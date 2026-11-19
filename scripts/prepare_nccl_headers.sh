@@ -1,47 +1,49 @@
 #!/usr/bin/env bash
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Assemble the NCCL plugin headers needed to type-check `nccl_rma_srdsim.cc` on a machine that
-# has neither a built NCCL nor CUDA.
+# Assemble what is needed to compile `src/nccl_rma_srdsim.cc` on a machine with neither a built NCCL
+# nor CUDA: NCCL's plugin headers from a source checkout, with `nccl.h` generated for that checkout's
+# version, and declaration-only stand-ins for the CUDA driver API, NVRTC and GDRCopy.
 #
-# On a real build host none of this is needed: use the installed NCCL's include directory (the
-# `nvidia-nccl-cu13` wheel ships it) and the CUDA toolkit. This exists so the ABI can be checked
-# from a laptop, which is where most of the editing happens.
+# A real build uses the installed NCCL and the CUDA toolkit instead (see README.md). The stand-ins
+# declare only what the plugin calls, so they check the plugin against NCCL's plugin ABI, not against
+# CUDA's: CI also builds against the real CUDA headers for that.
 #
-# Usage: NCCL_SRC=/path/to/nccl ./prepare_nccl_headers.sh /path/to/output
+# Usage: NCCL_SRC=/path/to/nccl ./scripts/prepare_nccl_headers.sh OUT_DIR
+#   writes OUT_DIR/nccl (NCCL headers) and OUT_DIR/cuda-stub (stand-ins)
 set -euo pipefail
 
-NCCL_SRC="${NCCL_SRC:-$HOME/tmp/deepep/nccl}"
-OUT="${1:-$HOME/tmp/deepep/nccl-inc}"
-STUB="$OUT/../cuda-stub"
+: "${NCCL_SRC:?set NCCL_SRC to an NCCL source checkout}"
+ROOT="${1:?usage: NCCL_SRC=... $0 OUT_DIR}"
+OUT="$ROOT/nccl"
+STUB="$ROOT/cuda-stub"
 
-if [ ! -f "$NCCL_SRC/src/nccl.h.in" ]; then
-    echo "ERROR: $NCCL_SRC does not look like an NCCL checkout (set NCCL_SRC)" >&2
+if [ ! -f "$NCCL_SRC/src/nccl.h.in" ] || [ ! -f "$NCCL_SRC/makefiles/version.mk" ]; then
+    echo "ERROR: $NCCL_SRC does not look like an NCCL checkout" >&2
+    exit 2
+fi
+if [ ! -f "$NCCL_SRC/src/include/plugin/nccl_rma.h" ]; then
+    echo "ERROR: $NCCL_SRC has no RMA plugin interface (src/include/plugin/nccl_rma.h); NCCL 2.31.2 or later is needed" >&2
     exit 2
 fi
 
 mkdir -p "$OUT" "$STUB" "$OUT/nccl_device"
 
-# nccl.h is generated from a template at configure time. The version numbers only matter for
-# NCCL_VERSION_CODE comparisons, and 2.31.2 is the floor for the GIN device API.
-sed -e 's/${nccl:Major}/2/'   -e 's/${nccl:Minor}/31/' \
-    -e 's/${nccl:Patch}/2/'   -e 's/${nccl:Suffix}/-1/' \
-    -e 's/${nccl:Version}/23102/' \
+# nccl.h is generated from a template at configure time, with the checkout's own version.
+ver() { sed -n "s/^NCCL_$1[[:space:]]*:=[[:space:]]*//p" "$NCCL_SRC/makefiles/version.mk"; }
+MAJ=$(ver MAJOR); MIN=$(ver MINOR); PAT=$(ver PATCH); SUF=$(ver SUFFIX)
+sed -e "s/\${nccl:Major}/$MAJ/" -e "s/\${nccl:Minor}/$MIN/" -e "s/\${nccl:Patch}/$PAT/" \
+    -e "s/\${nccl:Suffix}/$SUF/" -e "s/\${nccl:Version}/$((MAJ * 10000 + MIN * 100 + PAT))/" \
     "$NCCL_SRC/src/nccl.h.in" > "$OUT/nccl.h"
+if grep -q '\${nccl:' "$OUT/nccl.h"; then echo "ERROR: unfilled placeholder in nccl.h" >&2; exit 2; fi
 
 cp -R "$NCCL_SRC/src/include/plugin/." "$OUT/"
 cp "$NCCL_SRC/src/include/nccl_common.h" "$OUT/"
 cp "$NCCL_SRC/src/include/nccl_device/net_device.h" "$OUT/nccl_device/"
 
-# Type-only CUDA stubs, in two parts.
-#
-# The first part is what nccl.h's own declarations need. The second declares every driver-API and
-# NVRTC entry point the plugin calls, so that the CUDA path type-checks here too. That second part was
-# added after a private member access inside `#ifdef SRDSIM_WITH_CUDA` compiled fine on a laptop -- the
-# block was skipped -- and failed on the target twelve minutes later. Code that only ever compiles on
-# the machine it runs on is code the local suite cannot check, and this suite exists to check it.
-#
-# Declarations only: nothing here links or runs. `make plugin-cuda` compiles with `-fsyntax-only`.
+# Declaration-only CUDA stand-ins, in two parts: what nccl.h's own declarations need, and every driver-API
+# and NVRTC entry point the plugin calls, so the code inside `#ifdef SRDSIM_WITH_CUDA` is compiled too.
+# Nothing here links or runs.
 cat > "$STUB/cuda_runtime.h" <<'EOF'
 #pragma once
 #include <stddef.h>
@@ -161,10 +163,7 @@ nvrtcResult nvrtcGetCUBIN(nvrtcProgram prog, char* cubin);
 }
 #endif
 EOF
-# GDRCopy, declarations only. The plugin writes device windows through a BAR mapping rather than with a
-# CUDA copy, because a CUDA copy does not complete while DeepEP's kernels are resident. Stubbed here for
-# the same reason the CUDA driver API is: so the path that only ever runs on a GPU host can still be
-# type-checked where the editing happens.
+# GDRCopy, declarations only, for the delivery path that writes device windows through a BAR mapping.
 cat > "$STUB/gdrapi.h" <<'EOF'
 #pragma once
 #include <stddef.h>
@@ -198,9 +197,5 @@ EOF
 : > "$STUB/cuda_bf16.h"
 : > "$STUB/cuda_fp8.h"
 
-echo "include tree:  $OUT"
-echo "cuda stubs:    $STUB"
-echo
-echo "type-check with:"
-echo "  c++ -std=c++17 -O2 -fPIC -Wall -Wextra -I $OUT -I $STUB -I \$(dirname \$0) \\"
-echo "      -c \$(dirname \$0)/nccl_rma_srdsim.cc -o /tmp/srdsim.o"
+echo "NCCL $MAJ.$MIN.$PAT$SUF headers: $OUT"
+echo "CUDA stand-ins:  $STUB"

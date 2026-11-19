@@ -16,22 +16,62 @@ jobs:
           cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  # The plugin against NCCL's plugin ABI for each supported NCCL release, in each delivery
+  # configuration, with declaration-only CUDA stand-ins. Links a shared object and checks that the
+  # op tables NCCL looks up with dlsym are exported.
   plugin-abi:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         nccl: [v2.31.2-1, v2.32.3-1, v2.32.6-1]
-        cuda: [cuda, nocuda]
+        delivery: [host-only, cuda, cuda-gdrcopy]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Fetch NCCL headers
-        run: git clone --quiet --depth 1 --branch "${{ matrix.nccl }}" https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl"
-      - name: Type-check the plugin against the NCCL plugin ABI
+      - name: Fetch NCCL
+        env:
+          NCCL_TAG: ${{ matrix.nccl }}
+        run: git clone --quiet --depth 1 --branch "$NCCL_TAG" https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+      - name: Build and check the exported op tables
+        env:
+          DELIVERY: ${{ matrix.delivery }}
         run: |
-          NCCL_SRC="$RUNNER_TEMP/nccl" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/nccl-inc"
-          DEFS=""
-          if [ "${{ matrix.cuda }}" = cuda ]; then DEFS="-DSRDSIM_WITH_CUDA -DSRDSIM_WITH_GDRCOPY"; fi
-          c++ -std=c++17 -O2 -fPIC -Wall -Wextra -Werror $DEFS -I "$RUNNER_TEMP/nccl-inc" -I "$RUNNER_TEMP/cuda-stub" \
-            -I src -c src/nccl_rma_srdsim.cc -o "$RUNNER_TEMP/srdsim.o"
-          nm "$RUNNER_TEMP/srdsim.o" | grep -q ' ncclRmaPlugin_v14$'
+          NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
+          case "$DELIVERY" in
+            host-only) DEFS="" ;;
+            cuda) DEFS="-DSRDSIM_WITH_CUDA" ;;
+            cuda-gdrcopy) DEFS="-DSRDSIM_WITH_CUDA -DSRDSIM_WITH_GDRCOPY" ;;
+          esac
+          c++ -std=c++17 -O2 -fPIC -shared -Wall -Wextra -Werror $DEFS \
+            -isystem "$RUNNER_TEMP/inc/nccl" -isystem "$RUNNER_TEMP/inc/cuda-stub" -I src \
+            src/nccl_rma_srdsim.cc -o "$RUNNER_TEMP/libnccl-rma-srdsim.so"
+          nm -D --defined-only "$RUNNER_TEMP/libnccl-rma-srdsim.so" > "$RUNNER_TEMP/syms"
+          EXPORTS=ncclRmaPlugin_v14
+          if [ -f "$RUNNER_TEMP/nccl-src/src/include/plugin/rma/rma_v15.h" ]; then EXPORTS="$EXPORTS ncclRmaPlugin_v15"; fi
+          for s in $EXPORTS; do
+            grep -Eq " [BDR] ${s}\$" "$RUNNER_TEMP/syms" || { echo "missing export: $s"; exit 1; }
+            echo "exported: $s"
+          done
+
+  # The documented CMake path, against the real CUDA 13 headers and libraries rather than stand-ins.
+  plugin-cuda:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install the CUDA 13 compiler, driver API, runtime and NVRTC development packages
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0 cuda-nvrtc-dev-13-0
+      - name: Fetch NCCL
+        run: git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+      - name: Build the plugin with CMake
+        run: |
+          NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
+          cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
+          cmake --build build -j
+          nm -D --defined-only build/libnccl-rma-srdsim.so | grep -E ' [BDR] ncclRmaPlugin_v1[45]$'
