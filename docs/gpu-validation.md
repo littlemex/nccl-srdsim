@@ -4,24 +4,27 @@ The host tests check the scheduler, transport and send queue without a GPU. What
 
 ## The test
 
-The ranks form a ring of thread blocks. In every round each block puts a buffer to the next block in chunks, each chunk carrying a weak signal increment. The receiver waits until the signal has counted every chunk of the round, checks every element, and returns a strong signal so that the sender may reuse the slot. The only thing that orders the data before the check is invariant I1, so:
+The ranks form a ring. In every round, block b of each rank puts a buffer to block b of the next rank in chunks, and every chunk carries a weak signal on a signal id of its own. The receiver waits for each chunk's signal and checks that chunk as soon as the signal is visible, so a signal that overtakes its own put is caught even when the put lands a moment later. Every element encodes the round, the sending rank and its own index, so a chunk written to the wrong place, from the wrong sender or in the wrong round also counts as wrong. The receiver then returns a weak signal to the sender, which waits for it before refilling the slot; that signal only has to arrive, so the test asks the fabric for no ordering other than I1.
 
 | Delivery | Required outcome |
 |---|---|
 | A mode that keeps I1 (`srd`, `inorder`, `peer-seq`, `reverse-ops`, `signal-last`, `defer-one`) | No wrong element, in every seed |
-| `violate-i1` | Wrong elements in at least one seed. Only the plugin's scheduler can release a signal ahead of its data, so this also shows that the GIN traffic went through the plugin |
+| `violate-i1` | Wrong elements in at least one seed and no crash or timeout in any. Only the plugin's scheduler can release a signal ahead of its data, so this also shows that the GIN traffic went through the plugin |
 
-`tests/gpu/run.sh` runs the test in every mode over several seeds and checks these outcomes. It runs every rank as a separate process on GPU 0 with its own `NCCL_HOSTID`, so NCCL treats each rank as a separate node and reaches each peer only through GIN, and it starts an MPS server so that the ranks' kernels run at the same time.
+`tests/gpu/run.sh` runs the test in every mode over several seeds and checks these outcomes. It runs every rank as a separate process on GPU 0 with its own `NCCL_HOSTID`, so NCCL treats each rank as a separate node and reaches each peer only through GIN, and it starts its own MPS server so that the ranks' kernels run concurrently. Every wait in the kernel has a timeout (`WAIT_TIMEOUT`, 60 s by default) and every run has one (`RUN_TIMEOUT`, 180 s); when one rank fails the others are stopped. On failure the script prints the failing ranks' logs and keeps the work directory. CI compiles the test but cannot run it, so running it is a manual step.
 
 ## Requirements
 
-- One NVIDIA GPU with compute capability 9.0 or later, its driver, and the CUDA toolkit (`nvcc`)
-- CMake 3.20 or later, a C++17 compiler, git and Python 3 with `venv`
+- One NVIDIA GPU. The run on record used compute capability 12.0; other generations have not been tried
+- The NVIDIA driver with its utilities, which provide `nvidia-cuda-mps-control`, and no MPS daemon already running
+- The CUDA 13 toolkit, with `nvcc` on `PATH` (it installs to `/usr/local/cuda/bin`), since the NCCL wheel below is built for CUDA 13
+- CMake 3.20 or later, a C++17 compiler, git, and Python 3 with `venv` (on Ubuntu, the `python3-venv` package)
 
 ## Run
 
 ```bash
 export NCCL_VERSION=2.32.6
+export PATH=/usr/local/cuda/bin:$PATH
 git clone https://github.com/littlemex/nccl-srdsim.git
 cd nccl-srdsim
 python3 -m venv .venv
