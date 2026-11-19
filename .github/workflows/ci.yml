@@ -19,6 +19,7 @@ jobs:
   plugin-abi:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         nccl: [v2.31.2-1, v2.32.3-1, v2.32.6-1]
         cuda: [cuda, nocuda]

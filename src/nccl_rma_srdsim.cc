@@ -1232,12 +1232,19 @@ private:
     bool counted_ = false;
 };
 
-#endif  // SRDSIM_WITH_CUDA
-
 bool pinned_staging() {
     static const bool v = env_size("SRDSIM_PAGEABLE_STAGING", 0) == 0;
     return v;
 }
+
+#endif  // SRDSIM_WITH_CUDA
+
+// Defined with the rest of get handling, below `srdsim_iget`; forward-declared so the `ReceiveAgent`
+// construction that wires them in as hooks does not have to sit after everything that uses `RmaCtx`.
+bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t length,
+                               uint32_t dest_window, uint64_t dest_off, uint32_t requester_rank,
+                               uint64_t owner_token, void* user);
+void srdsim_handle_get_response_landed(uint64_t owner_token, void* user);
 
 #ifdef SRDSIM_WITH_CUDA
 // Creates `n` events into `out`, or none: a partly built ring would hand out null events later.
@@ -1324,12 +1331,6 @@ bool wire_unit(CollComm* cc, const srdsim::Unit& u, const void* src) {
 
 void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u);
 
-// Defined with the rest of get handling, below `srdsim_iget`; forward-declared so the `ReceiveAgent`
-// construction that wires them in as hooks does not have to sit after everything that uses `RmaCtx`.
-bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t length,
-                               uint32_t dest_window, uint64_t dest_off, uint32_t requester_rank,
-                               uint64_t owner_token, void* user);
-void srdsim_handle_get_response_landed(uint64_t owner_token, void* user);
 
 // Assigns free slots to unstaged units, in each connection's order. Called with `g_send.mu` held and the
 // delivery context current.
@@ -1611,6 +1612,7 @@ void take_snapshot(const void* owner, const srdsim::Op& op) {
 #endif
 }
 
+#ifdef SRDSIM_WITH_CUDA
 // Replaces `staged` (the bytes read now) by the submit-time copy, and reports whether they differed.
 void apply_snapshot(const void* owner, const srdsim::Unit& u, void* staged) {
     std::lock_guard<std::mutex> g(g_snapshots.mu);
@@ -1643,6 +1645,7 @@ void apply_snapshot(const void* owner, const srdsim::Unit& u, void* staged) {
     snap.unsent = snap.unsent > u.bytes ? snap.unsent - u.bytes : 0;
     if (snap.unsent == 0) g_snapshots.snaps.erase(it);
 }
+#endif  // SRDSIM_WITH_CUDA
 
 #ifdef SRDSIM_WITH_CUDA
 // A synchronous read of device memory from the plugin's own context: the mapping when there is one, a copy on
