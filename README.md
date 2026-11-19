@@ -43,7 +43,7 @@ The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specifica
 | To | Needs |
 |---|---|
 | Run the host tests | A C++17 compiler and CMake 3.20 or later |
-| Build the plugin | The plugin headers of NCCL 2.31.2 or later (from an NCCL source checkout, see below), and for delivery into device memory the CUDA toolkit 12 or 13 with NVRTC; optionally GDRCopy |
+| Build the plugin | The plugin headers of NCCL 2.31.2 or later (from an NCCL source checkout, see below) and the CUDA toolkit 12 or 13, whose headers `nccl.h` includes; NVRTC for delivery into device memory; optionally GDRCopy |
 | Run the plugin | An NVIDIA GPU, an NCCL release with the GIN device API (2.31.2 or later), and the CUDA driver |
 
 CI builds against NCCL 2.31.2, 2.32.3 and 2.32.6, CUDA 12.8 and 13.0, and GDRCopy 2.5.2.

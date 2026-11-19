@@ -120,15 +120,27 @@ jobs:
             grep -Eq " [BDR] ${s}\$" defined || { echo "missing export: $s"; exit 1; }
           done
 
-  # The CMake path with no CUDA at all.
+  # The CMake path without the CUDA delivery path: CUDA headers only (nccl.h needs them), no driver
+  # API or NVRTC linked.
   plugin-host-only-cmake:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install the CUDA runtime headers
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          echo "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba  cuda-keyring_1.1-1_all.deb" | sha256sum -c
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0
       - name: Build
         run: |
           git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
           NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
           cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DSRDSIM_WITH_CUDA=OFF \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
             -DCMAKE_CXX_FLAGS=-Werror -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
           cmake --build build -j
+          if nm -D --undefined-only build/libnccl-rma-srdsim.so | grep -Eq ' U (cu[A-Z]|nvrtc|gdr_)'; then
+            echo "built without the CUDA delivery path but references CUDA or GDRCopy"; exit 1
+          fi

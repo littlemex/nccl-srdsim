@@ -52,8 +52,11 @@ if(SRDSIM_BUILD_PLUGIN)
   target_link_libraries(nccl-rma-srdsim PRIVATE srdsim_core Threads::Threads)
   # -g1 keeps line tables, so an address from a crash report resolves with addr2line.
   target_compile_options(nccl-rma-srdsim PRIVATE ${SRDSIM_WARNINGS} -g1)
+  # nccl.h includes cuda_runtime.h, so the CUDA headers are needed in every configuration. Only the
+  # CUDA delivery path links the driver API and NVRTC.
+  find_package(CUDAToolkit REQUIRED)
+  target_include_directories(nccl-rma-srdsim SYSTEM PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   if(SRDSIM_WITH_CUDA)
-    find_package(CUDAToolkit REQUIRED)
     target_compile_definitions(nccl-rma-srdsim PRIVATE SRDSIM_WITH_CUDA)
     target_link_libraries(nccl-rma-srdsim PRIVATE CUDA::cuda_driver CUDA::nvrtc)
   endif()
