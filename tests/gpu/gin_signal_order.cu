@@ -225,12 +225,15 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMemcpy(&host, result, sizeof(host), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaFree(result));
 
-    std::printf("rank %d: %d rounds, %zu elements in %d chunks per block, %llu wrong elements\n",
-                rank, rounds, elts, nchunks, host.wrong);
     if (host.timeouts)
-        std::printf("rank %d: %llu block(s) timed out after %d s, first in round %d waiting for %s\n", rank,
-                    host.timeouts, timeout_s, host.first_timeout_round,
-                    host.first_timeout_kind == 1 ? "a free slot" : host.first_timeout_kind == 2 ? "a chunk's signal" : "a flush");
+        std::printf("rank %d: %llu block(s) timed out after %d s, the first in round %d of %d waiting for %s; "
+                    "%llu wrong elements in what was checked before that\n", rank, host.timeouts, timeout_s,
+                    host.first_timeout_round, rounds,
+                    host.first_timeout_kind == 1 ? "a free slot" : host.first_timeout_kind == 2 ? "a chunk's signal" : "a flush",
+                    host.wrong);
+    else
+        std::printf("rank %d: %d rounds, %zu elements in %d chunks per block, %llu wrong elements\n",
+                    rank, rounds, elts, nchunks, host.wrong);
     // After a timeout, operations may still be pending and peers may be gone, so a teardown could fail or
     // hang and replace the status that says what happened. Leave without it.
     if (host.timeouts) { std::fflush(stdout); std::_Exit(3); }
