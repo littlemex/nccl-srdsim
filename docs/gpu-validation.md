@@ -42,16 +42,11 @@ The last command prints one line per mode and exits 0 when every mode produced i
 
 ## Result on record
 
-On 2026-11-20, on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07, CUDA 13.2) with NCCL 2.32.6: three ranks, five seeds per mode, 50 rounds of 65,536 elements in 16 chunks per block.
+The plugin and the test at commit `b8911a4`, on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The Run block was run four times: once exactly as written above, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run is three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and takes about 75 seconds.
 
-| Mode | Exit status per seed | Wrong elements reported by rank 0, per seed |
+| Mode | Exit status per seed, in every run | Wrong elements reported by rank 0 |
 |---|---|---|
-| `srd` | 0 0 0 0 0 | 0 in every seed |
-| `inorder` | 0 0 0 0 0 | 0 in every seed |
-| `peer-seq` | 0 0 0 0 0 | 0 in every seed |
-| `reverse-ops` | 0 0 0 0 0 | 0 in every seed |
-| `signal-last` | 0 0 0 0 0 | 0 in every seed |
-| `defer-one` | 0 0 0 0 0 | 0 in every seed |
-| `violate-i1` | 1 1 1 1 1 | 5,995,424; 6,746,688; 8,511,104; 11,900,576; 10,330,528 |
+| `srd`, `inorder`, `peer-seq`, `reverse-ops`, `signal-last`, `defer-one` | 0 0 0 0 0 | 0 in every seed of every run |
+| `violate-i1` | 1 1 1 1 1 | Between 3,557,376 and 12,587,264 per seed, over the 20 seeds of the four runs |
 
-Each rank checks 13,107,200 elements per run (50 rounds of 4 blocks of 65,536), so under `violate-i1` between 46% and 91% of the elements rank 0 read had not yet landed when their signal had.
+Each rank checks 13,107,200 elements per run (50 rounds of 4 blocks of 65,536), so under `violate-i1` between 27% and 96% of the elements rank 0 read had not landed when it read them.
