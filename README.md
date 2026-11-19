@@ -12,7 +12,7 @@ about bandwidth or latency.
 ## What it covers
 
 NCCL's GIN proxy backend (`NCCL_GIN_TYPE=2`) routes every device-initiated put, signal and get through
-the host RMA plugin interface. This plugin implements that interface (it exports `ncclRmaPlugin_v14`, and `ncclRmaPlugin_v15` when built against headers that define it; CI covers NCCL 2.31.2, 2.32.3 and 2.32.6), so anything
+the host RMA plugin interface. This plugin implements that interface (it exports `ncclRmaPlugin_v14`, and `ncclRmaPlugin_v15` when built against headers that define it; CI covers NCCL 2.31.2, 2.32.3 and 2.32.6, and newer interface versions are tracked in [#13](https://github.com/littlemex/nccl-srdsim/issues/13)), so anything
 whose remote writes travel through it is in scope, whatever library issued them:
 
 | In scope | Out of scope |
@@ -43,8 +43,8 @@ The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specifica
 | To | Needs |
 |---|---|
 | Run the host tests | A C++17 compiler and CMake 3.20 or later |
-| Build the plugin | The plugin headers of NCCL 2.31.2 or later (from an NCCL source checkout, see below) and the CUDA toolkit 12 or 13, whose headers `nccl.h` includes; NVRTC for delivery into device memory; optionally GDRCopy |
-| Run the plugin | An NVIDIA GPU, an NCCL release with the GIN device API (2.31.2 or later), and the CUDA driver |
+| Build the plugin | The plugin headers of NCCL 2.31.2 to 2.32.6 (from an NCCL source checkout, see below) and the CUDA toolkit, whose headers `nccl.h` includes; NVRTC for delivery into device memory; optionally GDRCopy. Built in CI against CUDA 12.8 and 13.0 |
+| Run the plugin | An NVIDIA GPU, NCCL 2.31.2 or later, and the CUDA driver. A build with the CUDA delivery path also loads the NVRTC runtime of the CUDA version it was built with, and a GDRCopy build loads `libgdrapi.so`; if either cannot be found, the plugin does not load |
 
 CI builds against NCCL 2.31.2, 2.32.3 and 2.32.6, CUDA 12.8 and 13.0, and GDRCopy 2.5.2.
 
@@ -85,7 +85,7 @@ export NCCL_GIN_TYPE=2
 export SRDSIM_MODE=srd SRDSIM_SEED=1
 ```
 
-The plugin reads further `SRDSIM_*` settings for impairments and diagnostics; a reference is in progress (#3). A run under NCCL on a GPU is being validated in #8; CI checks that NCCL can load the plugin and find its op tables, not that a GPU run passes.
+The plugin reads further `SRDSIM_*` settings for impairments and diagnostics; a reference is in progress ([#3](https://github.com/littlemex/nccl-srdsim/issues/3)). CI builds the plugin in every configuration and loads the build without the CUDA delivery path with `dlopen`, looking up its op tables as NCCL does; it does not run NCCL. A run under NCCL on a GPU is being validated in [#8](https://github.com/littlemex/nccl-srdsim/issues/8).
 
 ## Security
 

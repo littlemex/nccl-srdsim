@@ -28,15 +28,18 @@ jobs:
         delivery: [host-only, cuda, cuda-gdrcopy]
         nccl: [v2.31.2-1, v2.32.3-1, v2.32.6-1]
         include:
-          - { nccl: v2.31.2-1, version_code: "23102", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
-          - { nccl: v2.32.3-1, version_code: "23203", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
-          - { nccl: v2.32.6-1, version_code: "23206", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
+          - { nccl: v2.31.2-1, commit: 7b83616df3ae082a1f32bb74c27458bfe8153a13, version_code: "23102", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
+          - { nccl: v2.32.3-1, commit: 12df1a11afad322be5a204a2db890161cbf8131d, version_code: "23203", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
+          - { nccl: v2.32.6-1, commit: ad2d192c1f279aefcaf340f67e07880b65a1116b, version_code: "23206", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Fetch NCCL
         env:
           NCCL_TAG: ${{ matrix.nccl }}
-        run: git clone --quiet --depth 1 --branch "$NCCL_TAG" https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          NCCL_COMMIT: ${{ matrix.commit }}
+        run: |
+          git clone --quiet --depth 1 --branch "$NCCL_TAG" https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = "$NCCL_COMMIT"
       - name: Generate the headers and check the version
         env:
           VERSION_CODE: ${{ matrix.version_code }}
@@ -102,7 +105,9 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/gdrcopy" rev-parse HEAD)" = c91ad9f178e5fb729fc5b6dc62a77c3bb364d6c9
           make -C "$RUNNER_TEMP/gdrcopy" prefix="$RUNNER_TEMP/gdr" lib_install
       - name: Fetch NCCL
-        run: git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+        run: |
+          git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = ad2d192c1f279aefcaf340f67e07880b65a1116b
       - name: Build the plugin with CMake
         env:
           CUDA_PKG: ${{ matrix.cuda }}
@@ -116,9 +121,16 @@ jobs:
             -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
           cmake --build build -j
           nm -D --defined-only build/libnccl-rma-srdsim.so > defined
+          nm -D --undefined-only build/libnccl-rma-srdsim.so > undefined
           for s in ncclRmaPlugin_v14 ncclRmaPlugin_v15; do
             grep -Eq " [BDR] ${s}\$" defined || { echo "missing export: $s"; exit 1; }
           done
+          grep -Eq ' U cu[A-Z]' undefined && grep -q ' U nvrtc' undefined || { echo "the CUDA delivery path is not compiled in"; exit 1; }
+          if [ "$GDRCOPY" = ON ]; then
+            grep -q ' U gdr_' undefined || { echo "SRDSIM_WITH_GDRCOPY=ON but GDRCopy is not compiled in"; exit 1; }
+          else
+            ! grep -q ' U gdr_' undefined || { echo "SRDSIM_WITH_GDRCOPY=OFF but GDRCopy is referenced"; exit 1; }
+          fi
 
   # The CMake path without the CUDA delivery path: CUDA headers only (nccl.h needs them), no driver
   # API or NVRTC linked.
@@ -136,6 +148,7 @@ jobs:
       - name: Build
         run: |
           git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = ad2d192c1f279aefcaf340f67e07880b65a1116b
           NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
           cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DSRDSIM_WITH_CUDA=OFF \
             -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
@@ -144,3 +157,5 @@ jobs:
           if nm -D --undefined-only build/libnccl-rma-srdsim.so | grep -Eq ' U (cu[A-Z]|nvrtc|gdr_)'; then
             echo "built without the CUDA delivery path but references CUDA or GDRCopy"; exit 1
           fi
+          cc ci/dlopen_check.c -o dlopen_check -ldl
+          ./dlopen_check "$PWD/build/libnccl-rma-srdsim.so" ncclRmaPlugin_v14 ncclRmaPlugin_v15

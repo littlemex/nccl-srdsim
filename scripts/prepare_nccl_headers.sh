@@ -28,7 +28,15 @@ if [ ! -f "$NCCL_SRC/src/include/plugin/nccl_rma.h" ]; then
     exit 2
 fi
 
-# Start from empty trees: headers of a newer release left behind would be compiled against.
+# Start from empty trees: headers of a newer release left behind would be compiled against. Refuse an
+# output directory that overlaps the checkout, so that the removal can never reach it.
+SRC_REAL=$(cd "$NCCL_SRC" && pwd -P)
+mkdir -p "$ROOT"
+ROOT_REAL=$(cd "$ROOT" && pwd -P)
+for d in "$ROOT_REAL/nccl" "$ROOT_REAL/cuda-stub"; do
+    case "$SRC_REAL/" in "$d/"*) echo "ERROR: $d would contain the NCCL checkout $SRC_REAL" >&2; exit 2 ;; esac
+    case "$d/" in "$SRC_REAL/"*) echo "ERROR: $d is inside the NCCL checkout $SRC_REAL" >&2; exit 2 ;; esac
+done
 rm -rf "$OUT" "$STUB"
 mkdir -p "$OUT" "$STUB" "$OUT/nccl_device"
 
