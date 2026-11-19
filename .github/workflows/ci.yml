@@ -214,6 +214,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/devinc"
           cp "$RUNNER_TEMP/nccl-src/src/include/nccl_device.h" "$RUNNER_TEMP/devinc/"
           cp -R "$RUNNER_TEMP/nccl-src/src/include/nccl_device" "$RUNNER_TEMP/devinc/"
+          # NCCL's source headers include every GIN backend's device code unless told otherwise; this test
+          # uses only the proxy backend, and the GDAKI and EFA-GDA backends need vendor headers CI lacks.
           /usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_90 -Werror all-warnings \
+            -DNCCL_GIN_GDAKI_ENABLE=0 -DNCCL_GIN_EFA_GDA_ENABLE=0 \
             -I "$RUNNER_TEMP/inc/nccl" -I "$RUNNER_TEMP/devinc" \
             -c tests/gpu/gin_signal_order.cu -o "$RUNNER_TEMP/gin_signal_order.o"
