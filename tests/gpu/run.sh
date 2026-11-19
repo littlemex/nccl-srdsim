@@ -19,7 +19,8 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-180}"; WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"
 MODES="${MODES:-srd inorder peer-seq reverse-ops signal-last defer-one violate-i1}"
 for f in "$PLUGIN" "$TEST"; do [ -e "$f" ] || { echo "no such file: $f" >&2; exit 2; }; done
 command -v nvidia-cuda-mps-control >/dev/null || { echo "nvidia-cuda-mps-control is not on PATH" >&2; exit 2; }
-if pgrep -x nvidia-cuda-mps-server >/dev/null || pgrep -x nvidia-cuda-mps-control >/dev/null; then
+# Matched on the full command line: process names are cut at 15 characters, so -x on the name never matches.
+if pgrep -f '(^|/)nvidia-cuda-mps-(control|server)( |$)' >/dev/null; then
     echo "an MPS daemon is already running on this host; stop it first (echo quit | nvidia-cuda-mps-control)" >&2
     exit 2
 fi
@@ -29,6 +30,7 @@ export CUDA_MPS_PIPE_DIRECTORY="$WORK/mps-pipe" CUDA_MPS_LOG_DIRECTORY="$WORK/mp
 mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 RANK_PIDS=()
 RANK_STATUS=""
+FIRST_STATUS=""
 fail=0
 
 kill_ranks() {
@@ -40,21 +42,25 @@ kill_ranks() {
 mps_start() { nvidia-cuda-mps-control -d || { echo "could not start an MPS server" >&2; exit 2; }; }
 mps_stop() { echo quit | nvidia-cuda-mps-control >/dev/null 2>&1; }
 cleanup() {
+    local rc=$?
     kill_ranks
     mps_stop
-    if [ "$fail" -eq 0 ]; then rm -rf "$WORK"; else echo "logs kept in $WORK"; fi
+    if [ "$rc" -eq 0 ] && [ "$fail" -eq 0 ]; then rm -rf "$WORK"; else echo "logs kept in $WORK"; fi
 }
 trap cleanup EXIT
 trap 'fail=1; exit 130' INT TERM
 mps_start
 
-# Runs every rank of one (mode, seed) and leaves one exit status per rank in RANK_STATUS. It runs in
-# this shell, not in a command substitution, so that the trap can see and stop the ranks. When one rank exits non-zero
-# the others are stopped, since they would otherwise wait for it until their own timeout.
+# Runs every rank of one (mode, seed). Leaves one exit status per rank in RANK_STATUS and, in
+# FIRST_STATUS, the status of the first rank that exited with something other than 0 or 1 (else the
+# worst of those). It runs in this shell, not in a command substitution, so that the trap can see and
+# stop the ranks. A rank that crashed makes the others wait for it until their own timeout, so they are
+# stopped at once; a rank that timed out (3) gives the others GRACE seconds to time out and log too.
+GRACE=10
 run_once() {
-    local mode=$1 seed=$2 id="$WORK/id-$1-$2" r p alive rc
+    local mode=$1 seed=$2 id="$WORK/id-$1-$2" r p q alive rc stop_at=0
     local -a status
-    RANK_PIDS=()
+    RANK_PIDS=(); FIRST_STATUS=""
     for r in $(seq 0 $((NRANKS - 1))); do
         NCCL_RMA_PLUGIN="$PLUGIN" NCCL_GIN_TYPE=2 NCCL_HOSTID="srdsim-rank-$r" \
         SRDSIM_MODE="$mode" SRDSIM_SEED="$seed" \
@@ -70,25 +76,35 @@ run_once() {
             p=${RANK_PIDS[$r]}
             if kill -0 "$p" 2>/dev/null; then alive=1; continue; fi
             wait "$p"; rc=$?; status[$r]=$rc
-            if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
-                for q in "${RANK_PIDS[@]}"; do kill -TERM "$q" 2>/dev/null; done
+            if [ "$rc" -gt 1 ] && [ -z "$FIRST_STATUS" ]; then
+                FIRST_STATUS=$rc
+                if [ "$rc" -eq 3 ]; then stop_at=$((SECONDS + GRACE)); else stop_at=$SECONDS; fi
             fi
         done
         [ "$alive" -eq 0 ] && break
+        if [ "$stop_at" -gt 0 ] && [ "$SECONDS" -ge "$stop_at" ]; then
+            for q in "${RANK_PIDS[@]}"; do kill -TERM "$q" 2>/dev/null; done
+            stop_at=0
+        fi
         sleep 0.2
     done
     RANK_PIDS=()
     RANK_STATUS="${status[*]}"
+    if [ -z "$FIRST_STATUS" ]; then
+        FIRST_STATUS=0; for rc in $RANK_STATUS; do [ "$rc" -gt "$FIRST_STATUS" ] && FIRST_STATUS=$rc; done
+    fi
 }
 
 for mode in $MODES; do
     per_seed=(); bad_seeds=(); found=0
     for seed in $(seq 1 "$SEEDS"); do
         run_once "$mode" "$seed"
-        worst=0; for rc in $RANK_STATUS; do [ "$rc" -gt "$worst" ] && worst=$rc; done
+        worst=$FIRST_STATUS
         per_seed+=("$worst")
-        # A rank killed by a timeout may leave the MPS server holding its context; start a fresh one.
-        if [ "$worst" -ge 124 ]; then mps_stop; mps_start; fi
+        # A rank that was stopped mid-kernel may leave the MPS server holding its context; start a fresh one.
+        restart=0; [ "$worst" -ge 3 ] && restart=1
+        for rc in $RANK_STATUS; do [ "$rc" -ge 124 ] && restart=1; done
+        if [ "$restart" -eq 1 ]; then mps_stop; mps_start; fi
         if [ "$mode" = violate-i1 ]; then
             [ "$worst" -le 1 ] || bad_seeds+=("$seed")
             [ "$worst" -eq 1 ] && found=1

@@ -4,10 +4,10 @@
 // A GIN user whose correctness rests on invariant I1: a weak signal becomes visible only after its own
 // put has landed. Ranks form a ring. In every round, block b of each rank puts a buffer to block b of the
 // next rank in chunks, and every chunk carries a weak signal on a signal id of its own. The receiver
-// waits for each chunk's signal and checks that chunk immediately, so a signal that overtakes its own
-// put is seen as soon as it happens, not only when it outlasts the rest of the round. Every element
-// encodes the round, the sending rank and its own index, so a chunk that lands in the wrong place, from
-// the wrong sender or in the wrong round is also caught. The receiver then returns a weak signal to the
+// checks whichever chunk's signal it sees next, in any order, so a chunk is read right after its own
+// signal is seen rather than after the signals of the chunks before it. Every element encodes the round,
+// the sending rank, the block and its own index, so a chunk that lands in the wrong place, from the
+// wrong sender or in the wrong round is also caught. The receiver then returns a weak signal to the
 // sender, which waits for it before refilling the slot; that signal only has to arrive, so it puts no
 // further ordering requirement on the fabric.
 //
@@ -16,7 +16,8 @@
 //
 // Usage: gin_signal_order RANK NRANKS ID_FILE [ROUNDS] [ELEMENTS] [CHUNKS] [TIMEOUT_S]
 //   Every rank is a separate process. Rank 0 writes NCCL's unique id to ID_FILE; the others wait for it.
-// Exit status: 0 when no element was wrong, 1 when some were, 2 on a setup error, 3 when a wait timed out.
+// Exit status: 0 when no element was wrong, 1 when some were, 2 on a setup error, 3 when a wait timed out
+// (then without NCCL teardown).
 
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -37,17 +38,20 @@
 
 struct Result {
     unsigned long long wrong;     // elements that did not hold the expected value
-    unsigned long long timeouts;  // waits that expired
-    int first_timeout_round;      // the round of the first expired wait, or -1
-    int first_timeout_kind;       // 1 waiting for a free slot, 2 waiting for a chunk's signal
+    unsigned long long timeouts;  // blocks that gave up waiting
+    int first_timeout_round;      // the round of the first block that gave up, or -1
+    int first_timeout_kind;       // 1 waiting for a free slot, 2 for a chunk's signal, 3 for a flush
 };
 
-__device__ __forceinline__ uint32_t expected(int round, int sender, size_t index) {
-    return (uint32_t(round + 1) * 0x9E3779B1u) ^ (uint32_t(sender) * 0x85EBCA6Bu) ^ uint32_t(index);
+__device__ __forceinline__ uint32_t expected(int round, int sender, int block, size_t index) {
+    return (uint32_t(round + 1) * 0x9E3779B1u) ^ (uint32_t(sender) * 0x85EBCA6Bu) ^
+           (uint32_t(block) * 0xC2B2AE35u) ^ uint32_t(index);
 }
 
+// Signals are read with absolute values (round r needs r or r + 1), so the test assumes they start at
+// zero: one launch per communicator.
 __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, size_t elts, int nchunks,
-                     size_t chunk_elts, uint64_t timeout_cycles, Result* result) {
+                     size_t chunk_elts, long long timeout_cycles, Result* result) {
     const ncclTeam world = ncclTeamWorld(comm);
     const int blocks = gridDim.x, b = blockIdx.x;
     const int down = (world.rank + 1) % world.nRanks;
@@ -66,26 +70,29 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
     const ncclGinSignal_t free_sig = ncclGinSignal_t(blocks) * nchunks + b;
     ncclGin gin(comm, 0);
     ncclCoopCta cta;
+
+    // Thread 0 makes every wait decision and publishes it here, so the whole block takes the same branch.
     __shared__ unsigned long long wrong;
-    if (threadIdx.x == 0) wrong = 0;
+    __shared__ int stop;     // 0 to go on, else the kind of wait that expired
+    __shared__ int next;     // the chunk whose signal thread 0 found visible
+    __shared__ unsigned checked_bits[32];
+    if (threadIdx.x == 0) { wrong = 0; stop = 0; }
     __syncthreads();
+    // Every thread reads `stop` before any thread can pass the barrier and write it again.
+    auto stopped = [&]() { const int s = stop; __syncthreads(); return s != 0; };
 
-    auto timed_out = [&](int round, int kind) {
-        if (threadIdx.x == 0) {
-            if (atomicAdd(&result->timeouts, 1ull) == 0) {
-                result->first_timeout_round = round;
-                result->first_timeout_kind = kind;
-            }
-        }
-    };
-
-    for (int r = 0; r < rounds; ++r) {
+    int r = 0;
+    for (; r < rounds; ++r) {
         // The downstream block has checked round r - 1, so its receive slot may be overwritten.
-        if (gin.waitSignal(cta, free_sig, uint64_t(r), 64, cuda::memory_order_acquire, timeout_cycles) != ncclSuccess) {
-            timed_out(r, 1);
-            return;
+        if (threadIdx.x == 0) {
+            const long long deadline = clock64() + timeout_cycles;
+            while (gin.readSignal(free_sig) < uint64_t(r))
+                if (clock64() > deadline) { stop = 1; break; }
+            for (int w = 0; w < 32; ++w) checked_bits[w] = 0;
         }
-        for (size_t i = threadIdx.x; i < elts; i += blockDim.x) send[i] = expected(r, world.rank, i);
+        __syncthreads();
+        if (stopped()) break;
+        for (size_t i = threadIdx.x; i < elts; i += blockDim.x) send[i] = expected(r, world.rank, b, i);
         __syncthreads();
         for (int c = threadIdx.x; c < nchunks; c += blockDim.x) {
             const size_t first = size_t(c) * chunk_elts;
@@ -93,26 +100,45 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
             gin.put(world, down, their_recv + first, my_send + first, n,
                     ncclGin_WeakSignalInc{chunk_sig0 + c});
         }
-        // Each chunk is checked as soon as its own signal is visible. Under I1 it has landed by then.
-        for (int c = 0; c < nchunks; ++c) {
-            if (gin.waitSignal(cta, chunk_sig0 + c, uint64_t(r + 1), 64, cuda::memory_order_acquire,
-                               timeout_cycles) != ncclSuccess) {
-                timed_out(r, 2);
-                return;
+        // Check whichever chunk's signal is visible next, in any order, so that a chunk is read as soon
+        // as its own signal is seen rather than after the signals of the chunks before it.
+        for (int done = 0; done < nchunks; ++done) {
+            if (threadIdx.x == 0) {
+                const long long deadline = clock64() + timeout_cycles;
+                next = -1;
+                while (next < 0) {
+                    for (int c = 0; c < nchunks && next < 0; ++c)
+                        if (!(checked_bits[c / 32] >> (c % 32) & 1u) &&
+                            gin.readSignal(chunk_sig0 + c) >= uint64_t(r + 1)) next = c;
+                    if (next < 0 && clock64() > deadline) { stop = 2; break; }
+                }
+                if (next >= 0) checked_bits[next / 32] |= 1u << (next % 32);
             }
+            __syncthreads();
+            const int c = next;
+            if (stopped()) break;
             const size_t first = size_t(c) * chunk_elts, last = min(first + chunk_elts, elts);
             unsigned long long bad = 0;
             for (size_t i = first + threadIdx.x; i < last; i += blockDim.x)
-                if (recv[i] != expected(r, up, i)) ++bad;
+                if (recv[i] != expected(r, up, b, i)) ++bad;
             if (bad) atomicAdd(&wrong, bad);
+            __syncthreads();
         }
-        __syncthreads();
-        if (threadIdx.x == 0) gin.signal(world, up, ncclGin_WeakSignalInc{ncclGinSignal_t(blocks) * nchunks + b});
+        if (stopped()) break;
+        if (threadIdx.x == 0) gin.signal(world, up, ncclGin_WeakSignalInc{free_sig});
         // The puts of this round have read their source before the slot is refilled next round.
-        gin.flush(cta);
+        if (gin.flush(cta, cuda::memory_order_acquire, ncclGin_None{}, uint64_t(timeout_cycles)) != ncclSuccess)
+            stop = 3;
+        __syncthreads();
+        if (stopped()) break;
     }
-    __syncthreads();
-    if (threadIdx.x == 0 && wrong) atomicAdd(&result->wrong, wrong);
+    if (threadIdx.x == 0) {
+        if (wrong) atomicAdd(&result->wrong, wrong);
+        if (stop && atomicAdd(&result->timeouts, 1ull) == 0) {
+            result->first_timeout_round = r;
+            result->first_timeout_kind = stop;
+        }
+    }
 }
 
 static void exchange_id(int rank, const std::string& path, ncclUniqueId* id) {
@@ -132,11 +158,11 @@ static void exchange_id(int rank, const std::string& path, ncclUniqueId* id) {
     std::exit(2);
 }
 
-static long positive(const char* s, const char* what) {
+static long integer(const char* s, const char* what, long least) {
     char* end = nullptr;
     const long v = std::strtol(s, &end, 10);
-    if (end == s || *end != '\0' || v <= 0) {
-        std::fprintf(stderr, "%s must be a positive integer, got '%s'\n", what, s);
+    if (end == s || *end != '\0' || v < least) {
+        std::fprintf(stderr, "%s must be an integer of at least %ld, got '%s'\n", what, least, s);
         std::exit(2);
     }
     return v;
@@ -147,24 +173,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s RANK NRANKS ID_FILE [ROUNDS] [ELEMENTS] [CHUNKS] [TIMEOUT_S]\n", argv[0]);
         return 2;
     }
-    const int nranks = int(positive(argv[2], "NRANKS"));
-    const int rank = std::atoi(argv[1]);
-    if (rank < 0 || rank >= nranks) { std::fprintf(stderr, "RANK must be in [0, NRANKS)\n"); return 2; }
-    const int rounds = argc > 4 ? int(positive(argv[4], "ROUNDS")) : 50;
-    const size_t elts = argc > 5 ? size_t(positive(argv[5], "ELEMENTS")) : size_t(1) << 16;
-    const int chunks = argc > 6 ? int(positive(argv[6], "CHUNKS")) : 16;
-    const int timeout_s = argc > 7 ? int(positive(argv[7], "TIMEOUT_S")) : 60;
+    // A log is a file, so stdout would be fully buffered and lost when the driver stops this rank.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    // Two ranks at least: with one, every put would go to the sender's own rank.
+    const int nranks = int(integer(argv[2], "NRANKS", 2));
+    const int rank = int(integer(argv[1], "RANK", 0));
+    if (rank >= nranks) { std::fprintf(stderr, "RANK must be less than NRANKS\n"); return 2; }
+    const int rounds = argc > 4 ? int(integer(argv[4], "ROUNDS", 1)) : 50;
+    const size_t elts = argc > 5 ? size_t(integer(argv[5], "ELEMENTS", 1)) : size_t(1) << 16;
+    const int chunks = argc > 6 ? int(integer(argv[6], "CHUNKS", 1)) : 16;
+    const int timeout_s = argc > 7 ? int(integer(argv[7], "TIMEOUT_S", 1)) : 60;
     const int blocks = 4, threads = 256;
     // The number of chunks actually sent, which is what each receiver waits for.
     const size_t chunk_elts = (elts + chunks - 1) / chunks;
     const int nchunks = int((elts + chunk_elts - 1) / chunk_elts);
+    if (nchunks > 1024) { std::fprintf(stderr, "at most 1024 chunks per block\n"); return 2; }
 
     ncclUniqueId id;
     exchange_id(rank, argv[3], &id);
     CHECK_CUDA(cudaSetDevice(0));
     int clock_khz = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0));
-    const uint64_t timeout_cycles = uint64_t(clock_khz) * 1000 * uint64_t(timeout_s);
+    const long long timeout_cycles = (long long)clock_khz * 1000 * timeout_s;
 
     ncclComm_t comm;
     CHECK_NCCL(ncclCommInitRank(&comm, nranks, id, rank));
@@ -195,12 +225,14 @@ int main(int argc, char** argv) {
     std::printf("rank %d: %d rounds, %zu elements in %d chunks per block, %llu wrong elements\n",
                 rank, rounds, elts, nchunks, host.wrong);
     if (host.timeouts)
-        std::printf("rank %d: %llu wait(s) timed out after %d s, first in round %d waiting for %s\n", rank,
+        std::printf("rank %d: %llu block(s) timed out after %d s, first in round %d waiting for %s\n", rank,
                     host.timeouts, timeout_s, host.first_timeout_round,
-                    host.first_timeout_kind == 1 ? "a free slot" : "a chunk's signal");
+                    host.first_timeout_kind == 1 ? "a free slot" : host.first_timeout_kind == 2 ? "a chunk's signal" : "a flush");
+    // After a timeout, operations may still be pending and peers may be gone, so a teardown could fail or
+    // hang and replace the status that says what happened. Leave without it.
+    if (host.timeouts) { std::fflush(stdout); std::_Exit(3); }
     CHECK_NCCL(ncclDevCommDestroy(comm, &dcomm));
     CHECK_NCCL(ncclCommFinalize(comm));
     CHECK_NCCL(ncclCommDestroy(comm));
-    if (host.timeouts) return 3;
     return host.wrong == 0 ? 0 : 1;
 }
