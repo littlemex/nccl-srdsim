@@ -1,7 +1,7 @@
 # nccl-srdsim
 
 An NCCL RMA plugin that simulates the delivery semantics of an unordered, reliable transport such as
-AWS's Scalable Reliable Datagram (SRD), on any machine, with no EFA device. It lets code built on NCCL's
+AWS's Scalable Reliable Datagram (SRD), on GPU machines with no EFA device. It lets code built on NCCL's
 GIN (GPU-initiated networking) device API be tested against the orderings such a fabric is allowed to
 produce: operations that complete out of order, operations torn into chunks that land in any order, and
 signals that may only be relied on once their own payload has landed.
@@ -24,7 +24,7 @@ whose remote writes travel through it is in scope, whatever library issued them:
 
 ## Delivery modes
 
-The contract the default mode keeps is the one SRD gives for a signalled put: the signal becomes visible only after every byte of its own put has landed. Nothing else is ordered: puts complete in any order relative to each other, and the chunks of one put land in any order. The documentation calls the signal rule invariant I1.
+The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specification](https://github.com/NVIDIA/nccl/blob/ad2d192c1f279aefcaf340f67e07880b65a1116b/plugins/rma/README.md#L92-L97), which is what an unordered fabric can provide: a signal becomes visible only after every byte of its own put has landed, with no guarantee about earlier puts or signals. This documentation calls that rule invariant I1. Nothing else is ordered: puts complete in any order relative to each other, and the chunks of one put land in any order.
 
 `SRDSIM_MODE` selects the schedule:
 
@@ -37,6 +37,16 @@ The contract the default mode keeps is the one SRD gives for a signalled put: th
 | `violate-i1` | May release a signal before its own put has fully landed, breaking I1 on purpose. Code that relies on I1, as correct code does, should fail under it for some seed; a test that never fails here does not check what it reads |
 
 `SRDSIM_SEED` makes a schedule reproducible.
+
+## Requirements
+
+| To | Needs |
+|---|---|
+| Run the host tests | A C++17 compiler and CMake 3.20 or later |
+| Build the plugin | The plugin headers of NCCL 2.31.2 or later (from an NCCL source checkout, see below), and for delivery into device memory the CUDA toolkit 12 or 13 with NVRTC; optionally GDRCopy |
+| Run the plugin | An NVIDIA GPU, an NCCL release with the GIN device API (2.31.2 or later), and the CUDA driver |
+
+CI builds against NCCL 2.31.2, 2.32.3 and 2.32.6, CUDA 12.8 and 13.0, and GDRCopy 2.5.2.
 
 ## Build
 
@@ -57,6 +67,16 @@ cmake -S . -B build -DSRDSIM_BUILD_PLUGIN=ON -DNCCL_PLUGIN_INCLUDE_DIRS=/tmp/srd
 cmake --build build -j
 ```
 
+The script also writes `/tmp/srdsim-inc/cuda-stub`, declaration-only CUDA stand-ins used to type-check the plugin without CUDA; a real build must not add it to the include path.
+
+| CMake option | Default | Effect |
+|---|---|---|
+| `SRDSIM_BUILD_TESTS` | `ON` | Build the host tests |
+| `SRDSIM_BUILD_PLUGIN` | `OFF` | Build `libnccl-rma-srdsim.so` |
+| `SRDSIM_WITH_CUDA` | `ON` | Deliver into device memory through the CUDA driver API. Without it the plugin handles host memory only |
+| `SRDSIM_WITH_GDRCOPY` | `OFF` | Also deliver into device memory through GDRCopy BAR mappings when `/dev/gdrdrv` is present. Needs `SRDSIM_WITH_CUDA` |
+| `SRDSIM_ASAN` | `OFF` | Build with AddressSanitizer |
+
 ## Use
 
 ```bash
@@ -64,6 +84,8 @@ export NCCL_RMA_PLUGIN=$PWD/build/libnccl-rma-srdsim.so
 export NCCL_GIN_TYPE=2
 export SRDSIM_MODE=srd SRDSIM_SEED=1
 ```
+
+The plugin reads further `SRDSIM_*` settings for impairments and diagnostics; a reference is in progress (#3). A run under NCCL on a GPU is being validated in #8; CI checks that NCCL can load the plugin and find its op tables, not that a GPU run passes.
 
 ## Security
 

@@ -5,9 +5,10 @@
 # nor CUDA: NCCL's plugin headers from a source checkout, with `nccl.h` generated for that checkout's
 # version, and declaration-only stand-ins for the CUDA driver API, NVRTC and GDRCopy.
 #
-# A real build uses the installed NCCL and the CUDA toolkit instead (see README.md). The stand-ins
-# declare only what the plugin calls, so they check the plugin against NCCL's plugin ABI, not against
-# CUDA's: CI also builds against the real CUDA headers for that.
+# A real build uses OUT_DIR/nccl together with the real CUDA toolkit, and must not add
+# OUT_DIR/cuda-stub to its include path (see README.md). The stand-ins declare only what the plugin
+# calls, in the CUDA 13 form, so they check the plugin against NCCL's plugin ABI rather than against
+# CUDA's: CI also builds against the real CUDA 12 and 13 headers for that.
 #
 # Usage: NCCL_SRC=/path/to/nccl ./scripts/prepare_nccl_headers.sh OUT_DIR
 #   writes OUT_DIR/nccl (NCCL headers) and OUT_DIR/cuda-stub (stand-ins)
@@ -27,11 +28,16 @@ if [ ! -f "$NCCL_SRC/src/include/plugin/nccl_rma.h" ]; then
     exit 2
 fi
 
+# Start from empty trees: headers of a newer release left behind would be compiled against.
+rm -rf "$OUT" "$STUB"
 mkdir -p "$OUT" "$STUB" "$OUT/nccl_device"
 
 # nccl.h is generated from a template at configure time, with the checkout's own version.
 ver() { sed -n "s/^NCCL_$1[[:space:]]*:=[[:space:]]*//p" "$NCCL_SRC/makefiles/version.mk"; }
 MAJ=$(ver MAJOR); MIN=$(ver MINOR); PAT=$(ver PATCH); SUF=$(ver SUFFIX)
+for n in "$MAJ" "$MIN" "$PAT"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "ERROR: cannot read the version from $NCCL_SRC/makefiles/version.mk" >&2; exit 2; }
+done
 sed -e "s/\${nccl:Major}/$MAJ/" -e "s/\${nccl:Minor}/$MIN/" -e "s/\${nccl:Patch}/$PAT/" \
     -e "s/\${nccl:Suffix}/$SUF/" -e "s/\${nccl:Version}/$((MAJ * 10000 + MIN * 100 + PAT))/" \
     "$NCCL_SRC/src/nccl.h.in" > "$OUT/nccl.h"
@@ -64,6 +70,9 @@ typedef struct CUmod_st* CUmodule;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef int CUdevice;
+// The stand-ins follow CUDA 13, whose cuCtxCreate takes a parameters argument.
+#define CUDA_VERSION 13000
+typedef struct CUctxCreateParams_st CUctxCreateParams;
 #define CUDA_SUCCESS 0
 // 600 in the real header. Named here because the health probe has to tell "still working" from
 // "broken", and treating a pending stream as an error would report a fault on every busy run.
@@ -112,7 +121,7 @@ CUresult cuCtxGetDevice(CUdevice* dev);
 CUresult cuDeviceGet(CUdevice* dev, int ordinal);
 CUresult cuDeviceGetAttribute(int* value, int attribute, CUdevice dev);
 CUresult cuDevicePrimaryCtxRetain(CUcontext* ctx, CUdevice dev);
-CUresult cuCtxCreate(CUcontext* ctx, unsigned int flags, CUdevice dev);
+CUresult cuCtxCreate(CUcontext* ctx, CUctxCreateParams* params, unsigned int flags, CUdevice dev);
 CUresult cuCtxPushCurrent(CUcontext ctx);
 CUresult cuCtxPopCurrent(CUcontext* ctx);
 CUresult cuEventCreate(CUevent* e, unsigned int flags);
