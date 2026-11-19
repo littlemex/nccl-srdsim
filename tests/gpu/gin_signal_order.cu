@@ -4,8 +4,8 @@
 // A GIN user whose correctness rests on invariant I1: a weak signal becomes visible only after its own
 // put has landed. Ranks form a ring. In every round, block b of each rank puts a buffer to block b of the
 // next rank in chunks, and every chunk carries a weak signal on a signal id of its own. The receiver
-// checks whichever chunk's signal it sees next, in any order, so a chunk is read right after its own
-// signal is seen rather than after the signals of the chunks before it. Every element encodes the round,
+// repeatedly scans the chunks it has not checked and checks the first whose signal is visible, so a chunk
+// never waits for the signals of the chunks before it, only for one scan. Every element encodes the round,
 // the sending rank, the block and its own index, so a chunk that lands in the wrong place, from the
 // wrong sender or in the wrong round is also caught. The receiver then returns a weak signal to the
 // sender, which waits for it before refilling the slot; that signal only has to arrive, so it puts no
@@ -71,7 +71,8 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
     ncclGin gin(comm, 0);
     ncclCoopCta cta;
 
-    // Thread 0 makes every wait decision and publishes it here, so the whole block takes the same branch.
+    // Thread 0 decides every signal wait and publishes the decision here, so the whole block takes the same
+    // branch. The flush result is evaluated by every thread and merged here the same way.
     __shared__ unsigned long long wrong;
     __shared__ int stop;     // 0 to go on, else the kind of wait that expired
     __shared__ int next;     // the chunk whose signal thread 0 found visible
@@ -100,8 +101,8 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
             gin.put(world, down, their_recv + first, my_send + first, n,
                     ncclGin_WeakSignalInc{chunk_sig0 + c});
         }
-        // Check whichever chunk's signal is visible next, in any order, so that a chunk is read as soon
-        // as its own signal is seen rather than after the signals of the chunks before it.
+        // Check whichever unchecked chunk thread 0's scan finds visible first, rather than in chunk order, so
+        // a chunk whose signal is visible never waits for the signals of the chunks before it.
         for (int done = 0; done < nchunks; ++done) {
             if (threadIdx.x == 0) {
                 const long long deadline = clock64() + timeout_cycles;
@@ -117,6 +118,8 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
             __syncthreads();
             const int c = next;
             if (stopped()) break;
+            // Thread 0's acquire is not relied on to order the other threads' reads: each does its own.
+            (void)gin.readSignal(chunk_sig0 + c);
             const size_t first = size_t(c) * chunk_elts, last = min(first + chunk_elts, elts);
             unsigned long long bad = 0;
             for (size_t i = first + threadIdx.x; i < last; i += blockDim.x)

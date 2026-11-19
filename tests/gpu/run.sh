@@ -7,15 +7,16 @@
 # with a wrong element under violate-i1.
 #
 # Each rank is a separate process on GPU 0 with its own NCCL_HOSTID, so NCCL treats every rank as a
-# separate node and reaches every peer through GIN rather than through peer memory. An MPS server runs
+# separate node rather than reach the others through peer memory. An MPS server runs
 # the ranks' kernels concurrently instead of time-slicing them.
 #
 # Usage: tests/gpu/run.sh PLUGIN_SO TEST_BINARY [NRANKS] [SEEDS]
 # Environment: RUN_TIMEOUT (seconds per run, default 180), WAIT_TIMEOUT (seconds a kernel waits for one
-# signal before it gives up, default 60), MODES (space-separated, default every mode).
+# signal before it gives up, default 60), ROUNDS (per seed, default 50), MODES (space-separated, default
+# every mode).
 set -uo pipefail
 PLUGIN="${1:?plugin .so}"; TEST="${2:?test binary}"; NRANKS="${3:-3}"; SEEDS="${4:-5}"
-RUN_TIMEOUT="${RUN_TIMEOUT:-180}"; WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"
+RUN_TIMEOUT="${RUN_TIMEOUT:-180}"; WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"; ROUNDS="${ROUNDS:-50}"
 MODES="${MODES:-srd inorder peer-seq reverse-ops signal-last defer-one violate-i1}"
 for f in "$PLUGIN" "$TEST"; do [ -e "$f" ] || { echo "no such file: $f" >&2; exit 2; }; done
 command -v nvidia-cuda-mps-control >/dev/null || { echo "nvidia-cuda-mps-control is not on PATH" >&2; exit 2; }
@@ -58,13 +59,13 @@ mps_start
 # stopped at once; a rank that timed out (3) gives the others GRACE seconds to time out and log too.
 GRACE=10
 run_once() {
-    local mode=$1 seed=$2 id="$WORK/id-$1-$2" r p q alive rc stop_at=0
+    local mode=$1 seed=$2 id="$WORK/id-$1-$2" r p q alive rc stop_at=-1
     local -a status
     RANK_PIDS=(); FIRST_STATUS=""
     for r in $(seq 0 $((NRANKS - 1))); do
         NCCL_RMA_PLUGIN="$PLUGIN" NCCL_GIN_TYPE=2 NCCL_HOSTID="srdsim-rank-$r" \
         SRDSIM_MODE="$mode" SRDSIM_SEED="$seed" \
-            timeout -k 10 "$RUN_TIMEOUT" "$TEST" "$r" "$NRANKS" "$id" 50 65536 16 "$WAIT_TIMEOUT" \
+            timeout -k 10 "$RUN_TIMEOUT" "$TEST" "$r" "$NRANKS" "$id" "$ROUNDS" 65536 16 "$WAIT_TIMEOUT" \
             > "$WORK/log-$mode-$seed-$r" 2>&1 &
         RANK_PIDS+=($!)
         status[$r]=""
@@ -82,9 +83,9 @@ run_once() {
             fi
         done
         [ "$alive" -eq 0 ] && break
-        if [ "$stop_at" -gt 0 ] && [ "$SECONDS" -ge "$stop_at" ]; then
+        if [ "$stop_at" -ge 0 ] && [ "$SECONDS" -ge "$stop_at" ]; then
             for q in "${RANK_PIDS[@]}"; do kill -TERM "$q" 2>/dev/null; done
-            stop_at=0
+            stop_at=-1
         fi
         sleep 0.2
     done
