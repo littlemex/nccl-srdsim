@@ -162,10 +162,19 @@ void violate_control(Rank& R) {
     }
 }
 
+// Polls for up to `ms` for `t` to retire, without failing either way.
+constexpr int kStopMs = 2000;
+void wait_retired_for(const Ticket* t, int ms) {
+    set_where("peer-stopped");
+    const auto start = Clock::now();
+    while (t->retired.load(std::memory_order_acquire) == 0 and Clock::now() - start < std::chrono::milliseconds(ms))
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+}
+
 // A get completes when its bytes are in the local window. The owner's whole process is stopped while the
-// get is issued, so a get that reports completion within kHoldMs has completed without its reply, whether
-// the reply would come from the owner's proxy or from a one-sided read; one that does not is given the
-// owner back and must have its data when it retires.
+// get is issued and for up to kStopMs after, so a get that retires in that time must already hold its
+// data: a one-sided read has it, and a reply from the owner cannot have come. One that does not retire is
+// given the owner back and must have its data when it retires.
 void get_completes_with_data(Rank& R) {
     constexpr size_t n = (4 << 10) + 13, remote = (256 << 10) + 7, local = (300 << 10) + kGuard;
     if (g_rank == 1) fill(R.at(remote), n, 1, 5);
@@ -173,7 +182,7 @@ void get_completes_with_data(Rank& R) {
     if (g_rank == 0) {
         stop_peer(1);
         const Ticket* g = R.issue(get(0, 1, remote, n, local));
-        std::this_thread::sleep_for(std::chrono::milliseconds(kHoldMs));
+        wait_retired_for(g, kStopMs);
         const bool early = g->retired.load(std::memory_order_acquire) != 0;
         const size_t bad_early = early ? mismatches(R.at(local), n, 1, 5) : 0;
         continue_peer(1);
@@ -239,7 +248,7 @@ void get_one_chunk_early_flush(Rank& R) {
         stop_peer(1);
         R.issue(get(0, 1, remote, n, local));
         const Ticket* f = R.issue(flush(0, 1));
-        std::this_thread::sleep_for(std::chrono::milliseconds(kHoldMs));
+        wait_retired_for(f, kStopMs);
         const bool early = f->retired.load(std::memory_order_acquire) != 0;
         const size_t bad_early = early ? mismatches(R.at(local), n, 1, 11) : 0;
         continue_peer(1);
@@ -375,6 +384,7 @@ Result run_case(const std::string& plugin, int table, const Scenario& sc, const 
             prctl(PR_SET_PDEATHSIG, SIGKILL);   // a rank never outlives the driver
 #endif
             g_shared = shared; g_rank = r; g_nranks = nranks;
+            shared->pid[r] = getpid();          // published to the peers by the first barrier
             setenv("SRDSIM_MODE", mode, 1);
             setenv("SRDSIM_SEED", std::to_string(seed).c_str(), 1);
             if (sc.extra_env) putenv(const_cast<char*>(sc.extra_env));
@@ -385,7 +395,6 @@ Result run_case(const std::string& plugin, int table, const Scenario& sc, const 
             R.pass();
         }
         setpgid(pid, pid);                      // both sides, so an early kill(-pid) cannot miss
-        shared->pid[r] = pid;
         pids.push_back(pid);
         exited.push_back(false);
     }
