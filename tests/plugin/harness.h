@@ -136,7 +136,9 @@ inline unsigned char pattern(size_t i, int sender, int salt) {
     x ^= x >> 32;
     return static_cast<unsigned char>(x);
 }
-inline void fill(unsigned char* d, size_t n, int sender, int salt) {
+// Not instrumented either: a window filled here is read by the plugin's threads only after a barrier
+// between processes, which ThreadSanitizer cannot see.
+__attribute__((no_sanitize("thread"))) inline void fill(unsigned char* d, size_t n, int sender, int salt) {
     for (size_t i = 0; i < n; ++ i) d[i] = pattern(i, sender, salt);
 }
 // Reads a window the plugin's threads may still be writing. The read races with that write by design
