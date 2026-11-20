@@ -30,8 +30,7 @@
 // nvidia-nccl-cu13 wheel, so they come from an NCCL source checkout, assembled by
 // `scripts/prepare_nccl_headers.sh`; then `cmake -S . -B build -DSRDSIM_BUILD_PLUGIN=ON
 // -DNCCL_PLUGIN_INCLUDE_DIRS=<out>/nccl` (see README.md).
-// Use: NCCL_RMA_PLUGIN=libnccl-rma-srdsim.so NCCL_GIN_TYPE=2, plus the SRDSIM_* settings in
-// docs/configuration.md.
+// Use: NCCL_RMA_PLUGIN=libnccl-rma-srdsim.so NCCL_GIN_TYPE=2, plus the SRDSIM_* settings (see README.md).
 
 #include <csignal>
 #include <cerrno>
