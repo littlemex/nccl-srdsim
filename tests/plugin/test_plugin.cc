@@ -278,15 +278,18 @@ void dry_run(Rank& R) {
 void register_during_traffic(Rank& R) {
     constexpr size_t n = (64 << 10) + 13, src = 4099, base = 1 << 20;
     constexpr int rounds = 8;
+    // A source per put: each is overwritten when its own put retires, while the others may still be read.
     if (g_rank == 0) {
-        fill(R.at(src), n, 0, 12);
-        for (int r = 0; r < rounds; ++ r) R.issue(put_signal(r % kContexts, 1, src, n, base + kGuard + size_t(r) * (n + kGuard), 4, false));
+        for (int r = 0; r < rounds; ++ r) {
+            fill(R.at(src + size_t(r) * n), n, 0, 12 + r);
+            R.issue(put_signal(r % kContexts, 1, src + size_t(r) * n, n, base + kGuard + size_t(r) * (n + kGuard), 4, false));
+        }
     }
     for (int k = 0; k < 4; ++ k) R.register_and_release((64 << 10) + 4096 * size_t(k));
     if (g_rank == 1) {
         R.wait_peer([&] { return R.signal_word(4) >= uint64_t(rounds); }, "signal-word");
         for (int r = 0; r < rounds; ++ r)
-            if (size_t bad = mismatches(R.at(base + kGuard + size_t(r) * (n + kGuard)), n, 0, 12))
+            if (size_t bad = mismatches(R.at(base + kGuard + size_t(r) * (n + kGuard)), n, 0, 12 + r))
                 fail("assert", "data", "round %d: %zu bytes", r, bad);
         expect_signals(R, {{4, uint64_t(rounds)}});
     }
