@@ -435,6 +435,9 @@ inline int dial(const char* ip, uint16_t port, int attempts = 600) {
 // One thread per inbound connection. It applies whatever arrives, in arrival order, which equals
 // the order the sender wrote it. Applying is the only thing it does: every decision about order
 // was already made on the other side.
+//
+// Connections are applied concurrently and nothing orders one connection's writes against another's,
+// as on a real NIC: puts from different peers to overlapping bytes are the application's error.
 class ReceiveAgent {
 public:
     struct Hooks {
@@ -528,15 +531,18 @@ public:
         std::vector<ConnectionState> out;
         out.reserve(conns_.size());
         for (const auto& c : conns_)
-            out.push_back({c->fd, c->placements.load(std::memory_order_relaxed),
-                           c->signals.load(std::memory_order_relaxed),
-                           c->bytes.load(std::memory_order_relaxed),
-                           c->finished.load(std::memory_order_relaxed)});
+            out.push_back({c->fd, c->placements.load(std::memory_order_acquire),
+                           c->signals.load(std::memory_order_acquire),
+                           c->bytes.load(std::memory_order_acquire),
+                           c->finished.load(std::memory_order_acquire)});
         return out;
     }
 
-    uint64_t applied_placements() const { return placements_.load(std::memory_order_relaxed); }
-    uint64_t applied_signals() const { return signals_.load(std::memory_order_relaxed); }
+    // The counts of applied writes are released by the receive threads and acquired here, so a caller that
+    // sees a count also sees the host-window bytes it counts. For a device window a count means only that
+    // the copy hook returned.
+    uint64_t applied_placements() const { return placements_.load(std::memory_order_acquire); }
+    uint64_t applied_signals() const { return signals_.load(std::memory_order_acquire); }
 
     // Two kinds of failure with two different owners. A frame this agent declined is the peer's
     // mistake; a write that did not happen is local. Reporting one number for both means a run where
@@ -574,7 +580,7 @@ public:
 
     uint64_t refused_frames() const { return refused_.load(std::memory_order_relaxed); }
     uint64_t failed_writes() const { return failed_writes_.load(std::memory_order_relaxed); }
-    uint64_t get_requests_answered() const { return get_requests_.load(std::memory_order_relaxed); }
+    uint64_t get_requests_answered() const { return get_requests_.load(std::memory_order_acquire); }
     uint64_t errors() const { return refused_frames() + failed_writes(); }
 
     // Whether this agent is still alive, and if it is stuck, where. Every field is a duration rather
@@ -758,9 +764,9 @@ private:
                 // Counted only when the write actually happened. Counting attempts as applications
                 // would make a run where every write failed look identical to a healthy one, and the
                 // whole point of these counters is to tell "never sent" from "never landed".
-                if (ok) { placements_.fetch_add(1, std::memory_order_relaxed);
-                          if (conn) { conn->placements.fetch_add(1, std::memory_order_relaxed);
-                                      conn->bytes.fetch_add(h.length, std::memory_order_relaxed); }
+                if (ok) { placements_.fetch_add(1, std::memory_order_release);
+                          if (conn) { conn->placements.fetch_add(1, std::memory_order_release);
+                                      conn->bytes.fetch_add(h.length, std::memory_order_release); }
                           note(h.window_id, false, h.offset, h.length);
                           // The one way a GetResponse differs from a Placement: landing it also has to
                           // tell whichever get() is waiting that its data is actually here now, not
@@ -813,7 +819,7 @@ private:
                                                    h.op_id, conn->user ? conn->user : hooks_.user);
                 if (not hooks_.get_request)
                     say("a get request arrived but no get-request hook was installed");
-                if (ok) get_requests_.fetch_add(1, std::memory_order_relaxed);
+                if (ok) get_requests_.fetch_add(1, std::memory_order_release);
                 else    failed_writes_.fetch_add(1, std::memory_order_relaxed);
             } else if (h.kind == static_cast<uint32_t>(WireKind::Signal)) {
                 // A signal frame has no payload, so a non-zero length means the stream is no longer
@@ -858,13 +864,14 @@ private:
                     if (not hooks_.device_add)
                         say("a device signal arrived but no device add hook was installed");
                 } else {
-                    // Relaxed is enough here. The reader on the other side of this word uses an
-                    // acquire load; using a stronger order here would paper over a missing acquire
-                    // in the code under test, which is one of the things this is meant to catch.
-                    __atomic_fetch_add(static_cast<uint64_t*>(dst), h.value, __ATOMIC_RELAXED);
+                    // Release, so that a reader which acquire-loads the word sees every byte this
+                    // thread placed before it. A relaxed add would leave a correct reader racing
+                    // with those bytes; a reader that loads the word without acquire is still wrong,
+                    // and is still reported as such.
+                    __atomic_fetch_add(static_cast<uint64_t*>(dst), h.value, __ATOMIC_RELEASE);
                 }
-                if (ok) { signals_.fetch_add(1, std::memory_order_relaxed);
-                          if (conn) conn->signals.fetch_add(1, std::memory_order_relaxed);
+                if (ok) { signals_.fetch_add(1, std::memory_order_release);
+                          if (conn) conn->signals.fetch_add(1, std::memory_order_release);
                           note(h.window_id, true, h.offset, sizeof(uint64_t), h.value); }
                 else    failed_writes_.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -875,7 +882,7 @@ private:
             if (stopping_.load(std::memory_order_acquire))
                 break;
         }
-        if (conn) conn->finished.store(true, std::memory_order_relaxed);
+        if (conn) conn->finished.store(true, std::memory_order_release);
         // Out of the table before it is closed. Without this, `fds_` keeps a number the loop has already
         // closed, and a later `stop()` calls `::shutdown` on whatever the operating system has since
         // handed that number to. Measured: an unrelated socket pair lost a byte that way. The close and

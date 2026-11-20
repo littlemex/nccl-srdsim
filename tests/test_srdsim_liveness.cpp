@@ -38,6 +38,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -99,7 +100,8 @@ constexpr uint64_t kSentinel = 0x4c'49'56'45'4e'45'53'53ull;   // "LIVENESS"
 // how slowly the machine underneath it does that is a property of the machine.
 srdsim::Impairments g_recv_imp;
 std::atomic<uint64_t> g_applied{0};
-Clock::time_point g_last_apply;
+Clock::time_point g_last_apply;  // guarded by g_apply_mutex
+std::mutex g_apply_mutex;
 // The freeze has to be applied by the side that stops reading, which is the receiver. It was declared
 // and never wired in the first version, so the knob did nothing and the two cases that depend on it
 // passed without exercising anything -- exactly the failure mode this suite exists to catch.
@@ -131,6 +133,8 @@ bool throttled_copy(void* dst, const void* src, size_t bytes, void* user) {
     if (const int link = link_of(user); link >= 0 and link < kMaxLinks)
         ++ g_applied_on_link[link];
     if (g_recv_imp.apply_interval_us != 0) {
+        // The throttle paces the receiving side as a whole, so its clock is shared by every link.
+        std::lock_guard<std::mutex> lock(g_apply_mutex);
         const auto wait = std::chrono::microseconds(g_recv_imp.apply_interval_us);
         while (Clock::now() - g_last_apply < wait)
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -145,7 +149,7 @@ bool throttled_add(void* dst, uint64_t value, void* user) {
     maybe_freeze(user);
     if (const int link = link_of(user); link >= 0 and link < kMaxLinks)
         ++ g_applied_on_link[link];
-    __atomic_fetch_add(static_cast<uint64_t*>(dst), value, __ATOMIC_RELAXED);
+    __atomic_fetch_add(static_cast<uint64_t*>(dst), value, __ATOMIC_RELEASE);
     ++ g_applied;
     return true;
 }
@@ -276,6 +280,11 @@ RunOutcome drive(const srdsim::Impairments& imp, int peers, int ops_per_peer, si
         }
     }
 
+    if (size_t(peers) * op_bytes > kWindowBytes) {
+        std::fprintf(stderr, "drive: %d peers of %zu bytes do not fit the %zu-byte window\n", peers, op_bytes,
+                     kWindowBytes);
+        return out;
+    }
     std::vector<char> src(op_bytes ? op_bytes : 1, 'L');
     srdsim::Scheduler::Options o;
     o.mode = mode;
@@ -292,7 +301,9 @@ RunOutcome drive(const srdsim::Impairments& imp, int peers, int ops_per_peer, si
             op.src_base = src.data();
             op.bytes = op_bytes;
             op.dst_window = 0;
-            op.dst_off = 0;
+            // Each peer writes its own range, since puts from two peers to the same bytes would be
+            // the application's error (see ReceiveAgent).
+            op.dst_off = uint64_t(p) * op_bytes;
             op.has_signal = true;
             op.signal_window = 1;
             op.signal_off = (id % 200) * sizeof(uint64_t);
