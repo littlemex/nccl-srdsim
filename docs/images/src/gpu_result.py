@@ -27,10 +27,10 @@ def draw(L):
            size=13, anchor="start", weight="bold")
     x0, wbar = 60, 980
     f.items.append(f'<rect x="{x0}" y="{y+14}" width="{wbar}" height="22" fill="#FFFFFF" stroke="#888888"/>')
-    lo, hi = 3600256 / 13107200, 11626592 / 13107200
+    lo, hi = 3157632 / 13107200, 11900672 / 13107200
     f.cell(x0 + wbar * lo, y + 14, wbar * (hi - lo), 22, "", "sig")
-    f.text(x0 + wbar * lo, y + 58, "3,600,256 (27%)", size=12, anchor="middle")
-    f.text(x0 + wbar * hi, y + 58, "11,626,592 (89%)", size=12, anchor="middle")
+    f.text(x0 + wbar * lo, y + 58, "3,157,632 (24%)", size=12, anchor="middle")
+    f.text(x0 + wbar * hi, y + 58, "11,900,672 (91%)", size=12, anchor="middle")
     f.text(x0, y + 82, "0", size=12, anchor="start", color="#555555")
     f.text(x0 + wbar, y + 82, "13,107,200", size=12, anchor="end", color="#555555")
     return f
