@@ -3280,12 +3280,14 @@ void check_context(RmaCtx* ctx, int context) {
     char detail[160];
     std::snprintf(detail, sizeof(detail), "an operation names context %d, but the RMA context has %d", context,
                   ctx->contexts);
-    logf("%s", detail);
     {
+        // The first error is kept and logged; a caller repeating the mistake does not flood the log.
         std::lock_guard<std::mutex> g(ctx->mu);
+        if (ctx->has_error) return;
         ctx->has_error = true;
         ctx->error = detail;
     }
+    logf("%s", detail);
     std::lock_guard<std::mutex> g(ctx->coll->mu);
     if (ctx->coll->last_error.empty()) ctx->coll->last_error = detail;
 }

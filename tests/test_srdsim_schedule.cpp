@@ -716,6 +716,7 @@ void test_peer_seq_is_per_context() {
         // scheduler chooses. The seed is fixed, so the choice is the same on every run.
         std::vector<srdsim::Unit> batch;
         s.progress(9, &batch);
+        expect(batch.size() == 9, "S11 nine units released");
         bool second = false;
         for (const auto& u : batch) second = second or u.op_id == 2;
         if (other == 1) expect(second, "S11 another context's operation is not held behind the first");
