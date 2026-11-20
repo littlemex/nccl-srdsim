@@ -512,11 +512,15 @@ void out_of_range_context(Rank& R) {
 #if defined(HARNESS_CUDA)
 // A signal into a device window registered without NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET is an add to whatever the
 // word holds, because the application may reset it: the target sets the word back to zero between two signals
-// of 1, and must then read 1, not the running total 2. Needs a GPU; skipped without one.
-void device_signal_reset(Rank& R) {
+// of 1, and must then read 1, not the running total 2. With the flag the plugin is the only writer and keeps
+// the total, so the same sequence reads 2: that run shows the flag selects the stored total. Needs a GPU; skipped
+// without one, unless HARNESS_REQUIRE_GPU is set.
+void device_signal(Rank& R, uint64_t flags) {
     int n = 0;
-    if (cuInit(0) != CUDA_SUCCESS or cuDeviceGetCount(&n) != CUDA_SUCCESS or n < 1)
+    if (cuInit(0) != CUDA_SUCCESS or cuDeviceGetCount(&n) != CUDA_SUCCESS or n < 1) {
+        if (std::getenv("HARNESS_REQUIRE_GPU")) fail("error", "no-gpu", "%s", "HARNESS_REQUIRE_GPU is set");
         fail("skip", "no-gpu", "%s", "no CUDA device");
+    }
     CUdevice dev{};
     CUcontext c{};
     CUdeviceptr w{};
@@ -524,7 +528,7 @@ void device_signal_reset(Rank& R) {
     if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS or cuDevicePrimaryCtxRetain(&c, dev) != CUDA_SUCCESS or
         cuCtxSetCurrent(c) != CUDA_SUCCESS or cuMemAlloc(&w, bytes) != CUDA_SUCCESS or cuMemsetD8(w, 0, bytes) != CUDA_SUCCESS)
         fail("error", "cuda-setup", "%s", "could not allocate the device window");
-    void* mh = R.register_window(reinterpret_cast<void*>(w), bytes, NCCL_PTR_CUDA, 0);
+    void* mh = R.register_window(reinterpret_cast<void*>(w), bytes, NCCL_PTR_CUDA, flags);
     barrier("device window registered");
     const auto word = [&] { uint64_t v = 0; cuMemcpyDtoH(&v, w, sizeof v); return v; };
     if (g_rank == 0) {
@@ -541,8 +545,10 @@ void device_signal_reset(Rank& R) {
             R.wait_peer([&] { return word() != 0; }, "device-word");
             std::this_thread::sleep_for(std::chrono::milliseconds(50));   // a second store, if any, lands
             const uint64_t v = word();
-            if (v != 1) fail("assert", "add-not-store", "round %d: the word is %llu after a signal of 1", round,
-                             static_cast<unsigned long long>(v));
+            const uint64_t want = (flags & NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET) ? uint64_t(round + 1) : 1;
+            if (v != want) fail("assert", want == 1 ? "add-not-store" : "store-with-never-reset",
+                                "round %d: the word is %llu, expected %llu", round, static_cast<unsigned long long>(v),
+                                static_cast<unsigned long long>(want));
             cuMemsetD8(w, 0, bytes);   // the application resets it
             set_flag(2 * round + 1);
         }
@@ -551,6 +557,8 @@ void device_signal_reset(Rank& R) {
     R.deregister_window(mh);
     cuMemFree(w);
 }
+void device_signal_reset(Rank& R) { device_signal(R, 0); }
+void device_signal_never_reset(Rank& R) { device_signal(R, NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET); }
 #endif
 
 struct Scenario {
@@ -589,6 +597,7 @@ const std::vector<Scenario>& scenarios() {
         {"out_of_range_context", out_of_range_context, 2, {"srd"}, {1}, nullptr},
 #if defined(HARNESS_CUDA)
         {"device_signal_reset", device_signal_reset, 2, {"srd"}, {1}, "SRDSIM_DELIVERY_CONTEXT=primary"},
+        {"device_signal_never_reset", device_signal_never_reset, 2, {"srd"}, {1}, "SRDSIM_DELIVERY_CONTEXT=primary"},
 #endif
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
