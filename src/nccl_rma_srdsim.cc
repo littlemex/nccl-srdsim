@@ -605,6 +605,7 @@ RequestSlab& g_requests = *new RequestSlab;
 // here, which is the point.
 #ifdef SRDSIM_WITH_CUDA
 void prebuild_signal_kernel();   // defined below, next to the signal kernel it builds
+void report_device_delivery_once();   // defined below, once every mechanism it names is
 // The plugin's private non-blocking stream, shared by every device access it makes. Declared here
 // because the sending path needs it before the class that owns it is defined.
 CUstream device_stream();
@@ -2350,6 +2351,26 @@ private:
 // Never destroyed; see `g_where`.
 DeviceAtomicAdd& g_device_atomic_add = *new DeviceAtomicAdd;
 
+// Which mechanism writes device windows in this process, on stderr whatever NCCL_DEBUG says, once, when the first
+// device window is registered: the delivery's speed and its deadlock exposure both follow from it, and a run
+// cannot be compared with another without knowing it.
+void report_device_delivery_once() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+#ifdef SRDSIM_WITH_GDRCOPY
+        const bool gdr = g_gdr.ready();
+#else
+        const bool gdr = false;
+#endif
+        const char* context = delivery_uses_primary() ? "primary" : delivery_uses_green() ? "green" : "own";
+        lifecycle("device delivery: %s; CUDA context for copies: %s; signals into windows registered with "
+                  "SIGNAL_NEVER_RESET: %s, into other device windows: an atomic add kernel",
+                  gdr ? "GDRCopy (CPU stores through the BAR mapping)"
+                      : delivery_async() ? "CUDA copies, queued (asynchronous)" : "CUDA copies, each waited for",
+                  context, env_size("SRDSIM_SIGNAL_KERNEL", 0) != 0 ? "an atomic add kernel" : "stored totals");
+    });
+}
+
 // Compiles and loads the signal kernel now, reporting the outcome. Called when the first device window
 // is registered, which is before any of DeepEP's kernels have run.
 void prebuild_signal_kernel() {
@@ -3156,6 +3177,7 @@ ncclResult_t srdsim_reg_mr_sym(void* collComm, void* data, size_t size, int type
         return ncclSystemError;
     }
     {
+        report_device_delivery_once();
         prebuild_signal_kernel();
         // The pinned staging pool, for the same reason and one step stronger. Page-locked allocation
         // implicitly synchronizes the context, so it has to happen while the context is still quiet.
@@ -3297,6 +3319,10 @@ ncclResult_t srdsim_close_coll(void* collComm) {
         if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
 #endif
         cc->responder.stop();          // before the links it sends on go
+        lifecycle("communicator %p closing: progress calls that held a peer for outbox room %llu (process-wide), "
+                  "frames refused for the outbox budget %llu", collComm,
+                  static_cast<unsigned long long>(g_held_for_room.load()),
+                  static_cast<unsigned long long>(cc->links.refused_for_budget()));
         if (const size_t r = cc->links.reserved_total())
             logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
         cc->links.shutdown_all();      // tells every peer's agent to finish
@@ -3679,6 +3705,9 @@ void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u) {
     logf("%s", detail);
 }
 
+// Progress calls in which a peer's outbox had no room, so its operations stayed pending: backpressure at work.
+std::atomic<uint64_t> g_held_for_room{0};
+
 // A released unit holds room in its peer's outbox until its frame is appended (see `LinkRoom` in
 // `srdsim_progress`). One that will not be sent gives the room back.
 void release_reservation(CollComm* cc, const srdsim::Unit& u) {
@@ -3746,7 +3775,11 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             const size_t need = sizeof(srdsim::WireHeader) + bytes;
             size_t& have = granted[peer];
             if (have >= need) return true;
-            if (not links->reserve(peer, need - have)) { full.insert(peer); return false; }
+            if (not links->reserve(peer, need - have)) {
+                full.insert(peer);
+                g_held_for_room.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             have = need;
             return true;
         }
