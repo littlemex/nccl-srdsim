@@ -17,6 +17,9 @@ set(NCCL_PLUGIN_INCLUDE_DIRS "" CACHE STRING
     "Directories holding nccl.h and the plugin headers (nccl_rma.h), separated by ;")
 
 set(SRDSIM_WARNINGS -Wall -Wextra)
+if(SRDSIM_ASAN)
+  message(FATAL_ERROR "SRDSIM_ASAN was replaced by -DSRDSIM_SANITIZER=address (clear a cached value with -USRDSIM_ASAN)")
+endif()
 if(SRDSIM_SANITIZER)
   if(NOT SRDSIM_SANITIZER MATCHES "^(address|undefined|thread)$")
     message(FATAL_ERROR "SRDSIM_SANITIZER must be address, undefined or thread, not '${SRDSIM_SANITIZER}'")
@@ -46,7 +49,8 @@ if(SRDSIM_BUILD_TESTS)
     if(SRDSIM_SANITIZER)
       # The same options locally as in CI, so that a finding fails the test wherever it is run.
       set_tests_properties(${t} PROPERTIES ENVIRONMENT
-        "ASAN_OPTIONS=detect_leaks=1:abort_on_error=1;UBSAN_OPTIONS=print_stacktrace=1;TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+        "ASAN_OPTIONS=abort_on_error=1;UBSAN_OPTIONS=print_stacktrace=1;TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1"
+        TIMEOUT 300)
     endif()
   endforeach()
 endif()

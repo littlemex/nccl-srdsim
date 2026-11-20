@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -268,6 +269,12 @@ struct RunOutcome {
 RunOutcome drive(const srdsim::Impairments& imp, int peers, int ops_per_peer, size_t op_bytes,
                  uint64_t seed, srdsim::Mode mode) {
     RunOutcome out;
+    // A misconfigured case, not a result: fail before any connection or child process exists.
+    if (size_t(peers) * op_bytes > kWindowBytes) {
+        std::fprintf(stderr, "drive: %d peers of %zu bytes do not fit the %zu-byte window\n", peers, op_bytes,
+                     kWindowBytes);
+        std::exit(2);
+    }
     Session s;
     if (not open_session(&s, peers, imp)) return out;
 
@@ -280,11 +287,6 @@ RunOutcome drive(const srdsim::Impairments& imp, int peers, int ops_per_peer, si
         }
     }
 
-    if (size_t(peers) * op_bytes > kWindowBytes) {
-        std::fprintf(stderr, "drive: %d peers of %zu bytes do not fit the %zu-byte window\n", peers, op_bytes,
-                     kWindowBytes);
-        return out;
-    }
     std::vector<char> src(op_bytes ? op_bytes : 1, 'L');
     srdsim::Scheduler::Options o;
     o.mode = mode;
