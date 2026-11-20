@@ -385,7 +385,9 @@ struct RmaCtx {
     // this rank sent, a get's fences bytes this rank is waiting to receive, and the same entry point
     // serves both. Approximate across ranks the same way `send_holds_any_of` already is -- `iflush`'s
     // own `rank` argument is accepted and ignored below, as it always was.
-    std::atomic<int64_t> pending_gets{0};
+    // Counted in bytes, not gets: a reply of several chunks lands as several frames, each reported with its
+    // own length, so a count of gets would reach zero at the first frame and then go negative.
+    std::atomic<int64_t> pending_get_bytes{0};
     std::unique_ptr<srdsim::Scheduler> sched;
     uint64_t next_op_id = 1;
     bool has_error = false;
@@ -1215,7 +1217,7 @@ bool pinned_staging() {
 bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t length,
                                uint32_t dest_window, uint64_t dest_off, uint32_t requester_rank,
                                uint64_t owner_token, void* user);
-void srdsim_handle_get_response_landed(uint64_t owner_token, void* user);
+void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, void* user);
 
 #ifdef SRDSIM_WITH_CUDA
 // Creates `n` events into `out`, or none: a partly built ring would hand out null events later.
@@ -2563,7 +2565,7 @@ ncclResult_t submit(RmaCtx* ctx, const srdsim::Op& op, void** request) {
     // A get request names nothing in `dst_window`/`dst_off` -- see the note on `Scheduler::note_overlap`
     // -- so counting it here would manufacture a cross-context overlap against window 0 the same way.
     if (submitted and with_id.is_get_request) {
-        ctx->pending_gets.fetch_add(1, std::memory_order_relaxed);
+        ctx->pending_get_bytes.fetch_add(static_cast<int64_t>(with_id.bytes), std::memory_order_relaxed);
         if (log_ops())
             logf("op %llu on context %p is a get: fetch %zu byte(s) from peer %d window %u off %llu "
                  "into local window %u off %llu",
@@ -3205,7 +3207,7 @@ ncclResult_t srdsim_iput_signal(void* rmaCtx, int /*context*/, uint64_t srcOff, 
 // A get travels as a request (below, answered on the peer's own context by `srdsim_handle_get_request`)
 // and comes back as an ordinary placement tagged GetResponse. Its own local completion, like a put's,
 // means only "handed to the wire" -- the data landing is what `iflush`/`flushAsync` fence on, tracked by
-// `RmaCtx::pending_gets`.
+// `RmaCtx::pending_get_bytes`.
 //
 // EFA-GDA itself has no Get: the capability this reproduces is aws-ofi-nccl's host-proxy GIN backend
 // (`nccl_ofi_gin.h`'s `iget`, over `fi_read`), which DeepEP's engram fetch is written against. Enabling
@@ -3276,7 +3278,7 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
 
 // Releases the `iflush`/`flushAsync` request that is fencing on this get, now that its reply has
 // actually landed rather than merely been sent.
-void srdsim_handle_get_response_landed(uint64_t owner_token, void* /*user*/) {
+void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, void* /*user*/) {
     // The token is this rank's own `RmaCtx*`, chosen at `iget()` time and never interpreted by the
     // peer in between (the peer only ever echoes it back). Validated against `g_live_contexts` and used
     // under the same lock `destroy_context` erases and deletes under, rather than trusted outright and
@@ -3288,7 +3290,7 @@ void srdsim_handle_get_response_landed(uint64_t owner_token, void* /*user*/) {
         logf("a get response named a context (%p) that is not currently live; dropping", static_cast<void*>(ctx));
         return;
     }
-    ctx->pending_gets.fetch_sub(1, std::memory_order_relaxed);
+    ctx->pending_get_bytes.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
 }
 
 ncclResult_t srdsim_iflush(void* rmaCtx, int /*context*/, void* /*mhandle*/, uint32_t /*rank*/,
@@ -3348,11 +3350,11 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
     if (not complete) {
         std::lock_guard<std::mutex> g(r->ctx->mu);
         // A flush fences both directions on this context: the scheduler being idle is the put side
-        // (everything this rank sent has been released), `pending_gets` is the get side (every reply
+        // (everything this rank sent has been released), `pending_get_bytes` is the get side (every reply
         // this rank is waiting on has actually landed, not merely been sent by the peer). The same
         // entry point serves both, and `iflush`'s own `rank` argument does not narrow it to one peer.
         complete = r->is_flush
-                 ? r->ctx->sched->idle() and r->ctx->pending_gets.load(std::memory_order_relaxed) == 0
+                 ? r->ctx->sched->idle() and r->ctx->pending_get_bytes.load(std::memory_order_relaxed) == 0
                  : r->ctx->sched->complete(r->op_id);
     }
 #ifdef SRDSIM_WITH_CUDA
@@ -3361,7 +3363,7 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
     if (complete and not r->done_at_issue and delivery_async()) {
         drain_sends();
         complete = r->is_flush
-                 ? not send_holds_any_of(r->ctx) and r->ctx->pending_gets.load(std::memory_order_relaxed) == 0
+                 ? not send_holds_any_of(r->ctx) and r->ctx->pending_get_bytes.load(std::memory_order_relaxed) == 0
                  : not send_holds(r->ctx, r->op_id);
     }
 #endif

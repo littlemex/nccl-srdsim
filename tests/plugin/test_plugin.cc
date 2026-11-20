@@ -247,10 +247,11 @@ void get_then_flush(Rank& R, size_t n, int salt, bool data_first) {
 }
 void get_one_chunk_flush(Rank& R) { get_then_flush(R, (4 << 10) + 13, 7, true); }
 void get_multichunk_flush(Rank& R) { get_then_flush(R, (64 << 10) + 13, 8, true); }
-// A flush issued straight after a one-chunk get, with the owner stopped: the flush must not complete
-// before the get's reply has landed, and the data must be in place when it does.
-void get_one_chunk_early_flush(Rank& R) {
-    constexpr size_t n = (4 << 10) + 13, remote = (768 << 10) + 7, local = (900 << 10) + kGuard;
+// A flush issued straight after a get, with the owner stopped: the flush must not complete before the
+// whole reply has landed, and the data must be in place when it does. For a reply of several chunks this is
+// the case that catches a fence released when its count passes through zero part way.
+void get_early_flush(Rank& R, size_t n) {
+    constexpr size_t remote = (768 << 10) + 7, local = (900 << 10) + kGuard;
     if (g_rank == 1) fill(R.at(remote), n, 1, 11);
     barrier("owner filled");
     if (g_rank == 0) {
@@ -270,6 +271,8 @@ void get_one_chunk_early_flush(Rank& R) {
         wait_flag(0, "requester-done");
     }
 }
+void get_one_chunk_early_flush(Rank& R) { get_early_flush(R, (4 << 10) + 13); }
+void get_multichunk_early_flush(Rank& R) { get_early_flush(R, (64 << 10) + 13); }
 void flush_without_get(Rank& R) { get_then_flush(R, 0, 9, false); }
 
 // Under SRDSIM_DRY_RUN=1 every operation completes without moving data. Two puts, the second waited for
@@ -369,6 +372,7 @@ const std::vector<Scenario>& scenarios() {
         {"get_one_chunk_flush", get_one_chunk_flush, 2, {"srd"}, {1}, nullptr},
         {"get_multichunk_flush", get_multichunk_flush, 2, {"srd"}, {1}, nullptr},
         {"get_one_chunk_early_flush", get_one_chunk_early_flush, 2, {"srd"}, {1}, nullptr},
+        {"get_multichunk_early_flush", get_multichunk_early_flush, 2, {"srd"}, {1, 2, 3}, nullptr},
         {"flush_without_get", flush_without_get, 2, {"srd"}, {1}, nullptr},
         {"register_during_traffic", register_during_traffic, 2, {"srd"}, {1, 2, 3}, nullptr},
         {"refused_then_real", refused_then_real, 2, {"srd"}, {1}, nullptr},
@@ -383,7 +387,6 @@ struct Expected { const char* scenario; const char* mode; int table; const char*
 const Expected kExpected[] = {
     {"get_completes_with_data", "*", 0, "assert:data-at-early-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
-    {"get_multichunk_flush", "*", 0, "stall:flush", "#26: pending_gets is decremented once per chunk of a get"},
 };
 
 const Expected* expected_for(const Scenario& sc, const char* mode, int table) {
