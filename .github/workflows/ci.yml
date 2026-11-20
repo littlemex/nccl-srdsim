@@ -17,6 +17,32 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # The host tests under each sanitizer. ThreadSanitizer checks the threads of every test process,
+  # including a process a test forks; it cannot see a race between two processes, and a finding in a
+  # forked child fails the test only through the child's exit status. The plugin is not built here.
+  host-tests-sanitized:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined, thread]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # The sanitizers of this toolchain cannot map their shadow memory with more ASLR entropy than 28
+      # bits. The runner image used 28 when this was written; setting it keeps the jobs working on an
+      # image that does not, and the value before the change is logged.
+      - name: Lower ASLR entropy for the sanitizers
+        run: |
+          sudo sysctl vm.mmap_rnd_bits
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSRDSIM_SANITIZER=${{ matrix.sanitizer }}
+          cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
   # The plugin against NCCL's plugin ABI for each supported NCCL release, in each delivery
   # configuration, with declaration-only CUDA stand-ins. Checks the generated NCCL version, the op
   # tables exported, and that each configuration really compiled its delivery path in.

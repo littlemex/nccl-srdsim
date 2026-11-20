@@ -780,6 +780,45 @@ void test_deregistration_waits_for_a_write_under_way() {
     agent.stop();
 }
 
+// T12. A reader that waits on the signal word with an acquire load, as a GIN receiver does, and then reads the
+// bytes the signal guards, without asking the agent anything. The agent must release the word after the
+// bytes it placed before it, or that reader races with them. Only ThreadSanitizer detects the race: built
+// without it, a relaxed add passes on x86, where the locked add is a full barrier, and almost always elsewhere.
+void test_a_signal_word_orders_the_bytes_before_it() {
+    std::vector<char> data(4096, 0);
+    alignas(8) uint64_t signal_word = 0;
+    srdsim::WindowTable windows;
+    const uint32_t data_id = windows.add({data.data(), data.size(), false});
+    const uint32_t signal_id = windows.add({&signal_word, sizeof(signal_word), false});
+
+    srdsim::ReceiveAgent::Hooks hooks{};
+    hooks.log = [](const char*) {};
+    srdsim::ReceiveAgent agent(&windows, hooks);
+    int sv[2];
+    expect(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "T12 a socket pair was created");
+    expect(agent.serve(sv[1]), "T12 the agent serves the connection");
+    srdsim::SendLinks links;
+    links.set(0, sv[0]);
+
+    std::vector<char> payload(data.size(), 's');
+    expect(links.send_placement(0, data_id, 0, payload.data(), payload.size(), 1), "T12 the payload is sent");
+    expect(links.send_signal(0, signal_id, 0, 1, 1), "T12 the signal is sent after it");
+    uint64_t seen = 0;
+    for (int i = 0; i < 2000 and seen == 0; ++ i) {
+        seen = __atomic_load_n(&signal_word, __ATOMIC_ACQUIRE);
+        if (seen == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    expect(seen == 1, "T12 the signal arrived");
+    // Without the signal nothing orders the agent's write before this read, so the bytes are not read then.
+    if (seen == 1) {
+        size_t wrong = 0;
+        for (char c : data) wrong += c != 's';
+        expect(wrong == 0, ctx("T12 every byte placed before the signal is visible once it is (%zu wrong)", wrong));
+    }
+    links.shutdown_all();
+    agent.stop();
+}
+
 int main() {
     test_the_four_silent_losses();
     test_a_finished_connection_releases_its_number();
@@ -789,6 +828,7 @@ int main() {
     test_delivery_and_order();
     test_bytes_land_correctly();
     test_bad_descriptors_are_refused();
+    test_a_signal_word_orders_the_bytes_before_it();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

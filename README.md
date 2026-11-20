@@ -75,7 +75,7 @@ The script also writes `/tmp/srdsim-inc/cuda-stub`, declaration-only CUDA stand-
 | `SRDSIM_BUILD_PLUGIN` | `OFF` | Build `libnccl-rma-srdsim.so` |
 | `SRDSIM_WITH_CUDA` | `ON` | Deliver into device memory through the CUDA driver API. Without it the plugin handles host memory only |
 | `SRDSIM_WITH_GDRCOPY` | `OFF` | Also deliver into device memory through GDRCopy BAR mappings when `/dev/gdrdrv` is present. Needs `SRDSIM_WITH_CUDA` |
-| `SRDSIM_ASAN` | `OFF` | Build with AddressSanitizer |
+| `SRDSIM_SANITIZER` | empty | Build with a sanitizer: `address`, `undefined` or `thread`. Under `ctest`, which sets the sanitizer options itself (overriding any in the environment), a finding fails the test. The sanitizers of GCC 13 need `sudo sysctl -w vm.mmap_rnd_bits=28` on hosts with more ASLR entropy, such as Ubuntu 24.04; ThreadSanitizer fails at startup without it |
 
 ## Use
 
