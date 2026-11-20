@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // The plugin's op table, loaded the way NCCL loads it: dlopen the library, look up ncclRmaPlugin_vN for
 // one version N, and call through it. The wrappers give every version the same calls, so a scenario runs
-// unchanged on v14, v15 and v16; what a newer table adds (the optFlags of v15, getRmaProperties of v16) is
-// passed or skipped by version.
+// unchanged on v14, v15 and v16. What a newer table adds is passed where the loaded table has it: optFlags
+// (v15) is dropped for v14, and getRmaProperties (v16) reports false from hasRmaProperties() before v16.
 #pragma once
 
 #include "nccl_rma.h"
@@ -16,9 +16,11 @@
 #if defined(RMA_V16_H_)
 #define V16(expr) (v16_->expr)
 #define V15UP(expr) (v15_ ? (v15_->expr) : (v16_->expr))
+#define HAS_V16() (v16_ != nullptr)
 #else
 #define V16(expr) (ncclInternalError)
 #define V15UP(expr) (v15_->expr)
+#define HAS_V16() false
 #endif
 
 namespace harness {
@@ -45,6 +47,7 @@ public:
     }
 
     int version() const { return version_; }
+    bool hasRmaProperties() const { return HAS_V16(); }
 
     // Every call below goes to the same field of whichever table was loaded.
 #define SRDSIM_TABLE_CALL(expr) \
@@ -75,7 +78,6 @@ public:
     ncclResult_t closeListen(void* listenComm) { return SRDSIM_TABLE_CALL(closeListen(listenComm)); }
     ncclResult_t test(void* collComm, void* request, int* done) { return SRDSIM_TABLE_CALL(test(collComm, request, done)); }
     ncclResult_t progress(void* rmaCtx) { return SRDSIM_TABLE_CALL(rmaProgress(rmaCtx)); }
-    ncclResult_t queryLastError(void* rmaCtx, bool* hasError) { return SRDSIM_TABLE_CALL(queryLastError(rmaCtx, hasError)); }
     ncclResult_t finalize(void* ctx) { return SRDSIM_TABLE_CALL(finalize(ctx)); }
 
     ncclResult_t iput(void* rmaCtx, int context, uint64_t srcOff, void* srcMh, size_t size, uint64_t dstOff,
@@ -100,6 +102,9 @@ public:
     ncclResult_t iflush(void* rmaCtx, int context, void* mh, uint32_t rank, void** request) {
         return SRDSIM_TABLE_CALL(iflush(rmaCtx, context, mh, rank, request));
     }
+#if defined(RMA_V16_H_)
+    ncclResult_t getRmaProperties(void* collComm, ncclRmaProperties_v16_t* p) { return v16_->getRmaProperties(collComm, p); }
+#endif
 #undef SRDSIM_TABLE_CALL
 
 private:
@@ -115,4 +120,5 @@ private:
 }  // namespace harness
 
 #undef V16
+#undef HAS_V16
 #undef V15UP

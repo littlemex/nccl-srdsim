@@ -239,6 +239,9 @@ jobs:
           ./ci/check_exports.sh build/libnccl-rma-srdsim.so "$RUNNER_TEMP/nccl-src"
           EXPORTS=$(./ci/expected_exports.sh "$RUNNER_TEMP/nccl-src")
           ./dlopen_check "$PWD/build/libnccl-rma-srdsim.so" $(grep -v '^!' <<<"$EXPORTS")
+          want=$(grep -v '^!' <<<"$EXPORTS" | sed 's/^ncclRmaPlugin_v//' | sort -n | tr '\n' ' ')
+          have=$(ctest --test-dir build -N -R plugin_harness | sed -n 's/.*plugin_harness_v\([0-9]*\)$/\1/p' | sort -n | tr '\n' ' ')
+          test "$want" = "$have" || { echo "the harness runs tables '$have' but the plugin exports '$want'"; exit 1; }
       - name: The plugin harness, once per op-table version
         run: ctest --test-dir build -R plugin_harness --output-on-failure --verbose
       - name: The same build serves every pinned release
