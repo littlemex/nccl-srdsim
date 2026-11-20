@@ -372,8 +372,8 @@ struct Rank {
         stop_.store(true);
         proxy_.join();
         check(rma.destroyContext(rmaCtx), "destroyContext");
-        (void)rma.deregMrSym(coll, signalMh);
-        (void)rma.deregMrSym(coll, dataMh);
+        check(rma.deregMrSym(coll, signalMh), "deregMrSym signals");
+        check(rma.deregMrSym(coll, dataMh), "deregMrSym data");
         check(rma.closeColl(coll), "closeColl");
         check(rma.finalize(ctx), "finalize");
     }

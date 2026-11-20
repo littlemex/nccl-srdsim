@@ -3044,8 +3044,10 @@ ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
     // delivery stream after its write returned. NCCL frees the memory once this returns, so it waits.
     // A queued send may point into it too. The result is reported after the cleanup below, which has to
     // happen either way: NCCL frees the memory regardless of what this returns.
+    // Without a delivery context no device window was ever registered, so nothing is on the delivery stream
+    // and nothing can be queued to send (`send_unit_async` needs the context): there is nothing to wait for.
     bool drained = true;
-    if (delivery_async()) {
+    if (delivery_async() and delivery().ctx != nullptr) {
         auto* mr = static_cast<MrHandle*>(mhandle);
         if (mr != nullptr) {
             drained = finish_sends(nullptr, /*send=*/true);
