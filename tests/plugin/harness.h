@@ -218,6 +218,7 @@ struct Op {
     bool refused = false;              // the case expects the plugin to refuse it; it may name memory outside the window
     bool keep_source = false;          // the source is shared with later operations, so it is not overwritten on retirement
     int  plugin_context = -1;          // the context index passed to the plugin, when not `context` (which picks the queue)
+    void* signal_mh = nullptr;         // the signal's window, when it is not the rank's signal window
 };
 
 // What the rank's main thread sees of one operation: `done` when `test` reported it, `retired` when it
@@ -265,6 +266,14 @@ struct Rank {
         check(rma.createContext(coll, kContexts, &rmaCtx), "createContext");
         resume();
     }
+
+    // Registers one more window, collectively, and deregisters it.
+    void* register_window(void* base, size_t bytes, int type, uint64_t flags) {
+        void* mh = nullptr;
+        check(rma.regMrSym(coll, base, bytes, type, flags, &mh), "regMrSym extra");
+        return mh;
+    }
+    void deregister_window(void* mh) { check(rma.deregMrSym(coll, mh), "deregMrSym extra"); }
 
     const Ticket* last_ticket() {
         std::lock_guard<std::mutex> g(mu_);
@@ -470,7 +479,8 @@ private:
                 break;
             case Op::Signal:   // NCCL's VA signal: no source and no destination window
                 check(rma.iputSignal(rmaCtx, c, 0, nullptr, 0, 0, nullptr, uint32_t(o.peer), o.word * sizeof(uint64_t),
-                                     signalMh, o.value, NCCL_GIN_SIGNAL_OP_ADD, o.strong, flags, &req), "iputSignal");
+                                     o.signal_mh ? o.signal_mh : signalMh, o.value, NCCL_GIN_SIGNAL_OP_ADD, o.strong,
+                                     flags, &req), "iputSignal");
                 break;
             case Op::PutSignal:
                 check(rma.iputSignal(rmaCtx, c, o.srcOff, dataMh, o.size, o.dstOff, dataMh, uint32_t(o.peer),
