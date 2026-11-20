@@ -11,9 +11,7 @@ about bandwidth or latency.
 
 ## What it covers
 
-NCCL's GIN proxy backend (`NCCL_GIN_TYPE=2`) routes every device-initiated put, signal and get through
-the host RMA plugin interface. This plugin implements that interface (it exports `ncclRmaPlugin_v14`, and `ncclRmaPlugin_v15` when built against headers that define it; CI covers NCCL 2.31.2, 2.32.3 and 2.32.6, and newer interface versions are tracked in [#13](https://github.com/littlemex/nccl-srdsim/issues/13)), so anything
-whose remote writes travel through it is in scope, whatever library issued them:
+NCCL's GIN proxy backend (`NCCL_GIN_TYPE=2`) routes every device-initiated put, signal and get through the host RMA plugin interface. This plugin implements that interface, so anything whose remote writes travel through it is in scope, whatever library issued them:
 
 | In scope | Out of scope |
 |---|---|
@@ -46,7 +44,17 @@ The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specifica
 | Build the plugin | The plugin headers of NCCL 2.31.2 to 2.32.6 (from an NCCL source checkout, see below) and the CUDA toolkit, whose headers `nccl.h` includes; NVRTC for delivery into device memory; optionally GDRCopy. Built in CI against CUDA 12.8 and 13.0 |
 | Run the plugin | An NVIDIA GPU, NCCL 2.31.2 or later, and the CUDA driver. A build with the CUDA delivery path also loads the NVRTC runtime of the CUDA version it was built with, and a GDRCopy build loads `libgdrapi.so`; if either cannot be found, the plugin does not load |
 
-CI builds against NCCL 2.31.2, 2.32.3 and 2.32.6, CUDA 12.8 and 13.0, and GDRCopy 2.5.2.
+## NCCL versions
+
+NCCL looks up the newest op-table version it knows (`ncclRmaPlugin_vN`) and uses only that one, so one build serves several NCCL releases. Built against the newest supported headers, the plugin exports `ncclRmaPlugin_v14`, `ncclRmaPlugin_v15` and `ncclRmaPlugin_v16`:
+
+| NCCL release | Table it loads from this plugin |
+|---|---|
+| 2.31.2 | v15 |
+| 2.32.3 | v16 |
+| 2.32.6 | v16 (2.32.6 also defines v17, which the plugin does not export yet: [#13](https://github.com/littlemex/nccl-srdsim/issues/13)) |
+
+Every upstream version the repository builds and tests against (NCCL releases and their commits, CUDA toolkits, GDRCopy, the reference aws-ofi-nccl commit) is pinned in [`versions.env`](versions.env); CI reads it and fails when a document or workflow names any other.
 
 ## Build
 
