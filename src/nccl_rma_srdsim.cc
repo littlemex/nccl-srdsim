@@ -143,6 +143,24 @@ size_t env_size(const char* name, size_t dflt) {
 //   SRDSIM_LOG_OPS=1  log every iput / iputSignal with its arguments
 //   SRDSIM_DRY_RUN=1  accept operations and complete them immediately without moving any data
 // A dry run cannot produce correct results; the point is to watch the call sequence without hanging NCCL.
+// The largest frame payload a receiver accepts: the chunk size every rank sends with (the scheduler never
+// emits a placement larger, and get replies use the same size), and never less than the transport's default,
+// so that ranks configured with different chunk sizes up to that default still interoperate.
+// SRDSIM_CHUNK_BYTES, at most the 64 MiB a peer's outbox holds: a frame larger than the outbox could never
+// be queued behind another, and a receiver that accepts arbitrary lengths loses its defence against a
+// desynchronised stream.
+constexpr size_t kMaxChunkBytes = size_t{64} << 20;
+size_t chunk_bytes_setting() {
+    static const size_t v = [] {
+        const size_t asked = env_size("SRDSIM_CHUNK_BYTES", 8192);
+        if (asked <= kMaxChunkBytes) return asked;
+        logf("SRDSIM_CHUNK_BYTES=%zu is above the %zu byte limit; using the limit", asked, kMaxChunkBytes);
+        return kMaxChunkBytes;
+    }();
+    return v;
+}
+size_t max_frame_bytes() { return std::max<size_t>(chunk_bytes_setting(), size_t{1} << 22); }
+
 bool log_ops() {
     static const bool v = env_size("SRDSIM_LOG_OPS", 0) != 0;
     return v;
@@ -213,7 +231,7 @@ srdsim::Scheduler::Options scheduler_options() {
         o.mode = srdsim::Mode::Srd;
     }
     o.seed = env_size("SRDSIM_SEED", 1);
-    o.chunk_bytes = env_size("SRDSIM_CHUNK_BYTES", 8192);
+    o.chunk_bytes = chunk_bytes_setting();
     o.trace = env_size("SRDSIM_TRACE", 0) != 0;
     o.detect_overlaps = env_size("SRDSIM_DETECT_OVERLAP", 0) != 0;
     const std::string kind = env_str("SRDSIM_DEFER_KIND", "any");
@@ -908,7 +926,7 @@ FirstDeviceError& g_first_device_error = *new FirstDeviceError;
 // slot. Read from the same variable the scheduler chunks by, so a change to one cannot leave the other
 // refusing every frame and silently falling back to pageable copies.
 size_t staging_capacity() {
-    static const size_t v = env_size("SRDSIM_CHUNK_BYTES", 8192);
+    static const size_t v = chunk_bytes_setting();
     return v;
 }
 
@@ -2980,6 +2998,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     hooks.user = cc;
     hooks.log = [](const char* m) { logf("agent: %s", m); };
     cc->agent = std::make_unique<srdsim::ReceiveAgent>(&cc->windows, hooks);
+    cc->agent->set_max_frame_bytes(max_frame_bytes());
     if (log_ops()) {
         g_stall_monitor.watch(cc);
         // The transport reports where it is through the same breadcrumb map the rest of the plugin
@@ -3444,7 +3463,8 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
              static_cast<unsigned long long>(owner_token), requester_rank, cc->nranks);
         return false;
     }
-    // Frames no larger than the requester accepts (the transport's default frame limit), and never empty.
+    // Frames no larger than every receiver accepts whatever its own chunk size (the transport's default frame
+    // limit, the floor of `max_frame_bytes`), and never empty.
     const size_t chunk = std::min<size_t>(std::max<size_t>(scheduler_options().chunk_bytes, 1), size_t{1} << 22);
     std::vector<char> bytes;
 #ifdef SRDSIM_WITH_CUDA
