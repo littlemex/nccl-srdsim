@@ -622,7 +622,7 @@ private:
         // A free choice among the options, inside whatever constraint the mode applied above.
         size_t k = rng_.below(total);
         for (const Avail& a : avail) {
-            if (k < static_cast<size_t>(a.chunks)) return {static_cast<int>(a.i), pending_[a.i].kth_unplaced(static_cast<int>(k))};
+            if (k < static_cast<size_t>(a.chunks)) return {static_cast<int>(a.i), pending_[a.i].kth_unplaced(0)};
             k -= static_cast<size_t>(a.chunks);
             if (a.signal) {
                 if (k == 0) return {static_cast<int>(a.i), -1};
