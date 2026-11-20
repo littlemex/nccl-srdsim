@@ -124,6 +124,8 @@ The last command prints, for each mode, a line ending in `PASS` or `FAIL` follow
 
 ## Result on record
 
+The recipe in its current form (`tests/gpu/recipe.sh`, reading `versions.env`) was run as written once on the same `g7.2xlarge`; every mode produced its required outcome. The numbers below come from the four runs of the earlier form of the same commands.
+
 All seven modes produced their required outcome in each of four runs of `run.sh`.
 
 ![For each of the seven modes, the exit status of each of the five seeds, the same in every run: 0 in every seed of the six modes that keep I1, which means no mismatched element, and 1 in every seed of violate-i1, which means mismatched elements were found; every mode met its required outcome. Below, the range of mismatched elements rank 0 found per seed under violate-i1: from 3,157,632 (24%) to 11,900,672 (91%) of the 13,107,200 elements it checks per seed.](images/gpu-result.svg)
