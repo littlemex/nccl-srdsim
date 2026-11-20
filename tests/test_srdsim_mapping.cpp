@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The two pieces of arithmetic in `src/srdsim_mapping.h`: the offset of a window within its first page,
-// and the staging slot a thread claims.
+// The arithmetic in `src/srdsim_mapping.h`: the address arithmetic behind a BAR mapping, and the layout of
+// the pinned staging pool (no staging slot overlaps the signal's bytes).
 //
 // The code that uses them only compiles with `gdrapi.h` and only runs where `/dev/gdrdrv` exists, and a
-// small run reaches few of their values: page-aligned windows always have a lead offset of zero, and a few
-// threads never claim the last slot. So the cases are enumerated: every slot, and lead offsets across a
+// small run reaches few of their values: page-aligned windows always have a lead offset of zero, and a run
+// with only a few threads never claims the last slot. So the cases are enumerated: every slot, and lead offsets across a
 // page.
 
 #include "srdsim_mapping.h"

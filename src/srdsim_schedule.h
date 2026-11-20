@@ -438,9 +438,9 @@ private:
         int chunk_index = -1;   // -1 means the signal unit
     };
 
-    // Which operation `defer-one` is holding. The flag is separate from the id so that "not chosen yet"
-    // is never confused with a legal id; ids are also checked non-zero and unique on submit, since a
-    // repeated id would make `pick()` re-choose the same operation forever.
+    // Which operation `defer-one` is holding. The escape at the bottom of `pick()` tests `have_deferred_`,
+    // never `deferred_id_ != 0`: guarded by the id it would never fire for id 0, and `defer-one` would
+    // stall with nothing refused. Ids are also refused on submit if zero or already pending.
     uint64_t deferred_id_ = 0;
     bool     have_deferred_ = false;
 
@@ -522,8 +522,8 @@ private:
             // The deferred operation is the only thing left, so stop deferring it. Without this the
             // scheduler would report itself idle with work outstanding, which is the one thing a
             // scheduler must never do.
-            // Stop deferring and look once more, iteratively. The old version recursed, and with two
-            // operations sharing an id it re-chose the same one and never terminated.
+            // Stop deferring and look once more, iteratively rather than by recursion, so that no
+            // sequence of ids can make it re-choose the same operation without bound.
             if (opt_.mode == Mode::DeferOne and have_deferred_) {
                 have_deferred_ = false;
                 deferred_id_ = 0;

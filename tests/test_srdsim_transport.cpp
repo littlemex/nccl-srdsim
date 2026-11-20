@@ -438,7 +438,7 @@ void test_the_four_silent_losses() {
     // refused. Bounded by the largest registered window, which can be gigabytes, a garbage length of hundreds
     // of megabytes would be judged legitimate, allocated, and waited for forever.
     {
-        // The declared size is a large production window, 1.82 GB. Nothing reads it, and nothing may -- the
+        // The declared size is a large window, 1.82 GB. Nothing reads it, and nothing may -- the
         // point is that a window bound would accept a garbage length of hundreds of megabytes.
         // A one-megabyte window would have been refused either way and the check would prove nothing.
         std::vector<char> big(1 << 20, 0);

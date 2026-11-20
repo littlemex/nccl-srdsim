@@ -304,7 +304,7 @@ struct Mark {
 // Symmetric memory
 //
 // Exporting a cuMem allocation across a process boundary works, but giving a *different* GPU access to
-// it needs peer access, which many instances do not have and which cannot exist across hosts at all.
+// it needs peer access, which is not always available and which cannot exist across hosts at all.
 //
 // So this plugin does not reach into the peer's window. `regMrSym` is collective, so numbering the
 // windows in registration order gives both sides a name they agree on, and the receiving side
@@ -409,8 +409,8 @@ struct Request {
 //
 // A `std::vector` cannot provide that: growing it reallocates and invalidates every pointer already given
 // to NCCL, and the next `test()` reads a freed `Request` and locks a mutex at whatever address that
-// produces. A deque gives stable element addresses, which is the property this needs and the only
-// reason to prefer it here.
+// produces, which shows up as a SIGSEGV inside `pthread_mutex_lock`, far from this file. A deque gives stable
+// element addresses, which is the property this needs and the only reason to prefer it here.
 struct RequestSlab {
     // Non-zero while a request is live, so a stale or foreign pointer is caught and reported instead
     // of being followed. Cheap, and the alternative is the crash described above.
@@ -498,9 +498,10 @@ CUstream device_stream();
 // ordinary stores.
 //
 // WHY THIS REPLACES THE CUDA COPY
-// While kernels are resident and spinning for data, a host-issued transfer in the same context may not
-// complete at all, whatever its size, stream or source allocation: the kernel waits for bytes the copy
-// would deliver and the copy waits for the kernel to stop.
+// While kernels are resident and spinning for data, a host-issued transfer in the same context does not
+// complete, whatever its size, stream, source allocation or pinning: it blocks until the kernel times out,
+// then returns CUDA_ERROR_LAUNCH_FAILED and the context is lost. The kernel waits for bytes the copy would
+// deliver and the copy waits for the kernel to stop.
 //
 // A BAR mapping breaks that cycle: a CPU store through it is visible to a resident kernel at once. The
 // write submits nothing to CUDA, so there is nothing for the kernel to be ahead of in a queue.
@@ -512,8 +513,8 @@ CUstream device_stream();
 // WHAT IS PINNED, AND WHEN
 // Everything, once, at registration. `gdr_pin_buffer` commits BAR aperture rather than deferring it to
 // `gdr_map`, so pinning a subrange is the only way to use less -- and pinning on the data path would
-// replace one risky driver operation in the hot path with another. This card's BAR is 128 GB against a
-// 1.82 GB window, so there is no reason to be clever.
+// replace one risky driver operation in the hot path with another. BAR aperture is normally far larger than
+// a window, so there is no reason to be clever.
 class GdrWindows {
 public:
     // Opened lazily and once. A host without the module gets a single message and the CUDA fallback.
@@ -559,8 +560,9 @@ public:
             return;
         }
         // Already mapped ranges are reused rather than pinned again. NCCL registers the same window on
-        // more than one communicator, and pinning and mapping it afresh for each registration spends BAR aperture on a range that is already resident, doubles the kernel's
-        // bookkeeping, and leaves two host mappings for one piece of device memory, of which the lookup
+        // more than one communicator, and pinning and mapping it afresh for each registration spends BAR
+        // aperture on a range that is already resident, doubles the kernel's bookkeeping, and leaves two host
+        // mappings for one piece of device memory, of which the lookup
         // can only ever use the first. Nothing good comes of the second one.
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -591,8 +593,7 @@ public:
         // The pinned range starts at the GPU page *containing* the window, which can be below the window
         // base. Every access therefore carries a lead offset -- and the mapping has to be long enough to
         // hold that lead as well as the window, or a write at the far end runs off the end of the mapping
-        // by exactly the lead. Mapping only `bytes` is correct only for a window that begins on a page, and
-        // NCCL registers windows that do not.
+        // by exactly the lead. Mapping only `bytes` is correct only when the lead is zero.
         //
         // The size is asked for before the map, so `gdr_get_info` comes first: it is valid after the pin.
         gdr_info_t info{};
@@ -802,7 +803,8 @@ size_t staging_capacity() {
 // Both halves of that sentence are load-bearing.
 //
 // *Never freed*: `cuMemFreeHost` can wait on the context, and so never return, while resident kernels
-// spin for the bytes these buffers carry; growing a buffer by reallocation would call it on the data path.
+// spin for the bytes these buffers carry, and other threads' driver calls then wait behind it on a libcuda
+// lock; growing a buffer by reallocation would call it on the data path.
 //
 // *Reserved early*: NVIDIA lists page-locked host allocation among the operations that implicitly
 // synchronize the context, so allocating pinned memory waits for the context to go quiet. The context
@@ -951,7 +953,7 @@ PinnedPool g_pinned;
 //
 // So the plugin copies from a context of its own, on the device of the windows it writes. The windows
 // must be VMM allocations (`ncclMemAlloc`), whose mappings belong to the process rather than to a context,
-// so the same addresses are valid there; the probe's `ctx2` cells write exactly such an allocation.
+// so the same addresses are valid there.
 // Registration refuses any other kind of device window rather than let a copy into it fail later
 // (`check_delivery_window`). Sources of puts are registered windows too, so the same check covers them.
 // SRDSIM_DELIVERY_CONTEXT=primary uses the device's primary context instead, to reproduce the deadlock
@@ -1122,8 +1124,9 @@ bool check_delivery_window(void* base) {
 
 // Process exit tears the CUDA driver down from the main thread's exit handlers, while NCCL's threads and the
 // plugin's agents may still be running. A driver call made then lands in structures being freed, and either
-// crashes the calling thread or corrupts the heap the driver's own teardown then frees. This happens in
-// processes that exit without destroying their communicators.
+// crashes the calling thread or corrupts the heap, and glibc then aborts in the driver's own teardown with
+// `malloc_consolidate(): unaligned fastbin chunk detected`. This happens in processes that exit without
+// destroying their communicators.
 //
 // So the plugin registers an exit handler when it first opens delivery. Handlers run in reverse order of
 // registration, and the plugin is loaded after the CUDA runtime has initialised, so this one runs before the
@@ -1467,9 +1470,9 @@ bool send_unit_async(const srdsim::Unit& u, RmaCtx* owner) {
 #endif  // SRDSIM_WITH_CUDA
 
 // SRDSIM_PROBE_RECORD_BYTES / SRDSIM_PROBE_STAMP_OFFSET: a diagnostic that knows one thing about the application's
-// layout: records of a fixed size, each with a stamp (a small non-negative int) at a fixed offset, as DeepEP's
-// combine sends. When an operation's bytes are a whole
-// number of records, every record's stamp is looked at where the bytes are on the host: the sender's copy at
+// layout: records of a fixed size (as DeepEP's combine sends), in which the application has been instrumented to
+// write a stamp (a small non-negative int) at a fixed offset. When an operation's bytes are a whole number of
+// records, every record's stamp is looked at where the bytes are on the host: the sender's copy at
 // submit (with SRDSIM_SNAPSHOT_SOURCE=1) and the receiver's before it writes them to the device. An operation in
 // which some records carry a stamp and others do not is reported with where it was seen, so a record that is
 // wrong on the wire tells a wrong read of the source apart from a destination overwritten after delivery.
@@ -1864,7 +1867,8 @@ thread_local bool t_unsettled = false;
 
 // The agent is about to wait for its next frame. Whatever this thread submitted is waited for now, once per
 // burst rather than once per frame, so no copy into a window is still pending while the link is quiet --
-// which is when an application that skips its teardown frees its windows without deregistering them.
+// which is when an application that skips its teardown frees its windows without deregistering them. Once
+// per burst, so the wait is not visible in end-to-end run time.
 void delivery_idle(void* /*user*/) {
     if (not t_unsettled) return;
     t_unsettled = false;
@@ -2217,12 +2221,11 @@ void prebuild_signal_kernel() {
 
 // A counter written the way a NIC writes one: by DMA, from a value the transport already knows.
 //
-// This replaced a kernel, and the kernel was the unfaithful part. A NIC does not launch a kernel to
-// increment a counter; it writes eight bytes over the bus. Launching a kernel gave the emulator a
-// dependency on GPU compute that no fabric has, and DeepEP's forwarding CTAs are resident and spinning
-// while they wait for exactly these counters -- so the emulator needed an SM at the moment the code
-// under test was occupying them all, so whether a run completed depended on how many SMs the application
-// left free.
+// A kernel would be the unfaithful choice. A NIC does not launch a kernel to increment a counter; it writes
+// eight bytes over the bus. Launching a kernel would give the emulator a dependency on GPU compute that no
+// fabric has, and resident kernels (DeepEP's forwarding CTAs, for example) spin while they wait for exactly
+// these counters -- so the emulator would need an SM at the moment the code under test occupies them all,
+// and whether a run completes would depend on how many SMs the application leaves free.
 //
 // Correctness rests on one fact from NCCL: the signals region is registered with
 // `NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET`, so the counters are cumulative for the life of the window and
@@ -2251,8 +2254,8 @@ public:
         // nothing worth measuring.
         std::lock_guard<std::mutex> g(mu_);
         const uint64_t staged = (totals_[dst_u64] += value);
-        // Copied out of pinned memory, not off the stack. This is the same defect as the payload path
-        // and it was hidden behind it: with a pageable source `cuMemcpyHtoDAsync` is not asynchronous,
+        // Copied out of pinned memory, not off the stack. This is the same hazard as the payload path: with
+        // a pageable source `cuMemcpyHtoDAsync` is not asynchronous,
         // the driver stages the bytes through a pool of its own and that path waits on a device which
         // resident kernels are occupying while they spin for these very counters. Eight bytes in flight
         // are still eight bytes the driver must stage.
@@ -2740,8 +2743,9 @@ public:
 
     // Called before a communicator is destroyed. Without it the monitor keeps a raw pointer and goes on
     // dereferencing `cc->agent`, `cc->links` and `cc->rma_contexts` every half second after `closeColl`
-    // has deleted it, and a monitor reading freed memory can print anything. `connect` watches the comm
-    // before a dial can fail and delete it, so that path calls this too.
+    // has deleted it, and a monitor reading freed memory can print anything. The monitor watches a comm
+    // only when logging is on, so the hazard is invisible otherwise. `connect` watches the comm before a
+    // dial can fail and delete it, so that path calls this too.
     void unwatch(CollComm* cc) {
         std::lock_guard<std::mutex> g(mu_);
         comms_.erase(std::remove(comms_.begin(), comms_.end(), cc), comms_.end());

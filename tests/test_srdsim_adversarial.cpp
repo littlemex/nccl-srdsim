@@ -6,11 +6,10 @@
 // sender would never send, because that is where a simulator earns its keep: a fabric emulator that
 // crashes on a malformed frame cannot be used to investigate a crash.
 //
-// Each case states the property it checks, written before the code it checks was fixed, so that the test
-// says what the transport promises rather than what the code happens to do.
+// Each case states the property it checks: what the transport promises, not what the code happens to do.
 //
 //   A1  A frame whose length is enormous is refused without allocating it, the link is closed, and the
-//       process survives. A desynchronised stream produces exactly such a length.
+//       process survives. A desynchronised stream can produce such a length.
 //   A2  `offset + length` overflowing 64 bits does not pass the bounds check.
 //   A3  The same, on the signal path.
 //   A4  `serve` after `stop` is refused rather than starting a thread nobody joins.
@@ -532,7 +531,7 @@ void test_shutdown_does_not_interleave_with_a_sender() {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
     // The order matters and getting it wrong deadlocks. `shutdown_all` waits for the peer's send lock,
-    // which is exactly what the fix under test makes it do, and a sender in a loop re-acquires that
+    // which is exactly the behaviour under test, and a sender in a loop re-acquires that
     // lock immediately after every frame. Telling the sender to stop first bounds the wait to the one
     // frame already in flight, which is still mid-frame and still the race this test exists for. Calling
     // shutdown first can starve when the receiver drains slowly.
