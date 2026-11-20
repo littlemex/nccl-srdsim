@@ -45,7 +45,6 @@ These change what is reported, or check something at a cost; they leave the data
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `SRDSIM_LOG_OPS` | flag | off | Logs every put, with its signal if it has one, and every get, with their arguments; copies every log line to stderr; and installs the crash handler |
 | `SRDSIM_TRACE` | flag | off | Logs every unit the schedule releases, to stderr |
 | `SRDSIM_DETECT_OVERLAP` | count | off | `1` counts submissions that overlap an earlier unreleased write to the same peer within a context; `2` or more also checks across contexts. Every submit walks the operations in flight |
 | `SRDSIM_PROBE_RECORD_BYTES` | count | off | Treats payloads that are a whole number of records of this size as records with a 4-byte non-negative stamp, and reports operations in which some records carry the stamp and others do not. The sender side is checked only with `SRDSIM_SNAPSHOT_SOURCE` |
