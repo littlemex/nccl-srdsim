@@ -1,4 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // A GIN user whose correctness rests on invariant I1: a weak signal becomes visible only after its own

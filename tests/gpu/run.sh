@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Run tests/gpu/gin_signal_order.cu under the plugin on one GPU host, in every delivery mode, and check
