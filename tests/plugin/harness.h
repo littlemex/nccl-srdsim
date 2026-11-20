@@ -217,6 +217,7 @@ struct Op {
     bool strong = false;
     bool refused = false;              // the case expects the plugin to refuse it; it may name memory outside the window
     bool keep_source = false;          // the source is shared with later operations, so it is not overwritten on retirement
+    int  plugin_context = -1;          // the context index passed to the plugin, when not `context` (which picks the queue)
 };
 
 // What the rank's main thread sees of one operation: `done` when `test` reported it, `retired` when it
@@ -458,8 +459,9 @@ private:
         (void)rma.progress(rmaCtx);
     }
 
-    void submit(int c, Ticket* t, bool aggregate) {
+    void submit(int queue, Ticket* t, bool aggregate) {
         const Op& o = t->op;
+        const int c = o.plugin_context >= 0 ? o.plugin_context : queue;
         const uint32_t flags = aggregate ? 1u /* ncclRmaOptFlagsAggregateRequests */ : 0u;
         void* req = nullptr;
         switch (o.kind) {
@@ -486,7 +488,7 @@ private:
         // other call NCCL would pass the NULL to test(); the harness fails it outright, which is stricter.
         if (req == nullptr and o.kind != Op::Flush) fail("error", "null-request", "kind %d", int(o.kind));
         if (req == nullptr) t->done.store(1, std::memory_order_release);
-        inflight_[c].push_back({t, req, issued_[c][o.peer] ++});
+        inflight_[queue].push_back({t, req, issued_[queue][o.peer] ++});
     }
 
     // NCCL's proxyGinPollCompletions: test each not-done operation in issue order, and retire one when it

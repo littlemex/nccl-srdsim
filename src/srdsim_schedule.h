@@ -107,6 +107,10 @@ inline bool mode_from_string(const std::string& s, Mode* out) {
 struct Op {
     uint64_t id = 0;
     int      peer = 0;
+    // The RMA context index within the plugin context (`ncclRmaConfig::nContexts`). Ordering is scoped to a
+    // context and a peer: nothing orders operations on different contexts, so a strong signal waits only for
+    // earlier operations on its own context to its own peer.
+    int      context = 0;
     // Placement: `bytes` from (src_base + src_off) to (dst_base + dst_off) at the peer.
     void*    src_base = nullptr;
     uint64_t src_off = 0;
@@ -483,7 +487,7 @@ private:
         // refused at the door.
         for (const Pending& q : pending_) {
             if (q.op.id >= p.op.id) continue;
-            if (q.op.peer != p.op.peer) continue;
+            if (q.op.peer != p.op.peer or q.op.context != p.op.context) continue;
             if (q.remaining != 0 or q.signal_pending) return false;
         }
         return true;
@@ -491,12 +495,12 @@ private:
 
     Choice pick() {
         std::vector<Choice> options;
-        // `pending_` is in submission order, so "the oldest operation for this peer" is the first one
-        // found for that peer. `peer-seq` needs that per peer rather than globally.
-        std::map<int, size_t> oldest_for_peer;
+        // `pending_` is in submission order, so "the oldest operation for this context and peer" is the first
+        // one found for them. `peer-seq` needs that per context and peer rather than globally.
+        std::map<std::pair<int, int>, size_t> oldest_for_peer;
         if (opt_.mode == Mode::PeerSeq)
             for (size_t i = 0; i < pending_.size(); ++ i)
-                oldest_for_peer.emplace(pending_[i].op.peer, i);
+                oldest_for_peer.emplace(std::make_pair(pending_[i].op.context, pending_[i].op.peer), i);
 
         // `defer-one` holds the oldest operation back. Which one is held has to be decided once and
         // stay decided: choosing afresh each call would hold whichever happens to be oldest now, which
@@ -520,8 +524,8 @@ private:
 
         for (size_t i = 0; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
-            if (opt_.mode == Mode::PeerSeq and oldest_for_peer[p.op.peer] != i)
-                continue;                // this peer has older work outstanding
+            if (opt_.mode == Mode::PeerSeq and oldest_for_peer[std::make_pair(p.op.context, p.op.peer)] != i)
+                continue;                // this context and peer have older work outstanding
             if (not has_room(p)) {
                 skipped_for_room = true;
                 continue;                // the link to this peer is full: nothing for it is released now

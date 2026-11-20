@@ -119,6 +119,43 @@ void put_then_signal(Rank& R, bool strong, int salt) {
 void put_then_strong_signal(Rank& R) { put_then_signal(R, true, 1); }
 void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 
+// Contexts are independent: a strong signal on one context is not ordered behind an earlier put on another
+// context to the same peer. Under reverse-ops the newest operation goes first, so the signal arrives while part
+// of the put on the other context is still missing. The sender holds after two proxy iterations (at most eight
+// chunks each, of the put's 128) until the target has looked.
+// Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
+// can be dropped without a failure.
+void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
+    constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 19);
+        // The put is submitted in one proxy iteration and the signal in the next, so the put is the earlier
+        // operation whichever context the proxy visits first.
+        R.pause();
+        const Ticket* p = R.issue(put(put_ctx, 1, src, n, dst));
+        R.run_steps(1);
+        const Ticket* s = R.issue(signal_only(sig_ctx, 1, 7, /*strong=*/true));
+        R.run_steps(1);
+        wait_flag(0, "target-looked");
+        R.resume();
+        R.wait_retired(p, "put");
+        R.wait_retired(s, "signal");
+        set_flag(1);
+    } else {
+        R.wait_peer([&] { return R.signal_word(7) >= 1; }, "signal-word");
+        const size_t bad = mismatches(R.at(dst), n, 0, 19);
+        set_flag(0);
+        if (bad == 0) fail("assert", "ordered-across-contexts", "%s", "the strong signal waited for the other context's put");
+        R.wait_peer([&] { return mismatches(R.at(dst), n, 0, 19) == 0; }, "put-complete");
+        wait_flag(1, "sender-done");
+        expect_guards(R, dst, n);
+        expect_signals(R, {{7, 1}});
+    }
+}
+
+void strong_signal_other_context_01(Rank& R) { strong_signal_other_context(R, 0, 1); }
+void strong_signal_other_context_10(Rank& R) { strong_signal_other_context(R, 1, 0); }
+
 // I1 over many rounds, alternating contexts: when a weak signal's word reaches its value, the put it was
 // bundled with has landed. The source is overwritten as soon as the put retires, so a plugin that still
 // reads it after reporting completion corrupts the destination.
@@ -450,6 +487,25 @@ void backpressure_target_stopped(Rank& R) {
     }
 }
 
+// An operation on a context index the RMA context does not have is reported through queryLastError, and still
+// carried out: the put lands and retires, and a valid operation after it does too.
+void out_of_range_context(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, src = 4099, dst = (512 << 10) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 21);
+        Op bad = put(0, 1, src, n, dst);
+        bad.plugin_context = kContexts;
+        R.wait_retired(R.issue(bad), "put-bad-context");
+        if (not R.last_error()) fail("assert", "context-reported", "%s", "queryLastError reports nothing");
+        R.wait_retired(R.issue(signal_only(0, 1, 9, true)), "signal");
+    } else {
+        R.wait_peer([&] { return R.signal_word(9) >= 1; }, "signal-word");
+        R.wait_peer([&] { return mismatches(R.at(dst), n, 0, 21) == 0; }, "put-data");
+        expect_guards(R, dst, n);
+        expect_signals(R, {{9, 1}});
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -465,6 +521,8 @@ const std::vector<Scenario>& scenarios() {
     static const std::vector<Scenario> s = {
         {"put_then_strong_signal", put_then_strong_signal, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, nullptr},
+        {"strong_signal_other_context_01", strong_signal_other_context_01, 2, {"reverse-ops"}, {1}, nullptr},
+        {"strong_signal_other_context_10", strong_signal_other_context_10, 2, {"reverse-ops"}, {1}, nullptr},
         {"i1_holds", i1_holds, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"violate_control", violate_control, 2, {"violate-i1"}, {1, 2, 3}, nullptr},
         {"get_completes_with_data", get_completes_with_data, 2, {"srd"}, {1}, nullptr},
@@ -481,6 +539,7 @@ const std::vector<Scenario>& scenarios() {
         {"refused_then_real", refused_then_real, 2, {"srd"}, {1}, nullptr},
         {"get_across_context_rebuild", get_across_context_rebuild, 2, {"srd"}, {1}, nullptr},
         {"backpressure_target_stopped", backpressure_target_stopped, 2, {"srd", "inorder"}, {1}, nullptr},
+        {"out_of_range_context", out_of_range_context, 2, {"srd"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
