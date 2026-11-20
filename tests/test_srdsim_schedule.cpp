@@ -724,6 +724,72 @@ void test_peer_seq_is_per_context() {
     }
 }
 
+// S12: the order of release is a fixed function of mode, seed and the interleaving of submissions with progress
+// calls. A scripted workload (puts of several sizes to three peers on two contexts, some with weak or strong
+// signals, zero-byte signals, and a get) is driven single-threaded, and the released sequence of (op, chunk, kind)
+// is hashed. A change to the scheduler that is meant to keep the order must leave every hash as it is; one that
+// changes the order on purpose updates the table in the same commit.
+uint64_t release_fingerprint(srdsim::Mode m, uint64_t seed) {
+    Fabric f(1 << 20, 64);
+    srdsim::Scheduler::Options o;
+    o.mode = m;
+    o.seed = seed;
+    o.chunk_bytes = 4096;
+    srdsim::Scheduler s(o);
+    uint64_t h = 1469598103934665603ull;   // FNV-1a
+    const auto mix = [&](uint64_t v) { for (int i = 0; i < 8; ++ i) { h ^= (v >> (8 * i)) & 0xff; h *= 1099511628211ull; } };
+    std::vector<srdsim::Unit> batch;
+    uint64_t id = 0;
+    for (int round = 0; round < 12; ++ round) {
+        for (int k = 0; k < 5; ++ k) {
+            ++ id;
+            const size_t bytes = (k == 4) ? 0 : size_t(1000 + 3000 * k + 7 * round);
+            srdsim::Op op = make_op(id, f, size_t(k) * 40'000, bytes, (k % 2 == 0 or bytes == 0) ? int(id % 60) : -1);
+            op.peer = int(id % 3);
+            op.context = int(id % 2);
+            op.signal_is_strong = (k == 2);
+            if (round % 4 == 3 and k == 1) {   // a get request in place of a put
+                op = srdsim::Op{};
+                op.id = id;
+                op.peer = int(id % 3);
+                op.context = int(id % 2);
+                op.is_get_request = true;
+                op.bytes = 5000;
+            }
+            std::string why;
+            expect(s.submit(op, &why), ctx("S12 submit op %llu: %s", static_cast<unsigned long long>(id), why.c_str()));
+        }
+        batch.clear();
+        s.progress(8, &batch);
+        for (const auto& u : batch) { mix(u.op_id); mix(uint64_t(int64_t(u.chunk_index))); mix(uint64_t(u.kind)); }
+    }
+    for (int i = 0; i < 10'000 and not s.idle(); ++ i) {
+        batch.clear();
+        s.progress(8, &batch);
+        for (const auto& u : batch) { mix(u.op_id); mix(uint64_t(int64_t(u.chunk_index))); mix(uint64_t(u.kind)); }
+    }
+    expect(s.idle(), ctx("S12 the workload drains: mode=%s seed=%llu", srdsim::mode_name(m), static_cast<unsigned long long>(seed)));
+    return h;
+}
+
+void test_release_fingerprints() {
+    struct Golden { srdsim::Mode mode; uint64_t seed; uint64_t hash; };
+    // Recorded from this test's output on every CI build (host, ASan, UBSan, TSan), which agree.
+    const Golden golden[] = {
+        {srdsim::Mode::Srd, 1, 0x8eae147359f1b849ull}, {srdsim::Mode::Srd, 2, 0xdd5edf64e570fd79ull}, {srdsim::Mode::Srd, 3, 0x7a61069e44fb2d49ull},
+        {srdsim::Mode::InOrder, 1, 0x77bd7e54a06000a9ull}, {srdsim::Mode::PeerSeq, 1, 0x9a50e46119b5a1d9ull}, {srdsim::Mode::PeerSeq, 2, 0xf63e9ffc4b20e3c9ull},
+        {srdsim::Mode::ReverseOps, 1, 0x380a8a90d8a8ec59ull}, {srdsim::Mode::SignalLast, 1, 0x73163b6f0d4212b9ull}, {srdsim::Mode::SignalLast, 2, 0x08d60704003c1789ull},
+        {srdsim::Mode::DeferOne, 1, 0xc9d3fdfe5eb296a9ull}, {srdsim::Mode::DeferOne, 2, 0x62c7de8cf30fb0b9ull}, {srdsim::Mode::ViolateI1, 1, 0x35c99f9fb46b8579ull},
+    };
+    for (const auto& g : golden) {
+        const uint64_t h = release_fingerprint(g.mode, g.seed);
+        std::printf("FINGERPRINT %s %llu 0x%016llx\n", srdsim::mode_name(g.mode), static_cast<unsigned long long>(g.seed),
+                    static_cast<unsigned long long>(h));
+        expect(h == g.hash, ctx("S12 release order unchanged: mode=%s seed=%llu", srdsim::mode_name(g.mode),
+                                    static_cast<unsigned long long>(g.seed)));
+    }
+}
+
 int main() {
     test_overlapping_writes_are_named();
     test_overlap_detection_is_opt_in();
@@ -738,6 +804,7 @@ int main() {
     test_room_holds_a_full_peer();
     test_strong_signal_is_scoped_to_its_context();
     test_peer_seq_is_per_context();
+    test_release_fingerprints();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
