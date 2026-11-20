@@ -1,4 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // An NCCL RMA plugin that simulates EFA's SRD: reliable delivery with no ordering guarantee,

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Assemble what is needed to compile `src/nccl_rma_srdsim.cc` on a machine with neither a built NCCL
 # nor CUDA: NCCL's plugin headers from a source checkout, with `nccl.h` generated for that checkout's

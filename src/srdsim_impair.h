@@ -1,4 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // Deliberate impairments: delay, burstiness, backpressure and a frozen link, applied on purpose.

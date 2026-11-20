@@ -1,4 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // Loads a plugin the way NCCL does (dlopen with RTLD_NOW, so every undefined symbol must resolve) and
