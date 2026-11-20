@@ -1191,6 +1191,9 @@ public:
     DeliveryContext(const DeliveryContext&) = delete;
     DeliveryContext& operator=(const DeliveryContext&) = delete;
     bool ok() const { return ok_; }
+    // Whether a delivery context exists. Without one there is no delivery stream, so "not ok" then means
+    // there is nothing to wait for rather than a failure.
+    bool exists() const { return d_.ctx != nullptr; }
     CUstream stream() const { return d_.stream; }
 
 private:
@@ -3050,12 +3053,20 @@ ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
         if (mr != nullptr) {
             drained = finish_sends(nullptr, /*send=*/true);
             DeliveryContext in_delivery_context;
-            const CUresult rc = in_delivery_context.ok() ? cuStreamSynchronize(in_delivery_context.stream())
-                                                         : CUDA_ERROR_INVALID_CONTEXT;
-            if (rc != CUDA_SUCCESS) {
-                poison_delivery("waiting for copies before a deregistration", rc);
+            if (in_delivery_context.ok()) {
+                const CUresult rc = cuStreamSynchronize(in_delivery_context.stream());
+                if (rc != CUDA_SUCCESS) {
+                    poison_delivery("waiting for copies before a deregistration", rc);
+                    drained = false;
+                }
+            } else if (in_delivery_context.exists()) {
+                // The context exists but this thread cannot enter it: the copies cannot be confirmed. That is not
+                // a fault of the stream, so delivery is not stopped for it.
+                logf("window %u: cannot enter the delivery context to wait for its copies (%s)", mr->window_id,
+                     g_exiting.load() ? "the process is exiting" : "cuCtxPushCurrent failed, logged above");
                 drained = false;
             }
+            // Without a context there is no delivery stream, so nothing to wait for.
             if (not drained)
                 logf("window %u was deregistered with copies or sends that could not be confirmed", mr->window_id);
         }

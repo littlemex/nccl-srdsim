@@ -296,6 +296,44 @@ jobs:
           cmake --build build -j
           ctest --test-dir build -R plugin_harness --output-on-failure --verbose
 
+  # The plugin harness against the CUDA build, with no GPU: the driver library is installed so the plugin
+  # loads, and every window is a host window, so no device is opened. It covers the CUDA build's handling of
+  # host windows, which the host-only build does not compile.
+  plugin-harness-cuda:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: versions
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install the CUDA toolkit and the driver library
+        env:
+          KEYRING_DEB: ${{ needs.versions.outputs.cuda_keyring_deb }}
+          KEYRING_SHA256: ${{ needs.versions.outputs.cuda_keyring_sha256 }}
+          CUDA_PKG: ${{ needs.versions.outputs.cuda_default }}
+        run: |
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/$KEYRING_DEB"
+          echo "$KEYRING_SHA256  $KEYRING_DEB" | sha256sum -c
+          sudo dpkg -i "$KEYRING_DEB"
+          sudo apt-get update -q
+          . ./versions.env
+          sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-driver-dev-$CUDA_PKG" \
+            "cuda-nvrtc-dev-$CUDA_PKG" "$CI_DRIVER_LIB_PKG"
+          ls -l /usr/lib/x86_64-linux-gnu/libcuda.so.1
+          dpkg-query -W "$CI_DRIVER_LIB_PKG"
+      - name: Build and run
+        env:
+          NCCL_TAG: ${{ needs.versions.outputs.nccl_default_tag }}
+          NCCL_COMMIT: ${{ needs.versions.outputs.nccl_default_commit }}
+          CUDA_PKG: ${{ needs.versions.outputs.cuda_default }}
+        run: |
+          git clone --quiet --depth 1 --branch "$NCCL_TAG" https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = "$NCCL_COMMIT"
+          NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
+          cmake -S . -B build -DSRDSIM_BUILD_TESTS=ON -DSRDSIM_BUILD_PLUGIN=ON -DSRDSIM_WITH_CUDA=ON \
+            -DCUDAToolkit_ROOT="/usr/local/cuda-${CUDA_PKG/-/.}" -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
+          cmake --build build -j
+          ctest --test-dir build -R plugin_harness --output-on-failure --verbose
+
   # The GPU test compiles against NCCL's device API headers. It runs on a GPU host (tests/gpu/run.sh).
   gpu-test-compile:
     runs-on: ubuntu-24.04
