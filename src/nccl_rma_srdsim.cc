@@ -3327,6 +3327,12 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
              static_cast<const void*>(r));
         return ncclInternalError;
     }
+    if (r->op_id == 0 and not r->is_flush and not r->done_at_issue) {
+        // Every other request names an operation, and id 0 is never one: answering from the scheduler would
+        // report "not done" forever, which is how this stalled before.
+        logf("test() called with a request that names no operation (%p); refusing", static_cast<const void*>(r));
+        return ncclInternalError;
+    }
     bool complete = r->done_at_issue;
     if (not complete) {
         std::lock_guard<std::mutex> g(r->ctx->mu);
