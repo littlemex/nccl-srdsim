@@ -240,7 +240,7 @@ jobs:
           EXPORTS=$(./ci/expected_exports.sh "$RUNNER_TEMP/nccl-src")
           ./dlopen_check "$PWD/build/libnccl-rma-srdsim.so" $(grep -v '^!' <<<"$EXPORTS")
       - name: The plugin harness, once per op-table version
-        run: ctest --test-dir build -R plugin_harness --output-on-failure
+        run: ctest --test-dir build -R plugin_harness --output-on-failure --verbose
       - name: The same build serves every pinned release
         run: ./ci/check_serves_all.sh build/libnccl-rma-srdsim.so
       - name: The export check fails without a release to check against
@@ -272,7 +272,7 @@ jobs:
           echo "$KEYRING_SHA256  $KEYRING_DEB" | sha256sum -c
           sudo dpkg -i "$KEYRING_DEB"
           sudo apt-get update -q
-          sudo apt-get install -y -q "cuda-cudart-dev-$CUDA_PKG"
+          sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG"
       - name: Lower ASLR entropy for the sanitizers
         run: |
           sudo sysctl vm.mmap_rnd_bits
@@ -291,7 +291,7 @@ jobs:
             -DSRDSIM_BUILD_TESTS=ON -DSRDSIM_BUILD_PLUGIN=ON -DSRDSIM_WITH_CUDA=OFF \
             -DCUDAToolkit_ROOT="/usr/local/cuda-${CUDA_PKG/-/.}" -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
           cmake --build build -j
-          ctest --test-dir build -R plugin_harness --output-on-failure
+          ctest --test-dir build -R plugin_harness --output-on-failure --verbose
 
   # The GPU test compiles against NCCL's device API headers. It runs on a GPU host (tests/gpu/run.sh).
   gpu-test-compile:
