@@ -450,9 +450,8 @@ const std::vector<Scenario>& scenarios() {
 // Known defects (#26): the case fails today with exactly this status, "kind:id". A mode of "*" and a
 // table of 0 match any. A fix removes its entry; the run fails if a listed case passes or fails differently.
 struct Expected { const char* scenario; const char* mode; int table; const char* status; const char* issue; };
-const Expected kExpected[] = {
-    {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
-};
+// None today.
+const std::vector<Expected> kExpected = {};
 
 const Expected* expected_for(const Scenario& sc, const char* mode, int table) {
     for (const auto& e : kExpected)

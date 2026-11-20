@@ -3268,39 +3268,48 @@ ncclResult_t srdsim_iget(void* rmaCtx, int /*context*/, uint64_t remoteOff, void
     return rc;
 }
 
-// Answers a GetRequest this rank received: read from `src` (already resolved and bounds checked by the
-// transport, the same way a Placement's destination is) and submit the reply as an ordinary placement,
-// addressed back to the requester and tagged so the requester's receive loop can release the right
-// `iflush`. Any context already carrying this rank's own sends works -- the reply travels the exact
-// same wire/scheduler path a put does -- so the first one is as good as any; a get request does not
-// need a context of its own.
+// Answers a GetRequest this rank received, on the receive thread that read it: the reply's frames go straight
+// to the requester's link, read from `src` (already resolved and bounds checked by the transport, the same way
+// a Placement's destination is). Nothing here waits for this rank's NCCL progress thread or any of its contexts,
+// because a get is one-sided: in RDMA the target's NIC serves the read and its CPU takes no part, and the
+// receive thread stands in for that NIC. The reply is split into frames of `chunk_bytes`, as the requester
+// counts what has landed by bytes.
+//
+// What the socket does not take at once waits in the link's outbox, which this thread pushes again after each
+// frame and which progress also drains. A reply the outbox refuses (the requester has stopped reading) is
+// lost and reported; the requester's get then does not complete (#37).
 bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t length,
                                uint32_t dest_window, uint64_t dest_off, uint32_t requester_rank,
                                uint64_t owner_token, void* user) {
     auto* cc = static_cast<CollComm*>(user);
     if (cc == nullptr) return false;
-    RmaCtx* ctx = nullptr;
-    {
-        std::lock_guard<std::mutex> g(cc->mu);
-        if (not cc->rma_contexts.empty()) ctx = cc->rma_contexts.front();
+    static const size_t chunk = scheduler_options().chunk_bytes;
+    const int peer = static_cast<int>(requester_rank);
+    std::vector<char> staged;
+    for (size_t off = 0; off < length; off += chunk) {
+        const size_t n = std::min(chunk, length - off);
+        const void* from = static_cast<const char*>(src) + off;
+#ifdef SRDSIM_WITH_CUDA
+        if (src_is_device) {
+            staged.resize(n);
+            if (not read_device(staged.data(), from, n)) {
+                logf("get %llu: could not read %zu byte(s) of the device window for the reply; it is lost",
+                     static_cast<unsigned long long>(owner_token), n);
+                return false;
+            }
+            from = staged.data();
+        }
+#else
+        (void)src_is_device;
+#endif
+        if (not cc->links.send_placement(peer, dest_window, dest_off + off, from, n, owner_token,
+                                         srdsim::WireKind::GetResponse)) {
+            logf("get %llu: the link to rank %d refused %zu byte(s) of the reply; it is lost",
+                 static_cast<unsigned long long>(owner_token), peer, n);
+            return false;
+        }
+        cc->links.flush(peer);
     }
-    if (ctx == nullptr) {
-        logf("a get request arrived on communicator %p before any context was created on it; dropping",
-             static_cast<void*>(cc));
-        return false;
-    }
-    srdsim::Op op;
-    op.peer = static_cast<int>(requester_rank);
-    op.src_base = const_cast<void*>(src);
-    op.src_off = 0;
-    op.src_is_device = src_is_device;
-    op.dst_window = dest_window;
-    op.dst_off = dest_off;
-    op.bytes = length;
-    op.is_get_response = true;
-    op.get_response_token = owner_token;
-    void* throwaway = nullptr;
-    submit(ctx, op, &throwaway);   // fire-and-forget from the responder's own point of view
     return true;
 }
 
