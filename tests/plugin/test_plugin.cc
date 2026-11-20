@@ -207,14 +207,20 @@ void get_owner_idle(Rank& R) {
     }
 }
 
-// A flush issued after a get has retired completes, and the get's bytes are in place when it does.
-// Run with a get of one chunk and of several, and with no get at all, so a failure can be attributed.
-void get_then_flush(Rank& R, size_t n, int salt) {
+// A flush issued after a get completes, and the get's bytes are in place when it does. With
+// `data_first` the flush is issued only once every byte of the get has landed, so nothing is left for it
+// to fence and it must complete; without, it is issued as soon as the get retires and has to wait for
+// the reply. Run with a get of one chunk and of several, and with no get at all, so a failure can be
+// attributed to the size of the get rather than to the flush.
+void get_then_flush(Rank& R, size_t n, int salt, bool data_first) {
     const size_t remote = (768 << 10) + 7, local = (900 << 10) + kGuard;
     if (g_rank == 1) fill(R.at(remote), n, 1, salt);
     barrier("owner filled");
     if (g_rank == 0) {
         if (n > 0) R.wait_retired(R.issue(get(0, 1, remote, n, local)), "get");
+        if (data_first)
+            R.wait_until([&] { return mismatches(R.at(local), n, 1, salt) == 0; }, "get-data",
+                         [&] { return uint64_t(n - mismatches(R.at(local), n, 1, salt)); });
         R.wait_retired(R.issue(flush(0, 1)), "flush");
         if (size_t bad = mismatches(R.at(local), n, 1, salt)) fail("assert", "data-at-flush", "%zu bytes", bad);
         if (n > 0) expect_guards(R, local, n);
@@ -223,12 +229,13 @@ void get_then_flush(Rank& R, size_t n, int salt) {
         wait_flag(0, "requester-done");
     }
 }
-void get_one_chunk_flush(Rank& R) { get_then_flush(R, (4 << 10) + 13, 7); }
-void get_multichunk_flush(Rank& R) { get_then_flush(R, (64 << 10) + 13, 8); }
-void flush_without_get(Rank& R) { get_then_flush(R, 0, 9); }
+void get_one_chunk_flush(Rank& R) { get_then_flush(R, (4 << 10) + 13, 7, true); }
+void get_multichunk_flush(Rank& R) { get_then_flush(R, (64 << 10) + 13, 8, true); }
+void get_one_chunk_early_flush(Rank& R) { get_then_flush(R, (4 << 10) + 13, 11, false); }
+void flush_without_get(Rank& R) { get_then_flush(R, 0, 9, false); }
 
 // Under SRDSIM_DRY_RUN=1 every operation completes without moving data. Two puts, the second waited for
-// first, tell "the first request never completes" apart from "no dry-run put completes".
+// first, tell "the first request never completes" apart from "no dry-run request completes".
 void dry_run(Rank& R) {
     constexpr size_t n = 4096 + 13, src = 4099, dst = (512 << 10) + kGuard;
     if (g_rank == 0) {
@@ -267,6 +274,7 @@ const std::vector<Scenario>& scenarios() {
         {"get_owner_idle", get_owner_idle, 2, {"srd"}, {1}, nullptr},
         {"get_one_chunk_flush", get_one_chunk_flush, 2, {"srd"}, {1}, nullptr},
         {"get_multichunk_flush", get_multichunk_flush, 2, {"srd"}, {1}, nullptr},
+        {"get_one_chunk_early_flush", get_one_chunk_early_flush, 2, {"srd"}, {1}, nullptr},
         {"flush_without_get", flush_without_get, 2, {"srd"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
@@ -279,8 +287,8 @@ struct Expected { const char* scenario; const char* mode; int table; const char*
 const Expected kExpected[] = {
     {"get_completes_with_data", "*", 0, "assert:data-at-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
-    {"get_multichunk_flush", "*", 0, "stall:flush", "#26: pending_gets is miscounted for a get of several chunks"},
-    {"dry_run", "*", 0, "stall:put-first", "#26: a request numbered 0 never completes"},
+    {"get_multichunk_flush", "*", 0, "stall:flush", "#26: pending_gets is decremented once per chunk of a get"},
+    {"dry_run", "*", 0, "stall:put-second", "#26: every dry-run request is numbered 0, which never completes"},
 };
 
 const Expected* expected_for(const Scenario& sc, const char* mode, int table) {
