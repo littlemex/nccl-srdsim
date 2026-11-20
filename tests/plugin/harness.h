@@ -219,6 +219,7 @@ struct Op {
     bool keep_source = false;          // the source is shared with later operations, so it is not overwritten on retirement
     int  plugin_context = -1;          // the context index passed to the plugin, when not `context` (which picks the queue)
     void* signal_mh = nullptr;         // the signal's window, when it is not the rank's signal window
+    void* dst_mh = nullptr;            // the destination window, when it is not the rank's data window
 };
 
 // What the rank's main thread sees of one operation: `done` when `test` reported it, `retired` when it
@@ -483,9 +484,9 @@ private:
                                      flags, &req), "iputSignal");
                 break;
             case Op::PutSignal:
-                check(rma.iputSignal(rmaCtx, c, o.srcOff, dataMh, o.size, o.dstOff, dataMh, uint32_t(o.peer),
-                                     o.word * sizeof(uint64_t), signalMh, o.value, NCCL_GIN_SIGNAL_OP_ADD, o.strong,
-                                     flags, &req), "iputSignal");
+                check(rma.iputSignal(rmaCtx, c, o.srcOff, dataMh, o.size, o.dstOff, o.dst_mh ? o.dst_mh : dataMh,
+                                     uint32_t(o.peer), o.word * sizeof(uint64_t), o.signal_mh ? o.signal_mh : signalMh,
+                                     o.value, NCCL_GIN_SIGNAL_OP_ADD, o.strong, flags, &req), "iputSignal");
                 break;
             case Op::Get:
                 check(rma.iget(rmaCtx, c, o.srcOff, dataMh, o.size, o.dstOff, dataMh, uint32_t(o.peer), flags, &req), "iget");

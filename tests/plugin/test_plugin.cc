@@ -557,6 +557,41 @@ void device_signal(Rank& R, uint64_t flags) {
     R.deregister_window(mh);
     cuMemFree(w);
 }
+// I1 on the atomic-add path: a put with a signal into a device window registered without the flag. When the
+// word changes, every byte of the put must already be in the window.
+void device_put_signal(Rank& R) {
+    int n = 0;
+    if (cuInit(0) != CUDA_SUCCESS or cuDeviceGetCount(&n) != CUDA_SUCCESS or n < 1) {
+        if (std::getenv("HARNESS_REQUIRE_GPU")) fail("error", "no-gpu", "%s", "HARNESS_REQUIRE_GPU is set");
+        fail("skip", "no-gpu", "%s", "no CUDA device");
+    }
+    CUdevice dev{};
+    CUcontext c{};
+    CUdeviceptr w{};
+    constexpr size_t bytes = 2u << 20, len = (1u << 20) + 13, off = 4096, word_off = 0;
+    if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS or cuDevicePrimaryCtxRetain(&c, dev) != CUDA_SUCCESS or
+        cuCtxSetCurrent(c) != CUDA_SUCCESS or cuMemAlloc(&w, bytes) != CUDA_SUCCESS or cuMemsetD8(w, 0, bytes) != CUDA_SUCCESS)
+        fail("error", "cuda-setup", "%s", "could not allocate the device window");
+    void* mh = R.register_window(reinterpret_cast<void*>(w), bytes, NCCL_PTR_CUDA, 0);
+    barrier("device window registered");
+    if (g_rank == 0) {
+        fill(R.at(4099), len, 0, 22);
+        Op o = put_signal(0, 1, 4099, len, off, 0, false);
+        o.dst_mh = mh;
+        o.signal_mh = mh;
+        R.wait_retired(R.issue(o), "put-with-signal");
+    } else {
+        const auto word = [&] { uint64_t v = 0; cuMemcpyDtoH(&v, w + word_off, sizeof v); return v; };
+        R.wait_peer([&] { return word() != 0; }, "device-word");
+        std::vector<unsigned char> got(len);
+        cuMemcpyDtoH(got.data(), w + off, len);
+        if (size_t bad = mismatches(got.data(), len, 0, 22)) fail("assert", "i1-device", "%zu bytes missing at the signal", bad);
+    }
+    barrier("checked");
+    R.deregister_window(mh);
+    cuMemFree(w);
+}
+
 void device_signal_reset(Rank& R) { device_signal(R, 0); }
 void device_signal_never_reset(Rank& R) { device_signal(R, NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET); }
 #endif
@@ -598,6 +633,7 @@ const std::vector<Scenario>& scenarios() {
 #if defined(HARNESS_CUDA)
         {"device_signal_reset", device_signal_reset, 2, {"srd"}, {1}, "SRDSIM_DELIVERY_CONTEXT=primary"},
         {"device_signal_never_reset", device_signal_never_reset, 2, {"srd"}, {1}, "SRDSIM_DELIVERY_CONTEXT=primary"},
+        {"device_put_signal", device_put_signal, 2, {"srd", "reverse-ops"}, {1, 2}, "SRDSIM_DELIVERY_CONTEXT=primary"},
 #endif
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };

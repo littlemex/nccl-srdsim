@@ -321,7 +321,7 @@ struct MrHandle {
     size_t   bytes = 0;
     int      ptr_type = 0;                // NCCL_PTR_HOST or NCCL_PTR_CUDA
     uint32_t window_id = 0;               // the name both sides agree on
-    uint64_t mr_flags = 0;                // what NCCL asked for, kept so it can be reported
+    uint64_t mr_flags = 0;                // what NCCL asked for; SIGNAL_NEVER_RESET decides how a signal is applied
     bool     live = true;                 // false once deregistered: no signal may be stored as a total into it
 };
 
@@ -2511,8 +2511,8 @@ bool device_add(void* dst_u64, uint64_t value, void* user) {
     Mark mark("device_add: applying a signal into a device window");
     DeliveryContext in_delivery_context;
     if (not in_delivery_context.ok()) return false;
-    // The kernel path is kept because it is the only way to check the two against each other, and
-    // because a deployment where the plugin is not the only writer would need it.
+    // The atomic add on the device is the general method; the stored total is valid only where the plugin is
+    // the only writer of the word. SRDSIM_SIGNAL_KERNEL forces the add everywhere, to compare the two.
     static const bool signal_kernel = env_size("SRDSIM_SIGNAL_KERNEL", 0) != 0;   // read once; see `env_size`
     if (signal_kernel or not stored_total_allowed(static_cast<CollComm*>(user), dst_u64))
         return g_device_atomic_add.add(dst_u64, value);
