@@ -109,9 +109,6 @@ void logf(const char* fmt, ...) {
     }
 }
 
-// Progress calls in which a peer's outbox had no room, so its operations stayed pending: backpressure at work.
-std::atomic<uint64_t> g_held_for_room{0};
-
 // Registration, deregistration and teardown, always on stderr: they are rare, and whether a window's memory
 // was deregistered before it was freed is the question a crash in the delivery path turns on.
 void lifecycle(const char* fmt, ...) {
@@ -485,6 +482,9 @@ struct CollComm {
     uint64_t last_reported_placements = ~0ull;
     uint64_t last_reported_signals = ~0ull;
     std::vector<std::unique_ptr<MrHandle>> mrs;
+    // Progress calls in which a peer's outbox had no room, so its operations stayed pending, counted once per call
+    // and peer: backpressure at work.
+    std::atomic<uint64_t> held_for_room{0};
     // Every context created on this communicator, so a report can ask each scheduler what it is still
     // holding. Raw pointers: NCCL owns the lifetime through `createContext` / `destroyContext`, and a
     // destroyed context removes itself.
@@ -3180,7 +3180,6 @@ ncclResult_t srdsim_reg_mr_sym(void* collComm, void* data, size_t size, int type
         return ncclSystemError;
     }
     {
-        report_device_delivery_once();
         prebuild_signal_kernel();
         // The pinned staging pool, for the same reason and one step stronger. Page-locked allocation
         // implicitly synchronizes the context, so it has to happen while the context is still quiet.
@@ -3196,6 +3195,8 @@ ncclResult_t srdsim_reg_mr_sym(void* collComm, void* data, size_t size, int type
         // operation back into the hot path this whole change exists to empty.
         g_gdr.add(data, size);
 #endif
+        // Once everything that decides the mechanism has run for the first device window.
+        report_device_delivery_once();
     }
     }
 #endif
@@ -3322,9 +3323,9 @@ ncclResult_t srdsim_close_coll(void* collComm) {
         if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
 #endif
         cc->responder.stop();          // before the links it sends on go
-        lifecycle("communicator %p closing: progress calls that held a peer for outbox room %llu (process-wide), "
+        lifecycle("communicator %p closing: progress calls that held a peer for outbox room %llu, "
                   "frames refused for the outbox budget %llu", collComm,
-                  static_cast<unsigned long long>(g_held_for_room.load()),
+                  static_cast<unsigned long long>(cc->held_for_room.load()),
                   static_cast<unsigned long long>(cc->links.refused_for_budget()));
         if (const size_t r = cc->links.reserved_total())
             logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
@@ -3767,6 +3768,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     // is returned at the end.
     struct LinkRoom final : srdsim::Scheduler::Room {
         srdsim::SendLinks* links = nullptr;
+        CollComm* cc = nullptr;
+        std::set<std::pair<CollComm*, int>>* held = nullptr;   // peers already counted as held in this call
         std::map<int, size_t> granted;   // reserved and not yet taken
         std::set<int> full;
         bool fits(int peer, size_t bytes) override {
@@ -3777,7 +3780,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             if (have >= need) return true;
             if (not links->reserve(peer, need - have)) {
                 full.insert(peer);
-                g_held_for_room.fetch_add(1, std::memory_order_relaxed);
+                if (held->insert({cc, peer}).second) cc->held_for_room.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             have = need;
@@ -3791,6 +3794,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             if (links) for (const auto& g : granted) if (g.second) links->unreserve(g.first, g.second);
         }
     };
+    std::set<std::pair<CollComm*, int>> held;
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
         const size_t before = batch.size();
@@ -3798,6 +3802,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             std::lock_guard<std::mutex> g(c->mu);
             LinkRoom room;
             room.links = c->coll ? &c->coll->links : nullptr;
+            room.cc = c->coll;
+            room.held = &held;
             c->sched->progress(/*budget=*/8, &batch, &room);
         }
         owners.resize(batch.size(), c);
