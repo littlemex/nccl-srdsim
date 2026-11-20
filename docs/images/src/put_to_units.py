@@ -1,26 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-from svgkit import Fig, C
-f = Fig(1000, 420, "A signalled put becomes placement units and one signal unit")
-f.box(30, 60, 250, 70, "iputSignal", C["nccl"], "32 KiB put + signal", size=14)
-f.arrow(285, 95, 385, 95)
-f.text(335, 82, "8 KiB chunks", size=12, color="#333333")
-x = 390
-for i in range(4):
-    f.cell(x + i*95, 70, 85, 50, f"P{i}", C["sim"])
-f.cell(x + 4*95, 70, 85, 50, "S", C["sig"], hatch=True)
-f.text(x + 2*95 + 40, 150, "P0..P3 are mutually unordered; in the modes that keep I1, S follows all of P0..P3", size=13)
-rows = [("srd", ["P2", "P0", "P3", "P1", "S"], None, "legal: S after its last placement"),
-        ("violate-i1", ["P2", "S", "P0", "P3", "P1"], 1, "breaks I1: S visible while P0, P1, P3 are missing")]
-y = 190
-for name, order, bad, note in rows:
-    f.text(60, y+32, name, size=14, weight="bold", anchor="start")
-    for k, u in enumerate(order):
-        col = C["sig"] if u == "S" else C["sim"]
-        f.cell(200 + k*95, y+8, 85, 40, u, col, hatch=(u == "S"))
-    f.text(200 + 5*95 + 10, y+33, note, size=13, anchor="start", color=(C["sig"] if bad else "#333333"))
-    y += 70
-f.arrow(200, 350, 660, 350, "release order (time)", lx=430, ly=342)
-f.text(500, 395, "The receiver applies units in exactly this order: each peer's stream preserves it.", size=13, italic=True)
-f.save(os.path.join(OUT, "put-to-units.svg"))
+from svgkit import Fig
+
+NAME = "put-to-units"
+
+
+def draw(L):
+    f = Fig(1100, 430, L, L.t("A signalled put becomes placement units and one signal unit",
+                               "合図付きの put は、配置のユニットと 1 つの合図のユニットになる"))
+    f.box(30, 62, 250, 70, "iputSignal", "nccl", L.t("32 KiB + a signal", "32 KiB + 合図"))
+    f.arrow(285, 97, 395, 97, L.t("8 KiB chunks", "8 KiB ずつ"))
+    for i in range(4):
+        f.cell(400 + i * 100, 72, 88, 50, f"P{i}", "sim")
+    f.cell(800, 72, 88, 50, "S", "sig")
+    f.text(645, 152, L.t("P0..P3 have no order among them; I1 puts S after all of them",
+                         "P0〜P3 の間に順番は無い。I1 は S をそのすべての後に置く"), size=13)
+    rows = [("srd", ["P2", "P0", "P3", "P1", "S"], True, L.t("legal: S after its last placement", "正しい: S は最後の配置の後")),
+            ("violate-i1", ["P2", "S", "P0", "P3", "P1"], False,
+             L.t("breaks I1: S seen while P0, P1, P3 are missing", "I1 を破る: P0、P1、P3 が無いのに S が見える"))]
+    y = 190
+    for name, order, ok, note in rows:
+        f.text(40, y + 32, name, size=15, weight="bold", anchor="start")
+        for k, u in enumerate(order):
+            f.cell(190 + k * 95, y + 8, 85, 42, u, "sig" if u == "S" else "sim")
+        f.mark(700, y + 29, ok)
+        f.text(720, y + 34, note, size=13, anchor="start")
+        y += 72
+    f.arrow(190, 352, 660, 352, L.t("release order (time)", "送り出す順番 (時間)"), ly=344)
+    f.text(550, 400, L.t("The target applies units in exactly this order: each peer's stream keeps it.",
+                         "相手はユニットをまさにこの順に反映する。相手ごとの接続がこの順番を保つ。"), size=13, italic=True)
+    return f
