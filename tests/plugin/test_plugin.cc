@@ -119,17 +119,21 @@ void put_then_signal(Rank& R, bool strong, int salt) {
 void put_then_strong_signal(Rank& R) { put_then_signal(R, true, 1); }
 void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 
-// Contexts are independent: a strong signal on context 1 is not ordered behind a put on context 0 to the same
-// peer. Under reverse-ops the newest operation goes first, so the signal arrives while most of the earlier put
-// on the other context is missing. The sender holds after one proxy iteration until the target has looked.
+// Contexts are independent: a strong signal on one context is not ordered behind an earlier put on another
+// context to the same peer. Under reverse-ops the newest operation goes first, so the signal arrives while part
+// of the put on the other context is still missing. The sender holds after two proxy iterations (at most eight
+// chunks each, of the put's 128) until the target has looked.
 // Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
 // can be dropped without a failure.
 void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
     constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 19);
+        // The put is submitted in one proxy iteration and the signal in the next, so the put is the earlier
+        // operation whichever context the proxy visits first.
         R.pause();
         const Ticket* p = R.issue(put(put_ctx, 1, src, n, dst));
+        R.run_steps(1);
         R.issue(signal_only(sig_ctx, 1, 7, /*strong=*/true));
         R.run_steps(1);
         wait_flag(0, "target-looked");
