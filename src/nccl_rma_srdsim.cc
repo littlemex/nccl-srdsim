@@ -3826,14 +3826,27 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     // return value that reported it is discarded by NCCL anyway (`gin_host_proxy.cc`), so the only channel
     // that works is `queryLastError`.
     size_t failed = 0;
+    std::set<std::pair<CollComm*, int>> sent_on;   // (communicator, peer) with frames appended
+    {
+    // Frames are appended for the whole batch and each peer's outbox is pushed once after it, rather than one
+    // system call per frame.
+    srdsim::SendLinks::DeferDrain defer;
     for (size_t i = 0; i < batch.size(); ++ i) {
         const auto& u = batch[i];
+        sent_on.insert({owners[i]->coll, u.peer});
         if (send_unit(owners[i]->coll, u, owners[i]))
             continue;
         release_reservation(owners[i]->coll, u);
         ++ failed;
         note_send_failure(owners[i], u);
     }
+    }
+    // A push that fails means the link broke: report it on the calling context, as a failed send would be.
+    for (const auto& [cc, peer] : sent_on)
+        if (cc and not cc->links.flush(peer)) {
+            for (size_t i = 0; i < batch.size(); ++ i)
+                if (owners[i]->coll == cc and batch[i].peer == peer) { note_send_failure(owners[i], batch[i]); break; }
+        }
 #ifdef SRDSIM_WITH_CUDA
     // Units staged by earlier calls whose copies have landed since. Queried, not waited for.
     if (delivery_async()) drain_sends();

@@ -926,6 +926,9 @@ private:
 // One stream per peer. Writes are serialised per peer so that the order the scheduler chose is the
 // order that reaches the peer; that serialisation is the whole reason the simulator's control over
 // ordering survives the wire.
+// Set on a thread that appends several frames and then pushes every outbox once (`SendLinks::DeferDrain`).
+inline thread_local bool t_defer_drain = false;
+
 class SendLinks {
 public:
     // Optional breadcrumb sink. The transport can block in exactly two places -- waiting for a peer's
@@ -1279,11 +1282,22 @@ private:
             if (length > 0)
                 out.append(static_cast<const char*>(payload), static_cast<size_t>(length));
         }
+        if (t_defer_drain) return true;   // the caller pushes every outbox once it has appended its frames
         note("transport: pushing bytes to the socket");
         const bool ok = drain_locked(peer);
         note("transport: done");
         return ok;
     }
+
+    // While one is alive, frames sent from this thread are appended to the outbox and not pushed; the caller
+    // calls `flush_all` afterwards. The bytes on each stream are the same; only the number of system calls
+    // changes, from one or more per frame to one or more per peer.
+    struct DeferDrain {
+        DeferDrain() { t_defer_drain = true; }
+        ~DeferDrain() { t_defer_drain = false; }
+        DeferDrain(const DeferDrain&) = delete;
+        DeferDrain& operator=(const DeferDrain&) = delete;
+    };
 
     // Called with the peer's send lock held. Pushes bytes until the socket refuses them.
     bool drain_locked(int peer) {
