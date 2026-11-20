@@ -438,12 +438,9 @@ private:
         int chunk_index = -1;   // -1 means the signal unit
     };
 
-    // Which operation `defer-one` is holding. The flag is separate from the id, because zero used to mean
-    // both "not chosen yet" and a legal id: with two pending operations numbered zero, every operation
-    // was skipped, `options` came out empty, and the escape at the bottom of `pick()` was guarded by the
-    // same sentinel so it never fired -- a permanent stall whose shape (ops == chunks == signals, no
-    // refusal, no log) is exactly what a real run reported. With duplicate non-zero ids the escape did
-    // fire and re-chose the same id, recursing until the stack ran out. Both were measured.
+    // Which operation `defer-one` is holding. The escape at the bottom of `pick()` tests `have_deferred_`,
+    // never `deferred_id_ != 0`: guarded by the id it would never fire for id 0, and `defer-one` would
+    // stall with nothing refused. Ids are also refused on submit if zero or already pending.
     uint64_t deferred_id_ = 0;
     bool     have_deferred_ = false;
 
@@ -522,11 +519,9 @@ private:
                 break;                   // never look past the oldest operation
         }
         if (options.empty()) {
-            // The deferred operation is the only thing left, so stop deferring it. Without this the
-            // scheduler would report itself idle with work outstanding, which is the one thing a
-            // scheduler must never do.
-            // Stop deferring and look once more, iteratively. The old version recursed, and with two
-            // operations sharing an id it re-chose the same one and never terminated.
+            // The deferred operation is the only thing left: stop deferring it and look once more, in a
+            // loop rather than by recursion, so the scheduler never reports itself idle with work
+            // outstanding and no sequence of ids can make it re-choose the same operation without bound.
             if (opt_.mode == Mode::DeferOne and have_deferred_) {
                 have_deferred_ = false;
                 deferred_id_ = 0;

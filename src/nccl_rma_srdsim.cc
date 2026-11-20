@@ -23,22 +23,14 @@
 // `ginStrongSignalsRequired = false` and `ginVaSignalsRequired = false` themselves, but both
 // have to be stated so nobody reads a green run as EFA coverage.
 //
-// STATUS
-// The scheduler (`srdsim_schedule.h`) is complete and unit tested. This file is the op-table and
-// bootstrap around it. It type-checks against the NCCL plugin headers; it has NOT been loaded by
-// NCCL yet, and the three questions in `layer2/README.md` have to be settled on a machine with
-// GPUs before it can be. Every place that depends on one of those answers is marked
-// PREFLIGHT-1/2/3.
+// This file is the op table and bootstrap around the scheduler (`srdsim_schedule.h`) and the transport
+// (`srdsim_transport.h`).
 //
-// Build. The plugin ABI headers (nccl_rma.h, nccl_net.h, nccl_common.h) are NOT shipped in the
-// nvidia-nccl-cu13 wheel -- only nccl.h and the nccl_device tree are -- so the include path needs
-// an NCCL source checkout as well as the wheel:
-//   c++ -std=c++17 -O2 -fPIC -shared -DSRDSIM_WITH_CUDA
-//       -I <wheel>/nvidia/nccl/include -I <nccl-src>/src/include/plugin -I <nccl-src>/src/include
-//       -I /usr/local/cuda/include -I layer2 layer2/nccl_rma_srdsim.cc
-//       -o libnccl-rma-srdsim.so -lcuda
-// Use:
-//   NCCL_RMA_PLUGIN=libnccl-rma-srdsim.so   plus SRDSIM_MODE / SRDSIM_SEED / SRDSIM_CHUNK_BYTES
+// Build. The plugin ABI headers (nccl_rma.h, nccl_net.h, nccl_common.h) are not shipped in the
+// nvidia-nccl-cu13 wheel, so they come from an NCCL source checkout, assembled by
+// `scripts/prepare_nccl_headers.sh`; then `cmake -S . -B build -DSRDSIM_BUILD_PLUGIN=ON
+// -DNCCL_PLUGIN_INCLUDE_DIRS=<out>/nccl` (see README.md).
+// Use: NCCL_RMA_PLUGIN=libnccl-rma-srdsim.so NCCL_GIN_TYPE=2, plus the SRDSIM_* settings (see README.md).
 
 #include <csignal>
 #include <cerrno>
@@ -133,9 +125,8 @@ std::string env_str(const char* name, const char* dflt) {
 
 // Not for the data path. `getenv` walks `environ` without a lock, and the application changes its environment
 // while NCCL's threads run -- DeepEP calls `setenv("NCCL_ELASTIC_BUFFER_REGISTER", ...)` when it allocates a
-// buffer -- so a `getenv` on a proxy thread can read a table being reallocated: measured, NCCL's RMA progress
-// thread segfaulted inside `getenv` from `srdsim_progress` in a two-host vLLM run. Every read on a path that
-// runs repeatedly is a function-local static, read once.
+// buffer -- so a `getenv` on a proxy thread can read a table being reallocated and crash. Every read on a path
+// that runs repeatedly is a function-local static, read once.
 size_t env_size(const char* name, size_t dflt) {
     const char* v = std::getenv(name);
     if (not v) return dflt;
@@ -144,13 +135,11 @@ size_t env_size(const char* name, size_t dflt) {
     return (end and *end == '\0' and parsed > 0) ? static_cast<size_t>(parsed) : dflt;
 }
 
-// PREFLIGHT-2 needs to know only whether DeepEP's signalling puts reach this plugin at all. That
-// question is answerable before any transport exists, so two switches make the plugin usable as a
-// pure observer:
+// Two switches make the plugin usable as a pure observer, to see whether an application's puts reach it
+// at all:
 //   SRDSIM_LOG_OPS=1  log every iput / iputSignal with its arguments
 //   SRDSIM_DRY_RUN=1  accept operations and complete them immediately without moving any data
-// A dry run cannot produce correct results -- the point is to watch the call sequence without
-// hanging NCCL while the data path is still a stub.
+// A dry run cannot produce correct results; the point is to watch the call sequence without hanging NCCL.
 bool log_ops() {
     static const bool v = env_size("SRDSIM_LOG_OPS", 0) != 0;
     return v;
@@ -182,9 +171,8 @@ void crash_handler(int sig) {
     ::backtrace_symbols_fd(frames, n, 2);
     std::fflush(stderr);
     // Hand the signal back to whoever had it. In a host like vLLM that is Python's faulthandler, and
-    // it prints the Python traceback -- which is the half of the story this plugin cannot see. Going
-    // straight to SIG_DFL threw that away: a crash inside a Python C call showed twenty-four
-    // interpreter frames and not one line of Python.
+    // it prints the Python traceback, which is the half of the story this plugin cannot see; going
+    // straight to SIG_DFL would throw that away.
     for (const auto& p : g_previous) {
         if (p.sig != sig) continue;
         if (p.fn != SIG_DFL and p.fn != SIG_ERR and p.fn != SIG_IGN) {
@@ -302,9 +290,8 @@ private:
 
 // Never destroyed, like every global that NCCL's threads or the plugin's own touch on the data path. A
 // process that exits without destroying its communicators runs static destructors while those threads still
-// run: measured with AddressSanitizer, NCCL's GIN proxy thread wrote into a slot of `g_where` that
-// `~Checkpoints` had freed from `exit`, a heap-use-after-free in both ranks of a violate-i1 run, which without
-// the sanitizer surfaced as glibc's `malloc_consolidate(): unaligned fastbin chunk detected`.
+// run, so a destroyed `g_where` would be written by NCCL's GIN proxy thread after `exit` had freed it (a
+// heap-use-after-free under ASan; otherwise glibc's `malloc_consolidate(): unaligned fastbin chunk detected`).
 Checkpoints& g_where = *new Checkpoints;
 
 // Marks a scope, so a thread's breadcrumb says what it is inside rather than what it last finished.
@@ -316,9 +303,8 @@ struct Mark {
 // ---------------------------------------------------------------------------
 // Symmetric memory
 //
-// PREFLIGHT-3 was answered on 2026-09-04: exporting a cuMem allocation across a process boundary
-// works and is byte-verified, but giving a *different* GPU access to it needs peer access, which
-// the box tested did not have and which cannot exist across hosts at all.
+// Exporting a cuMem allocation across a process boundary works, but giving a *different* GPU access to
+// it needs peer access, which is not always available and which cannot exist across hosts at all.
 //
 // So this plugin does not reach into the peer's window. `regMrSym` is collective, so numbering the
 // windows in registration order gives both sides a name they agree on, and the receiving side
@@ -412,22 +398,19 @@ struct Request {
     uint64_t op_id = 0;
     RmaCtx*  ctx = nullptr;
     // A flush is not an operation, it is a question about all of them: "is everything I submitted
-    // settled?". Encoding it as an operation id was a mistake -- a flush issued before anything was
-    // submitted got id 0, and once `complete` learned to refuse ids it never issued, id 0 became
-    // permanently incomplete and the caller waited forever. The distinction belongs in the request.
+    // settled?". Encoded as an operation id, a flush issued before anything was submitted would get id 0,
+    // which `complete` refuses as never issued, and the caller would wait forever. The distinction
+    // belongs in the request.
     bool     is_flush = false;
 };
 
 // Requests are handed back to NCCL as opaque pointers and tested until done, so the address of a
 // request has to stay valid for as long as NCCL might still hold it.
 //
-// A `std::vector` cannot provide that. The first version of this slab kept one, and grew it with
-// `reserve(capacity * 2)`, which reallocates and therefore invalidates *every* pointer already given
-// to NCCL. The next `test()` then read a freed `Request`, took `r->ctx` out of reused memory, and
-// locked a mutex at whatever address that produced. The crash was a SIGSEGV inside
-// `pthread_mutex_lock` several frames below anything in this file, with no hint that a container had
-// moved. A deque gives stable element addresses, which is the property this needs and the only
-// reason to prefer it here.
+// A `std::vector` cannot provide that: growing it reallocates and invalidates every pointer already given
+// to NCCL, and the next `test()` reads a freed `Request` and locks a mutex at whatever address that
+// produces, which shows up as a SIGSEGV inside `pthread_mutex_lock`, far from this file. A deque gives stable
+// element addresses, which is the property this needs and the only reason to prefer it here.
 struct RequestSlab {
     // Non-zero while a request is live, so a stale or foreign pointer is caught and reported instead
     // of being followed. Cheap, and the alternative is the crash described above.
@@ -496,14 +479,11 @@ CUstream device_stream();
 
 // Pinned host memory to copy out of, one buffer per thread that applies frames.
 //
-// This is the second half of the same deadlock the non-blocking stream above fixed, and it took the
-// stall report and a native stack to see because the first half looked sufficient. `cuMemcpyHtoDAsync`
+// This is the second half of the same deadlock the non-blocking stream above addresses. `cuMemcpyHtoDAsync`
 // from a *pageable* source is not asynchronous: the driver has to stage the bytes through pinned
-// memory it owns, and that staging path waits on the device. So the submit itself blocks -- measured
-// on 2026-09-07, with the receiving agent stopped inside `cuMemcpyHtoDAsync_v2` in two stacks taken
-// seventeen seconds apart, at its sixty-third frame, while the same process was calling `rmaProgress`
-// thirty-nine million times. The device never drains, because what occupies it is DeepEP's resident
-// forwarding CTAs spinning for the bytes this copy would deliver. The kernel waits for the copy and
+// memory it owns, and that staging path waits on the device. So the submit itself blocks, and the device
+// never drains when what occupies it is resident kernels (DeepEP's forwarding CTAs, for example) spinning
+// for the bytes this copy would deliver. The kernel waits for the copy and
 // the copy waits for the kernel, and the non-blocking stream does not help: the stream governs
 // ordering between streams, not whether the driver's staging pool can be refilled.
 //
@@ -517,26 +497,25 @@ CUstream device_stream();
 // Device windows, mapped into this process's address space so the CPU can read and write them with
 // ordinary stores.
 //
-// WHY THIS REPLACES THE CUDA COPY
-// Measured on 2026-09-07: while DeepEP's forwarding kernels are resident and spinning, no host-issued
-// transfer in that context completes at all. Not four bytes, not a megabyte, not on a private stream out
-// of a private allocation. Every one blocked for ninety-three seconds and then returned
-// CUDA_ERROR_LAUNCH_FAILED, which is the driver reporting that the kernel had finally timed out and taken
-// the context with it. The kernel waits for bytes the copy would deliver and the copy waits for the
-// kernel to stop, and no arrangement of streams, pinning, sizes or addresses breaks that cycle.
+// WHY A BAR MAPPING, NOT A CUDA COPY
+// While kernels are resident and spinning for data, a host-issued transfer in the same context does not
+// complete, whatever its size, stream, source allocation or pinning: it blocks until the kernel times out,
+// then returns CUDA_ERROR_LAUNCH_FAILED and the context is lost. The kernel waits for bytes the copy would
+// deliver and the copy waits for the kernel to stop.
 //
-// A BAR mapping does. The same probe wrote through one and a resident spinning kernel saw it after 0 ms.
-// The write submits nothing to CUDA, so there is nothing for the kernel to be ahead of in a queue.
+// A BAR mapping breaks that cycle: a CPU store through it is visible to a resident kernel at once. The
+// write submits nothing to CUDA, so there is nothing for the kernel to be ahead of in a queue.
 //
 // This is also what the backend being simulated does: `aws-ofi-nccl` maps device memory with GDRCopy for
-// exactly this class of write (`src/nccl_ofi_gdrcopy.cpp`). Moving to it makes the emulator more faithful
-// rather than less, which is the opposite of the usual trade when a workaround replaces a clean path.
+// exactly this class of write (`src/nccl_ofi_gdrcopy.cpp`). Using it makes the emulator more faithful,
+// not less.
 //
 // WHAT IS PINNED, AND WHEN
 // Everything, once, at registration. `gdr_pin_buffer` commits BAR aperture rather than deferring it to
 // `gdr_map`, so pinning a subrange is the only way to use less -- and pinning on the data path would
-// replace one risky driver operation in the hot path with another. This card's BAR is 128 GB against a
-// 1.82 GB window, so there is no reason to be clever.
+// replace one risky driver operation in the hot path with another. This assumes a BAR aperture much larger
+// than the windows (128 GB against a 1.82 GB window on the card this was sized for); where it is not, pin
+// subranges.
 class GdrWindows {
 public:
     // Opened lazily and once. A host without the module gets a single message and the CUDA fallback.
@@ -582,11 +561,9 @@ public:
             return;
         }
         // Already mapped ranges are reused rather than pinned again. NCCL registers the same window on
-        // more than one communicator -- under vLLM the same device address arrived as window 5 and again
-        // as window 19, and as window 6 and again as window 20 -- and each registration pinned and mapped
-        // it afresh. That spends BAR aperture on a range that is already resident, doubles the kernel's
-        // bookkeeping, and leaves two host mappings for one piece of device memory, of which the lookup
-        // can only ever use the first. Nothing good comes of the second one.
+        // more than one communicator, and pinning and mapping it afresh for each registration spends BAR
+        // aperture on a range that is already resident, doubles the kernel's bookkeeping, and leaves two host
+        // mappings for one piece of device memory, of which the lookup can only ever use the first.
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (const Region& existing : regions_) {
@@ -616,9 +593,7 @@ public:
         // The pinned range starts at the GPU page *containing* the window, which can be below the window
         // base. Every access therefore carries a lead offset -- and the mapping has to be long enough to
         // hold that lead as well as the window, or a write at the far end runs off the end of the mapping
-        // by exactly the lead. The first version mapped only `bytes`, which is correct for a window that
-        // begins on a page and wrong for every other. vLLM registers a 1848 byte window and a 73856 byte
-        // one, neither of which is a page.
+        // by exactly the lead. Mapping only `bytes` is correct only when the lead is zero.
         //
         // The size is asked for before the map, so `gdr_get_info` comes first: it is valid after the pin.
         gdr_info_t info{};
@@ -694,9 +669,8 @@ public:
     // Without this the registry outlives the memory it describes, and that is not a leak but a wrong
     // answer: NCCL frees a window and a later allocation can return the same address with a different
     // size, after which every write for the new window goes through the old mapping. The bytes land in
-    // memory nobody is watching, or in memory somebody else now owns. The two-rank reproducer never frees
-    // a window mid-run and so never showed this; vLLM builds and tears down communicators during startup,
-    // which is where the difference lives.
+    // memory nobody is watching, or in memory somebody else now owns. Applications such as vLLM build and
+    // tear down communicators during start-up.
     //
     // Unmapping and unpinning here is safe in a way that CUDA calls on this path are not: both are ioctls
     // to the gdrdrv module and neither waits for the context to go quiet.
@@ -826,15 +800,11 @@ size_t staging_capacity() {
 // Pinned host memory for every copy this plugin performs, reserved in one block before any of DeepEP's
 // kernels exist, and never allocated or freed again.
 //
-// Both halves of that sentence are load-bearing, and each was learned by breaking it.
+// Both halves of that sentence are load-bearing.
 //
-// *Never freed*: the first version of this grew a per-thread buffer by reallocation, and the
-// `cuMemFreeHost` on the way never returned. Two stacks twenty-three seconds apart:
-//
-//     #4  cuMemFreeHost () from libcuda.so.1
-//     #5  PinnedStaging::get () at layer2/nccl_rma_srdsim.cc
-//
-// with another thread of the same process waiting on a libcuda rwlock behind it.
+// *Never freed*: `cuMemFreeHost` can wait on the context, and so never return, while resident kernels
+// spin for the bytes these buffers carry, and other threads' driver calls then wait behind it on a libcuda
+// lock; growing a buffer by reallocation would call it on the data path.
 //
 // *Reserved early*: NVIDIA lists page-locked host allocation among the operations that implicitly
 // synchronize the context, so allocating pinned memory waits for the context to go quiet. The context
@@ -885,10 +855,7 @@ public:
         shape_ = srdsim::StagingShape{kGroups, ring};
         const size_t kSlots = shape_.slots();
         // The layout comes from `srdsim_mapping.h`, where the suite asserts for *every* slot that it
-        // cannot touch the signal's bytes. The first version carved the signal out of the end of the pool,
-        // which is inside the last staging slot, so a thread holding that slot and the signal path wrote
-        // the same bytes. Three threads never reach the last slot, which is why the two-rank reproducer
-        // could not show it and vLLM could.
+        // cannot touch the signal's bytes.
         layout_ = srdsim::PoolLayout{kSlots, slot_bytes_};
         const size_t total = layout_.total_bytes();
         void* p = nullptr;
@@ -978,17 +945,15 @@ PinnedPool g_pinned;
 // plugin thread binds a context before its first copy.
 //
 // Which context is the part that matters. A module load or a free in a context takes a lock that every
-// other driver call in *that context* needs, and holds it until the context's resident kernels finish --
-// measured with a standalone probe: while one thread is inside `cuModuleLoadData`
-// or `cuMemFree` with a spinning kernel resident, even `cuEventCreate`, which submits no GPU work, waits
-// 19.7 s, until the kernel gives up. DeepEP's JIT loads a module inside dispatch, while its earlier
-// kernels spin waiting for this plugin's bytes, so copies issued from the primary context deadlock
-// against it. A second context in the same process is not held: the same copy returned in 1 ms and the
-// module load then finished.
+// other driver call in *that context* needs, and holds it until the context's resident kernels finish:
+// while one thread is inside `cuModuleLoadData` or `cuMemFree` with a spinning kernel resident, even
+// `cuEventCreate`, which submits no GPU work, waits until the kernel gives up. DeepEP's JIT loads a module
+// inside dispatch, while its earlier kernels spin waiting for this plugin's bytes, so copies issued from the
+// primary context deadlock against it. A second context in the same process is not held by that lock.
 //
 // So the plugin copies from a context of its own, on the device of the windows it writes. The windows
 // must be VMM allocations (`ncclMemAlloc`), whose mappings belong to the process rather than to a context,
-// so the same addresses are valid there; the probe's `ctx2` cells write exactly such an allocation.
+// so the same addresses are valid there.
 // Registration refuses any other kind of device window rather than let a copy into it fail later
 // (`check_delivery_window`). Sources of puts are registered windows too, so the same check covers them.
 // SRDSIM_DELIVERY_CONTEXT=primary uses the device's primary context instead, to reproduce the deadlock
@@ -1158,10 +1123,10 @@ bool check_delivery_window(void* base) {
 }
 
 // Process exit tears the CUDA driver down from the main thread's exit handlers, while NCCL's threads and the
-// plugin's agents may still be running. A driver call made then lands in structures being freed: measured, an
-// agent thread segfaulted inside `cuMemcpyHtoDAsync_v2`, and in other runs the main thread's teardown aborted
-// on a heap the driver had corrupted (`malloc_consolidate(): unaligned fastbin chunk detected`, in a free
-// inside libcuda) -- in both ranks, in runs that ended without destroying their communicators.
+// plugin's agents may still be running. A driver call made then lands in structures being freed, and either
+// crashes the calling thread or corrupts the heap, and glibc then aborts in the driver's own teardown with
+// `malloc_consolidate(): unaligned fastbin chunk detected`. This happens in processes that exit without
+// destroying their communicators.
 //
 // So the plugin registers an exit handler when it first opens delivery. Handlers run in reverse order of
 // registration, and the plugin is loaded after the CUDA runtime has initialised, so this one runs before the
@@ -1413,9 +1378,7 @@ void drain_sends() {
 // reported. For a context or communicator going away (`send` false): nothing is sent, only removed. By then
 // the application may already have freed what the units point at -- a buffer torn down without `destroy()`
 // frees its host windows without deregistering them -- and a unit sent now would carry stale heap from the
-// sender into freed heap on the receiver. Measured: a receiver's heap arena held the previous top-chunk
-// header of an identical sender, and glibc aborted in `malloc_consolidate`. Returns false if something had
-// to be dropped.
+// sender into freed heap on the receiver. Returns false if something had to be dropped.
 bool finish_sends(const void* owner, bool send) {
     std::lock_guard<std::mutex> g(g_send.mu);
     if (g_send.queue.empty()) return true;
@@ -1506,10 +1469,10 @@ bool send_unit_async(const srdsim::Unit& u, RmaCtx* owner) {
 }
 #endif  // SRDSIM_WITH_CUDA
 
-// SRDSIM_PROBE_RECORD_BYTES / SRDSIM_PROBE_STAMP_OFFSET: a diagnostic for H6 (docs/DEEPEP-FINDINGS.md), knowing one
-// thing about the application's layout. DeepEP's combine sends records of a fixed size, and the H6 kernel checks
-// write a stamp (a small non-negative int) at a fixed offset in each. When an operation's bytes are a whole
-// number of records, every record's stamp is looked at where the bytes are on the host: the sender's copy at
+// SRDSIM_PROBE_RECORD_BYTES / SRDSIM_PROBE_STAMP_OFFSET: a diagnostic that knows one thing about the application's
+// layout: records of a fixed size (as DeepEP's combine sends), in which the application has been instrumented to
+// write a stamp (a small non-negative int) at a fixed offset. When an operation's bytes are a whole number of
+// records, every record's stamp is looked at where the bytes are on the host: the sender's copy at
 // submit (with SRDSIM_SNAPSHOT_SOURCE=1) and the receiver's before it writes them to the device. An operation in
 // which some records carry a stamp and others do not is reported with where it was seen, so a record that is
 // wrong on the wire tells a wrong read of the source apart from a destination overwritten after delivery.
@@ -1547,7 +1510,7 @@ void probe_records(const char* bytes, size_t n, const char* where, int peer, uin
                   count - good, count, first_bad, bad_value);
 }
 
-// SRDSIM_SNAPSHOT_SOURCE=1: a diagnostic for H4 (docs/DEEPEP-FINDINGS.md). A put's source must stay unchanged
+// SRDSIM_SNAPSHOT_SOURCE=1: a diagnostic for a source reused too early. A put's source must stay unchanged
 // until the put completes; the plugin reads it when each unit is released, which may be long after the submit.
 // If the application rewrites the source before completion, a late unit carries the new bytes. With this set,
 // the whole device source of each put is copied when it is submitted; when a unit is released, the bytes it
@@ -1872,8 +1835,8 @@ void probe_device_health(bool* idle, bool* busy) {
 // Deliberate contract violations, for negative controls. Every other impairment in this project slows the
 // transport down without breaking its promise; these two break it on purpose, the way `violate-i1` breaks the
 // ordering promise. They exist because a verification that has never been shown to fail is not known to
-// verify anything: a reproducer's oracle passing on a correct backend says nothing until it is also seen to
-// fail on a backend that corrupts or loses a placement.
+// verify anything: a check passing on a correct backend says nothing until it is also seen to fail on a
+// backend that corrupts or loses a placement.
 //
 //   SRDSIM_CORRUPT_EVERY=N   flip one byte in the middle of every Nth placement applied on this rank
 //   SRDSIM_DROP_EVERY=N      report every Nth placement as applied without writing it
@@ -1905,7 +1868,6 @@ thread_local bool t_unsettled = false;
 // The agent is about to wait for its next frame. Whatever this thread submitted is waited for now, once per
 // burst rather than once per frame, so no copy into a window is still pending while the link is quiet --
 // which is when an application that skips its teardown frees its windows without deregistering them.
-// Measured on H100 to cost nothing visible (DeepEP's test_ep.py, 591 s before, 570 s after).
 void delivery_idle(void* /*user*/) {
     if (not t_unsettled) return;
     t_unsettled = false;
@@ -2258,12 +2220,11 @@ void prebuild_signal_kernel() {
 
 // A counter written the way a NIC writes one: by DMA, from a value the transport already knows.
 //
-// This replaced a kernel, and the kernel was the unfaithful part. A NIC does not launch a kernel to
-// increment a counter; it writes eight bytes over the bus. Launching a kernel gave the emulator a
-// dependency on GPU compute that no fabric has, and DeepEP's forwarding CTAs are resident and spinning
-// while they wait for exactly these counters -- so the emulator needed an SM at the moment the code
-// under test was occupying them all. Measured: with DeepEP given 64 SMs the dispatch never completed in
-// three runs; at 8 and at 24 it completed once each. That is a dependency, not a coincidence.
+// This is the default; the kernel in `DeviceAtomicAdd` is used only with SRDSIM_SIGNAL_KERNEL=1, so that the
+// two can be compared. A NIC does not launch a kernel to increment a counter; it writes eight bytes over the bus. Launching a kernel would give the emulator a dependency on GPU compute that no
+// fabric has, and resident kernels (DeepEP's forwarding CTAs, for example) spin while they wait for exactly
+// these counters -- so the emulator would need an SM at the moment the code under test occupies them all,
+// and whether a run completes would depend on how many SMs the application leaves free.
 //
 // Correctness rests on one fact from NCCL: the signals region is registered with
 // `NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET`, so the counters are cumulative for the life of the window and
@@ -2292,13 +2253,11 @@ public:
         // nothing worth measuring.
         std::lock_guard<std::mutex> g(mu_);
         const uint64_t staged = (totals_[dst_u64] += value);
-        // Copied out of pinned memory, not off the stack. This is the same defect as the payload path
-        // and it was hidden behind it: with a pageable source `cuMemcpyHtoDAsync` is not asynchronous,
+        // Copied out of pinned memory, not off the stack. This is the same hazard as the payload path: with
+        // a pageable source `cuMemcpyHtoDAsync` is not asynchronous,
         // the driver stages the bytes through a pool of its own and that path waits on a device which
-        // DeepEP's resident CTAs are occupying while they spin for these very counters. Measured on
-        // 2026-09-07: pinning the payload buffer moved the stall from `device_copy` to exactly here, in
-        // both ranks, with the stack stopped inside `cuMemcpyHtoDAsync_v2` under this call. Eight bytes
-        // in flight is still eight bytes the driver refuses to stage.
+        // resident kernels are occupying while they spin for these very counters. Eight bytes in flight
+        // are still eight bytes the driver must stage.
         //
         // One slot rather than one per thread, because `mu_` is already held: the lock that makes the
         // totals ordered also makes the slot exclusive, so a second slot would buy nothing.
@@ -2421,9 +2380,8 @@ bool device_add(void* dst_u64, uint64_t value, void* /*user*/) {
 #endif
 
 // Signal counters used two ways. A counter one sender increments both with puts and with bare signals holds two
-// kinds of increment; a receiver that counts it as completions will count the bare ones too. That was the shape of
-// H4 (docs/DEEPEP-FINDINGS.md) -- the cached dispatch's per-part signals shared QP 0's ids with the barrier -- but the
-// observation is only that the counter is shared, not what the receiver does with it. NCCL lays a signal out at
+// kinds of increment; a receiver that counts it as completions will count the bare ones too. What is recorded is
+// only that the counter is shared, not what the receiver does with it. NCCL lays a signal out at
 // (signalId + contextId * nSignalsPerContext) * 8, so the offset names one counter. Always on: the entries are
 // bounded by the counters this rank signals, and the lookup is taken under the lock `submit` already holds for the
 // signal-window check.
@@ -2770,9 +2728,8 @@ ncclResult_t srdsim_listen(void* /*ctx*/, int /*dev*/, void* handle, void** list
 
 void report_windows_once(CollComm* cc);   // defined below, next to the window bookkeeping
 
-// The monitor thread. Independent of everything it watches, which is the whole point: the previous
-// version reported from the progress loop and printed nothing on the run where the progress loop was
-// what had stopped.
+// The monitor thread. Independent of everything it watches, which is the whole point: a report printed
+// from the progress loop prints nothing when the progress loop is what has stopped.
 class StallMonitor {
 public:
     void watch(CollComm* cc) {
@@ -2785,10 +2742,9 @@ public:
 
     // Called before a communicator is destroyed. Without it the monitor keeps a raw pointer and goes on
     // dereferencing `cc->agent`, `cc->links` and `cc->rma_contexts` every half second after `closeColl`
-    // has deleted it -- and `connect` watched the comm before a dial failure could delete it, leaving a
-    // dangling pointer for the whole run. It only armed when the plugin's logging was on, which is the
-    // configuration every measurement used, and a monitor reading freed memory can print anything,
-    // including the impossible numbers that sent this investigation in the wrong direction twice.
+    // has deleted it, and a monitor reading freed memory can print anything. The monitor is armed only
+    // when logging is on, so the hazard exists only in that configuration. `connect` watches the comm before a
+    // dial can fail and delete it, so that path calls this too.
     void unwatch(CollComm* cc) {
         std::lock_guard<std::mutex> g(mu_);
         comms_.erase(std::remove(comms_.begin(), comms_.end(), cc), comms_.end());
@@ -2834,11 +2790,10 @@ private:
             if (quiet < quiet_ms) continue;
             // Repeat, on an interval, for as long as the stall lasts. Reporting once cannot answer the
             // question a stall actually poses: is the queue draining slowly or not at all? A scheduler
-            // holding 113 operations in a single snapshot is either the cause of the stall or its
+            // holding many operations in a single snapshot is either the cause of the stall or its
             // consequence -- if progress has stopped being called, work stays held because nothing is
             // asking for it -- and those are opposite conclusions from the same number. Two samples
-            // separate them; one cannot. This is the third time in this project that a report's
-            // cardinality, not its content, was what blocked the diagnosis.
+            // separate them; one cannot.
             const bool first = not reported;
             reported = true;
             if (not first and quiet % kRepeatMs > 500) continue;
@@ -3072,8 +3027,8 @@ ncclResult_t srdsim_reg_mr_sym_dmabuf(void* collComm, void* data, size_t size, i
 ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
     // The window itself, first and regardless of build flags. Leaving it in the table is not a leak: a
     // frame that arrives after deregistration is applied to the freed base, and for a host window that
-    // base is ordinary heap. Under vLLM that landed a packed `(finish, tail)` pair inside a Python object
-    // header and the worker died in the garbage collector, a long way from the write.
+    // base is ordinary heap, so the write corrupts whatever the application allocated there next, and the
+    // crash happens a long way from the write.
     if (auto* cc = static_cast<CollComm*>(collComm)) {
         if (auto* mr = static_cast<MrHandle*>(mhandle)) {
             cc->windows.retire(mr->window_id);   // returns once no write to it is under way
@@ -3438,11 +3393,9 @@ void report_receive_side(CollComm* cc, uint64_t progress_calls) {
 // the caller waits, times out somewhere else entirely, and the simulator's own numbers are never
 // looked at. So the plugin watches itself -- from `StallMonitor`, on its own thread.
 //
-// It used to watch itself from inside `rmaProgress`, and that version is gone rather than kept for
-// reference: a reporter that runs on the thread it is reporting about cannot report the one failure
-// that matters, because a blocked progress call never reaches it. Two attempts died that way. The
-// per-communicator state it needed is gone with it; anything a per-comm function remembers belongs on
-// the comm, which is the other lesson that cost two attempts.
+// A reporter that runs on the thread it is reporting about, such as one inside `rmaProgress`, cannot report
+// the one failure that matters, because a blocked progress call never reaches it. What a per-comm function
+// remembers belongs on the comm, not in a function-local static, which every communicator shares.
 void report_windows_once(CollComm* cc);   // defined below, next to the window bookkeeping
 
 // Records a unit the link refused, where a report and `queryLastError` will find it. NCCL discards what
@@ -3470,9 +3423,9 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     // never called progress, or they were released and went somewhere the peer is not watching.
     // Counting both sides is what separates them, and the counts are cheap enough to keep always.
     // These are process-wide on purpose -- they answer "is progress being called at all" -- but the
-    // context has to be printed with them. A scheduler was found holding 165 operations while the
-    // global count said 59 units released, and without the context pointer there was no way to tell
-    // whether progress was never called for that context or called and refusing to release.
+    // context has to be printed with them: without the context pointer, a scheduler holding operations
+    // while the global count shows units released does not tell whether progress was never called for
+    // that context or called and refusing to release.
     static std::atomic<uint64_t> calls{0}, units{0};
     const uint64_t n = ++ calls;
     if (log_ops() and (n <= 8 or n % 5000000 == 0))
@@ -3568,10 +3521,8 @@ void report_outstanding(CollComm* cc) {
         if (ctx == nullptr or ctx->sched == nullptr) continue;
         // Under the context's own lock. Without it this reads `pending_` while another thread is inside
         // `progress()`, where `reap()` resizes that vector -- a data race, and one that can report counts
-        // no reachable state has. The first version of this report omitted the lock, and its numbers
-        // contradicted the scheduler's own code: unplaced chunks after a million and a half drives, which
-        // `pick()` cannot produce. A racing instrument does not merely report noise, it reports
-        // impossibilities, and impossibilities send the reader looking for a bug that is not there.
+        // no reachable state has. A racing instrument reports impossibilities, and they send the reader
+        // looking for a bug that is not there.
         srdsim::Scheduler::Outstanding o;
         {
             std::lock_guard<std::mutex> g(ctx->mu);
@@ -3608,8 +3559,7 @@ void report_outstanding(CollComm* cc) {
 // Every line here is a duration rather than a count, because the question a stall poses is "how long
 // ago", and a count cannot answer it. Two samples of "driven 254699 times" taken a hundred seconds
 // apart say the number did not change, which is equally consistent with three different bugs: NCCL
-// stopped calling, the last call never returned, or this report is itself stale. For two rounds of
-// this investigation the first reading was assumed and the scheduler was blamed.
+// stopped calling, the last call never returned, or this report is itself stale.
 //
 // The distinction is worth stating precisely, because it decides who looks next. NCCL's GIN proxy runs
 // one thread by default (`NCCL_GIN_PROXY_NTHREADS`), and one iteration of that thread calls `test`,
@@ -3693,9 +3643,8 @@ void report_windows_once(CollComm* cc) {
     if (cc == nullptr or cc->agent == nullptr) return;
     report_outstanding(cc);
     // The completion path, the error and what teardown discarded all repeat. Only the window table is
-    // printed once, because it does not change. These used to sit below the early return, so "nothing was
-    // refused" was a snapshot of the first ten seconds and not a statement about the run -- and that
-    // snapshot was quoted as evidence for several days.
+    // printed once, because it does not change. They come before the early return, so that "nothing was
+    // refused" is a statement about the whole run and not about its first report.
     report_driving(cc);
     {
         const auto lost = cc->links.discarded();

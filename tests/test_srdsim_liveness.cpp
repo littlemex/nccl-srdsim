@@ -29,8 +29,6 @@
 //       nobody has watched fail is not a monitor.
 //   L6  memory stays bounded while a receiver is slow but present. A queue is allowed to grow; it is not
 //       allowed to grow without limit while the peer is still draining.
-//
-// Build: c++ -std=c++17 -O2 -pthread -I layer2 tests/test_srdsim_liveness.cpp -o test_srdsim_liveness
 
 #include <algorithm>
 #include <atomic>
@@ -103,15 +101,13 @@ srdsim::Impairments g_recv_imp;
 std::atomic<uint64_t> g_applied{0};
 Clock::time_point g_last_apply;  // guarded by g_apply_mutex
 std::mutex g_apply_mutex;
-// The freeze has to be applied by the side that stops reading, which is the receiver. It was declared
-// and never wired in the first version, so the knob did nothing and the two cases that depend on it
-// passed without exercising anything -- exactly the failure mode this suite exists to catch.
+// The freeze has to be applied by the side that stops reading, which is the receiver; L5 checks that it
+// takes effect, since a freeze that is never applied lets the cases that depend on it pass vacuously.
 srdsim::Freezer g_freezer;
 
 // Per-link applied counts, so the freeze fires after this link's third frame rather than after the
-// third frame on any link. Keyed on the whole receiving side, the freeze fired at frame 32 of 60 --
-// after the frozen peer's traffic had already finished -- and every test that depended on it passed
-// without a sender ever waiting for anything.
+// third frame on any link. Keyed on the whole receiving side, the freeze can fire after the frozen
+// peer's traffic has already finished, and then no sender ever waits for anything.
 // Two in every case here, and the bound is stated rather than left as a literal in four places.
 constexpr int kMaxLinks = 8;
 std::atomic<uint64_t> g_applied_on_link[kMaxLinks];
@@ -372,10 +368,9 @@ RunOutcome drive(const srdsim::Impairments& imp, int peers, int ops_per_peer, si
 // The volume is part of the case, not a constant, because how much has to move decides whether an
 // impairment is felt at all. A receiver that stops reading only holds a sender up once the bytes
 // outrun the socket buffers, and those are hundreds of kilobytes: with a few hundred kilobytes in the
-// run, the kernel absorbed everything and a frozen receiver was indistinguishable from a fast one.
-// Measured on this machine: the sender pushed all 197,808 bytes to a peer that had been frozen for
-// 3.5 seconds and finished in 538 ms. Shrinking SO_SNDBUF does not fix that -- the send buffer bounds
-// what is unsent, not what is unread, and the receiver keeps acknowledging into its own 326 kB.
+// run, the kernel absorbs everything and a frozen receiver is indistinguishable from a fast one.
+// Shrinking SO_SNDBUF does not change that: the send buffer bounds what is unsent, not what is unread,
+// and the receiver keeps acknowledging into its own receive buffer.
 struct Case {
     const char* name;
     srdsim::Impairments imp;
@@ -421,8 +416,8 @@ std::vector<Case> cases() {
     // Six seconds, not three: the receiver's socket buffer absorbs a few hundred kilobytes before a
     // sender feels anything, and that head start is worth about two seconds here. A blocking descriptor
     // then waits about four seconds inside one progress call, well past the budget, while a
-    // non-blocking one waits about a millisecond. Measured: 3500 ms of freeze left the blocking case at
-    // 1.3 s -- a real difference that the budget did not catch, which is the same as not catching it.
+    // non-blocking one waits about a millisecond. A freeze of about three seconds would leave the blocking
+    // case under the budget, and the case would not tell the two apart.
     frozen.freeze_ms = 6000;
     // Big enough not to trigger silly-window behaviour, small enough to backpressure. What makes the
     // freeze visible here is the volume above, not the buffer: see the note on Case.
@@ -527,8 +522,8 @@ void test_a_frozen_link_does_not_stop_the_others() {
 
     // L5. The freeze has to be observable, or the case proves only that nothing broke. The witness is
     // elapsed time against an unimpaired run of the same size, and the margin has to be a real fraction
-    // of the freeze rather than "at least as long": the first version asked only for `>=`, which is true
-    // of a run that absorbed the freeze entirely and therefore true of a knob that did nothing.
+    // of the freeze rather than "at least as long": `>=` alone is true of a run that absorbed the freeze
+    // entirely, and so of a knob that did nothing.
     const auto baseline = drive(srdsim::Impairments{}, 2, 40, 16384, 11, srdsim::Mode::Srd);
     expect(baseline.completed, "L5 the unimpaired baseline completed");
     const int64_t margin = static_cast<int64_t>(imp.freeze_ms) / 2;

@@ -30,8 +30,6 @@
 //          sequence has the same length as every other for that configuration.
 //   P-DONE every path from the initial state reaches a terminal state: the scheduler cannot wedge.
 //   P-ORD  in `inorder`, exactly one sequence exists, which is what "submission order" means.
-//
-// Build: c++ -std=c++17 -O2 -I layer2 tests/model_srdsim_schedule_exhaustive.cpp -o m
 
 #include <algorithm>
 #include <cstdio>

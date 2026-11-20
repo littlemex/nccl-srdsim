@@ -3,20 +3,19 @@
 // The address arithmetic behind a BAR mapping, and the layout of the pinned staging pool.
 //
 // WHY THIS IS A SEPARATE HEADER
-// Both of these were wrong in ways the local suite could not see, and both were found by vLLM rather than
-// by a test. On 2026-09-07:
+// Both are easy to get wrong in ways a small run does not reach:
 //
-//   * the pool carved the signal's eight bytes out of the end of the pool, which is inside the last
-//     staging slot, so a thread holding that slot and the signal path wrote the same bytes. The
-//     reproducer runs three threads and never reaches the last slot;
-//   * the mapping was created with the window's length while accesses were offset by the distance from
-//     the pinned page to the window, so a write at the far end ran off the end of the mapping by exactly
-//     that distance. Every window the reproducer registers begins on a page, so the distance was zero.
+//   * a signal's eight bytes carved out of the end of the pool lie inside the last staging slot, so a
+//     thread holding that slot and the signal path write the same bytes. A run with only a few threads
+//     never reaches the last slot;
+//   * a mapping created with the window's length, while accesses are offset by the distance from the
+//     pinned page to the window, runs off its end by exactly that distance. A window that begins on a
+//     page has a distance of zero.
 //
-// Neither needs a GPU to be wrong, and neither needed one to be checked. What kept them out of reach of
-// the suite was that the arithmetic lived inside a class that only compiles with `gdrapi.h` and only runs
-// where `/dev/gdrdrv` exists. Pulled out here it is ordinary integer arithmetic over `uintptr_t`, so the
-// suite can enumerate the cases that matter -- offset windows, page boundaries, the last slot, and values
+// Neither needs a GPU to be wrong or to be checked, but the code that uses them only compiles with
+// `gdrapi.h` and only runs where `/dev/gdrdrv` exists. Pulled out here it is ordinary integer arithmetic
+// over `uintptr_t`, so the suite can enumerate the cases that matter -- offset windows, page boundaries, the
+// last slot, and values
 // chosen to overflow if the arithmetic is written the obvious way.
 //
 // The rule these follow, and the reason they are written the way they are: no expression here adds two

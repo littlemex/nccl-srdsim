@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//
-// Tests for Get on the wire (`layer2/srdsim_transport.h`'s `WireKind::GetRequest`/`GetResponse`,
-// `SendLinks::send_get_request`, and the two new `ReceiveAgent::Hooks`). Real processes over a real
+// Tests for Get on the wire (`src/srdsim_transport.h`'s `WireKind::GetRequest`/`GetResponse`,
+// `SendLinks::send_get_request`, and the two `ReceiveAgent::Hooks` a get uses). Real processes over a real
 // TCP connection, like `test_srdsim_transport.cpp`; needs neither CUDA nor NCCL, and does not touch
 // `nccl_rma_srdsim.cc` at all -- the plugin's own `srdsim_iget`/`srdsim_handle_get_request` wire a real
 // `RmaCtx`/`Scheduler` into these same hooks, which is integration this file cannot reach without a
@@ -16,9 +15,6 @@
 //       the GetRequest carried -- unchanged, since the owner never interprets it.
 //   G3  a GetRequest naming a range past the end of its window is refused and the stream survives.
 //   G4  a GetRequest naming a window the receiver never registered is refused and the stream survives.
-//
-// Build:
-//   c++ -std=c++17 -O2 -Wall -Wextra -I layer2 tests/test_srdsim_get.cpp -o test_srdsim_get
 
 #include <cstdarg>
 #include <cstdio>

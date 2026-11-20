@@ -23,11 +23,11 @@
 //
 // WHY THERE IS ALSO A CUPTI FRONT END
 // The shim sees only callers that link libcuda's exported symbols. The CUDA runtime -- inside PyTorch and
-// NCCL -- does not: it obtains every driver entry point through `cuGetProcAddress`, and a measured attempt
-// to intercept that lookup broke PyTorch ("context is destroyed"), because the runtime asks the lookup for
-// itself and depends on what comes back. So "exactly one call in flight" from the shim alone was a lower
-// bound. Built with -DCENSUS_WITH_CUPTI and loaded through CUDA_INJECTION64_PATH, the same census is fed by
-// CUPTI's driver-API callbacks instead, which the driver raises for every call whoever made it. The two
+// NCCL -- does not: it obtains every driver entry point through `cuGetProcAddress`, and intercepting that
+// lookup breaks PyTorch ("context is destroyed"), because the runtime asks the lookup for itself and depends
+// on what comes back. So a count of calls in flight from the shim alone is a lower bound. Built
+// with -DCENSUS_WITH_CUPTI and loaded through CUDA_INJECTION64_PATH, the same census is fed by CUPTI's
+// driver-API callbacks instead, which the driver raises for every call whoever made it. The two
 // front ends are alternatives: load the library one way or the other, not both.
 //
 // WHAT IT DOES NOT DO
@@ -207,13 +207,10 @@ static void release(int i) {
     __atomic_store_n(&g_slots[i].entered_ms, 0, __ATOMIC_RELEASE);
 }
 
-// Swept by a thread of its own, and the reason is a hole the first version had.
-//
-// It swept from inside the wrappers, on the theory that a call which hangs is always accompanied by other
-// calls still arriving. That is false in exactly the case this tool is for: when the threads that make
-// CUDA calls are the ones that are stuck, no wrapper is entered, so nothing sweeps and the census stays
-// silent about a table full of overdue entries. Measured on 2026-09-07, where two threads sat in the same
-// place for 75 seconds and the census reported nothing at all.
+// Swept by a thread of its own. Sweeping from inside the wrappers assumes that a call which hangs is always
+// accompanied by other calls still arriving, which is false in exactly the case this tool is for: when the
+// threads that make CUDA calls are the ones that are stuck, no wrapper is entered, nothing sweeps, and the
+// census stays silent about a table full of overdue entries.
 //
 // A thread that can fail to start is the lesser risk, and it says so when it does.
 static void check_overdue(void) {
@@ -255,9 +252,8 @@ static void check_overdue(void) {
 //
 // `RTLD_NEXT` searches only the objects that follow this one in the load order, and libcuda is not
 // necessarily among them: NCCL and PyTorch bring it in with `dlopen` into a local scope, after the
-// preload. So the first lookup returns NULL for calls this shim must forward -- measured on 2026-09-07,
-// where `cuModuleLoadData` came back NULL and the wrapper called it, killing both ranks with SIGSEGV at
-// window registration. Opening the library by name and asking its handle finds it wherever it lives.
+// preload. So the first lookup can return NULL for calls this shim must forward, and calling that NULL
+// crashes the process. Opening the library by name and asking its handle finds it wherever it lives.
 //
 // `RTLD_NOLOAD` first, so this never *causes* libcuda to load in a process that was not going to use it.
 static void* real(const char* name) {
@@ -272,7 +268,7 @@ static void* real(const char* name) {
     if (!p) {
         // Fatal and said out loud. Returning a made-up error code would let the process continue with a
         // call that silently did nothing, and an instrument that alters the run it is measuring is worse
-        // than no instrument. Crashing quietly, which is what the first version did, is worse still.
+        // than no instrument, and crashing quietly is worse still.
         say("== census cannot resolve %s anywhere; refusing to guess. Unset LD_PRELOAD to run without "
             "the census.", name);
         abort();
