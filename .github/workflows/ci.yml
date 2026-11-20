@@ -16,8 +16,14 @@ jobs:
           cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
-      - name: Configuration reference lists every variable the source reads
-        run: ./scripts/check_configuration_reference.sh
+
+  # docs/configuration.md has a row for every SRDSIM_* variable the source reads, and no other.
+  configuration-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: ./scripts/check_configuration_reference.sh
 
   # The plugin against NCCL's plugin ABI for each supported NCCL release, in each delivery
   # configuration, with declaration-only CUDA stand-ins. Checks the generated NCCL version, the op
