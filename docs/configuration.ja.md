@@ -31,7 +31,7 @@ NCCL が RMA コンテキストを作るたびに読む。
 |---|---|---|
 | `SRDSIM_MODE` | 名前、`srd` | 配送のスケジュール。`srd`、`inorder`、`peer-seq`、`reverse-ops`、`signal-last`、`defer-one`、`violate-i1` のどれか ([README](../README.md#delivery-modes) を参照)。知らない名前はログに残し、`srd` を使う |
 | `SRDSIM_SEED` | 個数、`1` | スケジュールの乱数の種。`0` は既定値になるので、種に 0 は選べない |
-| `SRDSIM_CHUNK_BYTES` | 個数、`8192` | 操作を分けるチャンクの大きさ。1 回だけ読む別の箇所で、ピン留めした staging のスロット 1 つの大きさにも使い、これが `SRDSIM_STAGING_RING` の上限を決める。全ランクで同じ値にすること。受け手のスロットより大きいフレームは、ページング可能なメモリを通してコピーされる |
+| `SRDSIM_CHUNK_BYTES` | 個数、`8192` | 操作を分けるチャンクの大きさ。1 回だけ読む別の箇所で、ピン留めした staging のスロット 1 つの大きさにも使い、これが `SRDSIM_STAGING_RING` の上限を決める。全ランクで同じ値にすること。受け手のスロットより大きいフレームは、ページング可能なメモリを通してコピーされる。4 MiB を超える値では、受け手は自分の値までの大きさのフレームしか受け付けない |
 | `SRDSIM_DEFER_KIND` | 名前、`any` | `defer-one` がどの操作を後回しにするか。種類を問わず最も古いもの (`any`)、または最も古い、シグナルなしの put (`unsignaled`)、シグナル付きの put (`signaled`)、シグナルだけの操作 (`signal-only`)。知らない名前はログに残し、`any` を使う |
 
 ## 配送

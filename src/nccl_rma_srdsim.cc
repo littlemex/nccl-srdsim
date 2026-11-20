@@ -143,6 +143,14 @@ size_t env_size(const char* name, size_t dflt) {
 //   SRDSIM_LOG_OPS=1  log every iput / iputSignal with its arguments
 //   SRDSIM_DRY_RUN=1  accept operations and complete them immediately without moving any data
 // A dry run cannot produce correct results; the point is to watch the call sequence without hanging NCCL.
+// The largest frame payload a receiver accepts: the chunk size every rank sends with (the scheduler never
+// emits a placement larger, and get replies use the same size), and never less than the transport's default,
+// so that ranks configured with different chunk sizes up to that default still interoperate.
+size_t max_frame_bytes() {
+    static const size_t v = std::max<size_t>(env_size("SRDSIM_CHUNK_BYTES", 8192), size_t{1} << 22);
+    return v;
+}
+
 bool log_ops() {
     static const bool v = env_size("SRDSIM_LOG_OPS", 0) != 0;
     return v;
@@ -2980,6 +2988,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     hooks.user = cc;
     hooks.log = [](const char* m) { logf("agent: %s", m); };
     cc->agent = std::make_unique<srdsim::ReceiveAgent>(&cc->windows, hooks);
+    cc->agent->set_max_frame_bytes(max_frame_bytes());
     if (log_ops()) {
         g_stall_monitor.watch(cc);
         // The transport reports where it is through the same breadcrumb map the rest of the plugin
@@ -3444,8 +3453,8 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
              static_cast<unsigned long long>(owner_token), requester_rank, cc->nranks);
         return false;
     }
-    // Frames no larger than the requester accepts (the transport's default frame limit), and never empty.
-    const size_t chunk = std::min<size_t>(std::max<size_t>(scheduler_options().chunk_bytes, 1), size_t{1} << 22);
+    // Frames no larger than the requester accepts (`max_frame_bytes`), and never empty.
+    const size_t chunk = std::min(std::max<size_t>(scheduler_options().chunk_bytes, 1), max_frame_bytes());
     std::vector<char> bytes;
 #ifdef SRDSIM_WITH_CUDA
     if (src_is_device) {
