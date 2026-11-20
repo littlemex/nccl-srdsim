@@ -109,6 +109,9 @@ void logf(const char* fmt, ...) {
     }
 }
 
+// Progress calls in which a peer's outbox had no room, so its operations stayed pending: backpressure at work.
+std::atomic<uint64_t> g_held_for_room{0};
+
 // Registration, deregistration and teardown, always on stderr: they are rare, and whether a window's memory
 // was deregistered before it was freed is the question a crash in the delivery path turns on.
 void lifecycle(const char* fmt, ...) {
@@ -3704,9 +3707,6 @@ void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u) {
     }
     logf("%s", detail);
 }
-
-// Progress calls in which a peer's outbox had no room, so its operations stayed pending: backpressure at work.
-std::atomic<uint64_t> g_held_for_room{0};
 
 // A released unit holds room in its peer's outbox until its frame is appended (see `LinkRoom` in
 // `srdsim_progress`). One that will not be sent gives the room back.
