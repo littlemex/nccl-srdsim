@@ -14,6 +14,7 @@
 // listed case passes (remove its entry with the fix) or fails differently. A FAIL line carries the
 // arguments that replay that one case.
 #include "harness.h"
+#include "srdsim_schedule.h"
 
 #include <signal.h>
 #include <sys/mman.h>
@@ -331,7 +332,10 @@ void refused_then_real(Rank& R) {
     constexpr size_t n = (16 << 10) + 13, src = 4099, dst = (512 << 10) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 13);
-        const Ticket* bad = R.issue(put(0, 1, src, (size_t{1} << 30) + 1, dst));
+        // One byte over the largest single write the scheduler models.
+        Op big = put(0, 1, src, srdsim::Scheduler::Options{}.max_op_bytes + 1, dst);
+        big.refused = true;
+        const Ticket* bad = R.issue(big);
         R.wait_retired(bad, "refused");
         if (not R.last_error()) fail("assert", "refusal-reported", "%s", "queryLastError reports nothing");
         R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 5, false)), "put-with-signal");
