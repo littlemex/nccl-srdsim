@@ -208,8 +208,9 @@ void get_completes_with_data(Rank& R) {
 // A get needs nothing from the owner: the owner's proxy never runs while the requester waits for the
 // get to retire with its bytes in place. One wait covers both, so fixing completion alone leaves the
 // failure as it is.
-void get_owner_idle(Rank& R) {
-    constexpr size_t n = (4 << 10) + 13, remote = (256 << 10) + 7, local = (300 << 10) + kGuard;
+// Run with a small get and with one larger than a socket's send buffer, so that part of the reply has to wait
+// in the owner's outbox while the owner's proxy is not running.
+void get_owner_idle_n(Rank& R, size_t n, uint64_t remote, uint64_t local) {
     if (g_rank == 1) { fill(R.at(remote), n, 1, 6); R.pause(); }
     barrier("owner filled");
     if (g_rank == 0) {
@@ -222,6 +223,8 @@ void get_owner_idle(Rank& R) {
         R.resume();
     }
 }
+void get_owner_idle(Rank& R) { get_owner_idle_n(R, (4 << 10) + 13, (256 << 10) + 7, (300 << 10) + kGuard); }
+void get_owner_idle_large(Rank& R) { get_owner_idle_n(R, (1536 << 10) + 13, 7, kGuard); }
 
 // A flush issued after a get completes, and the get's bytes are in place when it does. With
 // `data_first` the flush is issued only once every byte of the get has landed, so nothing is left for it
@@ -432,6 +435,7 @@ const std::vector<Scenario>& scenarios() {
         {"violate_control", violate_control, 2, {"violate-i1"}, {1, 2, 3}, nullptr},
         {"get_completes_with_data", get_completes_with_data, 2, {"srd"}, {1}, nullptr},
         {"get_owner_idle", get_owner_idle, 2, {"srd"}, {1}, nullptr},
+        {"get_owner_idle_large", get_owner_idle_large, 2, {"srd"}, {1}, nullptr},
         {"get_one_chunk_flush", get_one_chunk_flush, 2, {"srd"}, {1}, nullptr},
         {"get_multichunk_flush", get_multichunk_flush, 2, {"srd"}, {1}, nullptr},
         {"get_one_chunk_early_flush", get_one_chunk_early_flush, 2, {"srd"}, {1}, nullptr},
@@ -450,9 +454,8 @@ const std::vector<Scenario>& scenarios() {
 // Known defects (#26): the case fails today with exactly this status, "kind:id". A mode of "*" and a
 // table of 0 match any. A fix removes its entry; the run fails if a listed case passes or fails differently.
 struct Expected { const char* scenario; const char* mode; int table; const char* status; const char* issue; };
-const Expected kExpected[] = {
-    {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
-};
+// None today.
+const std::vector<Expected> kExpected = {};
 
 const Expected* expected_for(const Scenario& sc, const char* mode, int table) {
     for (const auto& e : kExpected)
