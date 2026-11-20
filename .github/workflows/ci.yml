@@ -315,9 +315,9 @@ jobs:
           echo "$KEYRING_SHA256  $KEYRING_DEB" | sha256sum -c
           sudo dpkg -i "$KEYRING_DEB"
           sudo apt-get update -q
-          apt-cache search --names-only '^libnvidia-compute-[0-9]+$' | sort -V
-          DRIVER_PKG=$(apt-cache search --names-only '^libnvidia-compute-[0-9]+$' | sort -V | tail -1 | cut -d' ' -f1)
-          sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-driver-dev-$CUDA_PKG" "$DRIVER_PKG"
+          . ./versions.env
+          sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-driver-dev-$CUDA_PKG" \
+            "cuda-nvrtc-dev-$CUDA_PKG" "$CI_DRIVER_LIB_PKG"
           ls -l /usr/lib/x86_64-linux-gnu/libcuda.so.1
       - name: Build and run
         env:
