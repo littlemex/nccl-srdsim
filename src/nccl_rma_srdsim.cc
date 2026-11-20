@@ -2438,8 +2438,8 @@ CrossOverlaps& g_cross = *new CrossOverlaps;
 // Every get whose reply has not yet fully landed, by an id this process never reuses. The id is the token a
 // GetRequest carries and its GetResponse echoes back, so a reply finds its get, and through it the context,
 // without trusting anything that crossed the socket: an id with no entry is dropped. A get completes when its
-// entry has no bytes left to land, and `destroyContext` removes the entries of the context it destroys, so
-// a late reply for a destroyed context finds nothing.
+// entry has no bytes left to land. `destroyContext` marks the entries of the context it destroys as aborted,
+// so a late reply for them is dropped and `test` finishes them without reporting their data as landed.
 struct GetRecord {
     RmaCtx* ctx;         // null once the context was destroyed with the reply outstanding
     int64_t remaining;   // bytes of the reply that have not landed
@@ -3390,6 +3390,7 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
         auto it = g_gets.gets.find(r->get_id);
         if (it == g_gets.gets.end()) {
             logf("test() called on get %llu, which has no entry; refusing", static_cast<unsigned long long>(r->get_id));
+            *done = 0;
             return ncclInternalError;
         }
         if (it->second.ctx == nullptr) {
