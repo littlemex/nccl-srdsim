@@ -254,6 +254,15 @@ struct Rank {
         return has;
     }
 
+    // Destroys the RMA context and creates a new one in its place, with the proxy paused, as a communicator
+    // that rebuilds its contexts would. Operations already issued keep being tested.
+    void recreate_context() {
+        pause();
+        check(rma.destroyContext(rmaCtx), "destroyContext");
+        check(rma.createContext(coll, kContexts, &rmaCtx), "createContext");
+        resume();
+    }
+
     const Ticket* last_ticket() {
         std::lock_guard<std::mutex> g(mu_);
         return tickets_.empty() ? nullptr : &tickets_.back();

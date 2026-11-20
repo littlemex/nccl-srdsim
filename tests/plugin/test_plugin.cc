@@ -386,6 +386,33 @@ void refused_then_real(Rank& R) {
     }
 }
 
+// A context destroyed with a get outstanding: the get still finishes when tested, its late reply does not
+// count against the context created in its place, and a get and flush on the new context complete with
+// their data.
+void get_across_context_rebuild(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, ra = (256 << 10) + 7, rb = (512 << 10) + 7,
+                     la = (1200 << 10) + kGuard, lb = (1400 << 10) + kGuard;
+    if (g_rank == 1) { fill(R.at(ra), n, 1, 16); fill(R.at(rb), n, 1, 17); }
+    barrier("owner filled");
+    if (g_rank == 0) {
+        stop_peer(1);
+        const Ticket* a = R.issue(get(0, 1, ra, n, la));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));   // its request leaves
+        R.recreate_context();
+        continue_peer(1);
+        R.wait_retired(a, "aborted-get");
+        const Ticket* b = R.issue(get(0, 1, rb, n, lb));
+        const Ticket* f = R.issue(flush(0, 1));
+        R.wait_retired(b, "get");
+        R.wait_retired(f, "flush");
+        if (size_t bad = mismatches(R.at(lb), n, 1, 17)) fail("assert", "data-on-new-context", "%zu bytes", bad);
+        expect_guards(R, lb, n);
+        set_flag(0);
+    } else {
+        wait_flag(0, "requester-done");
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -414,6 +441,7 @@ const std::vector<Scenario>& scenarios() {
         {"zero_byte_get_flush", zero_byte_get_flush, 2, {"srd"}, {1}, nullptr},
         {"register_during_traffic", register_during_traffic, 2, {"srd"}, {1, 2, 3}, nullptr},
         {"refused_then_real", refused_then_real, 2, {"srd"}, {1}, nullptr},
+        {"get_across_context_rebuild", get_across_context_rebuild, 2, {"srd"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
@@ -423,7 +451,6 @@ const std::vector<Scenario>& scenarios() {
 // table of 0 match any. A fix removes its entry; the run fails if a listed case passes or fails differently.
 struct Expected { const char* scenario; const char* mode; int table; const char* status; const char* issue; };
 const Expected kExpected[] = {
-    {"get_completes_with_data", "*", 0, "assert:data-at-early-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
 };
 
