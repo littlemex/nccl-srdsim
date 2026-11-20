@@ -629,6 +629,44 @@ void test_overlap_detection_is_opt_in() {
     expect(s.overlaps() == 0, "S12 overlap detection is off unless requested");
 }
 
+// S9: a peer whose link has no room gets nothing released, in every mode, and the other peer is not held up.
+// Once the room returns, everything drains and every byte arrives.
+void test_room_holds_a_full_peer() {
+    struct Blocked final : srdsim::Scheduler::Room {
+        bool open = false;
+        size_t taken0 = 0;
+        bool fits(int peer) const override { return peer != 1 or open; }
+        void take(int peer, size_t bytes) override { if (peer == 0) taken0 += bytes; }
+    };
+    for (srdsim::Mode m : {srdsim::Mode::Srd, srdsim::Mode::InOrder, srdsim::Mode::PeerSeq, srdsim::Mode::ReverseOps,
+                           srdsim::Mode::SignalLast, srdsim::Mode::DeferOne}) {
+        Fabric f(1 << 16, 4);
+        srdsim::Scheduler::Options o;
+        o.mode = m;
+        o.chunk_bytes = 1000;
+        srdsim::Scheduler s(o);
+        for (int k = 0; k < 4; ++ k) {
+            srdsim::Op op = make_op(static_cast<uint64_t>(k) + 1, f, static_cast<size_t>(k) * 10'000, 10'000, k);
+            op.peer = k % 2;
+            std::string why;
+            expect(s.submit(op, &why), "S9 submit");
+        }
+        Blocked room;
+        std::vector<srdsim::Unit> batch;
+        for (int i = 0; i < 200; ++ i) s.progress(8, &batch, &room);
+        bool peer1 = false;
+        for (const auto& u : batch) peer1 = peer1 or u.peer == 1;
+        expect(not peer1, ctx("S9 nothing is released to a peer without room: mode=%s", srdsim::mode_name(m)));
+        expect(room.taken0 == 20'000, ctx("S9 the other peer drains: mode=%s took %zu", srdsim::mode_name(m), room.taken0));
+        room.open = true;
+        for (int i = 0; i < 200 and not s.idle(); ++ i) s.progress(8, &batch, &room);
+        expect(s.idle(), ctx("S9 everything drains once there is room: mode=%s", srdsim::mode_name(m)));
+        for (const auto& u : batch) f.apply(u);
+        expect(std::equal(f.dst.begin(), f.dst.begin() + 40'000, f.src.begin()),
+               ctx("S9 every byte arrives: mode=%s", srdsim::mode_name(m)));
+    }
+}
+
 int main() {
     test_overlapping_writes_are_named();
     test_overlap_detection_is_opt_in();
@@ -640,6 +678,7 @@ int main() {
     test_inorder_is_a_baseline();
     test_reproducible_and_exploring();
     test_oversized_is_refused();
+    test_room_holds_a_full_peer();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

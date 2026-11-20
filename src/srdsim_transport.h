@@ -1009,6 +1009,14 @@ public:
         return drain_locked(peer);
     }
 
+    // Bytes waiting in the outbox for `peer`, and the most the outbox holds before it refuses a frame.
+    size_t queued_bytes(int peer) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (static_cast<size_t>(peer) >= outboxes_.size()) return 0;
+        return outboxes_[static_cast<size_t>(peer)].size();
+    }
+    size_t outbox_budget() const { return outbox_budget_; }
+
     // Whether nothing is waiting in the outbox for `peer`: everything appended has reached the socket.
     bool outbox_empty(int peer) {
         std::lock_guard<std::mutex> g(mu_);

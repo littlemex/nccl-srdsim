@@ -294,7 +294,18 @@ public:
 
     // Releases up to `budget` units and appends them to `out`. Returns the number released.
     // The caller performs the memory writes for each returned unit, in the returned order.
-    size_t progress(size_t budget, std::vector<Unit>* out) {
+    // What the link to each peer can take now. A unit for a peer that has no room is not released: it stays
+    // pending, and so does its operation, which is backpressure. Without it the caller would have to drop a
+    // unit it could not send after the scheduler had already counted it as released.
+    struct Room {
+        virtual ~Room() = default;
+        virtual bool fits(int peer) const = 0;          // room for one more unit of up to chunk_bytes
+        virtual void take(int peer, size_t bytes) = 0;  // a unit of `bytes` was released to this peer
+    };
+
+    size_t progress(size_t budget, std::vector<Unit>* out, Room* room = nullptr) {
+        room_ = room;
+        struct Clear { Room** r; ~Clear() { *r = nullptr; } } clear{&room_};
         size_t released = 0;
         while (released < budget) {
             const Choice c = pick();
@@ -356,6 +367,7 @@ public:
                              u.kind == Unit::Kind::Placement ? "place" :
                              u.kind == Unit::Kind::GetRequest ? "get-request" : "signal",
                              u.chunk_index, u.chunk_count);
+            if (room_) room_->take(u.peer, u.kind == Unit::Kind::Placement ? u.bytes : 0);
             out->push_back(u);
             ++ released;
             ++ units_released_;
@@ -506,6 +518,8 @@ private:
             const Pending& p = pending_[i];
             if (opt_.mode == Mode::PeerSeq and oldest_for_peer[p.op.peer] != i)
                 continue;                // this peer has older work outstanding
+            if (room_ and not room_->fits(p.op.peer))
+                continue;                // the link to this peer is full: nothing for it is released now
             if (opt_.mode == Mode::DeferOne and have_deferred_ and p.op.id == deferred_id_ and
                 pending_.size() > 1)
                 continue;                // held until it is the only one left
@@ -527,6 +541,7 @@ private:
                 deferred_id_ = 0;
                 for (size_t i = 0; i < pending_.size(); ++ i) {
                     const Pending& p = pending_[i];
+                    if (room_ and not room_->fits(p.op.peer)) continue;
                     for (int c = 0; c < p.chunk_count; ++ c)
                         if (not p.placed[static_cast<size_t>(c)])
                             return {static_cast<int>(i), c};
@@ -579,6 +594,7 @@ private:
 
     Options opt_;
     Rng rng_;
+    Room* room_ = nullptr;   // set for the duration of one `progress` call
     std::vector<Pending> pending_;
     uint64_t units_released_ = 0;
     uint64_t largest_issued_id_ = 0;

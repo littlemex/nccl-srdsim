@@ -3647,12 +3647,30 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     // path keyed its per-operation failure record by the wrong context.
     std::vector<srdsim::Unit> batch;
     std::vector<RmaCtx*> owners;
+    // A unit is released only while its peer's outbox has room for it, counting what this call has already
+    // released to that peer, so `send_unit` below is never refused for budget.
+    struct LinkRoom final : srdsim::Scheduler::Room {
+        srdsim::SendLinks* links;
+        size_t chunk;
+        std::map<int, size_t> reserved;
+        bool fits(int peer) const override {
+            if (links == nullptr) return true;
+            auto it = reserved.find(peer);
+            const size_t queued = links->queued_bytes(peer) + (it == reserved.end() ? 0 : it->second);
+            const size_t frame = sizeof(srdsim::WireHeader) + chunk;
+            return queued == 0 or frame <= links->outbox_budget() - std::min(queued, links->outbox_budget());
+        }
+        void take(int peer, size_t bytes) override { reserved[peer] += sizeof(srdsim::WireHeader) + bytes; }
+    } room;
+    room.links = ctx->coll ? &ctx->coll->links : nullptr;
+    static const size_t chunk = scheduler_options().chunk_bytes;
+    room.chunk = chunk;
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
         const size_t before = batch.size();
         {
             std::lock_guard<std::mutex> g(c->mu);
-            c->sched->progress(/*budget=*/8, &batch);
+            c->sched->progress(/*budget=*/8, &batch, &room);
         }
         owners.resize(batch.size(), c);
         c->progress_calls.fetch_add(1, std::memory_order_relaxed);
