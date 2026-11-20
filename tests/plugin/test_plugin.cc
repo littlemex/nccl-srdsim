@@ -72,8 +72,9 @@ Op flush(int context, int peer) { Op o; o.kind = Op::Flush; o.context = context;
 // an ignored offset, a swapped pair or a dropped tail shows.
 
 // A put of many chunks, then a signal of size 0 on the same context, submitted in the same proxy
-// iteration. The sender runs that one iteration (which releases at most a few chunks), then waits up to
-// kHoldMs for the target to say it has looked before running freely.
+// iteration. The sender runs that one iteration (which releases at most a few chunks) and then holds: for
+// a weak signal until the target has looked, for a strong one up to kHoldMs, since the target cannot look
+// before the signal arrives.
 //
 // strong: the signal is ordered behind every byte of the put, so it cannot arrive during the hold and the
 // target sees the whole put when it does. weak, under reverse-ops (newest operation first): the signal
@@ -88,11 +89,16 @@ void put_then_signal(Rank& R, bool strong, int salt) {
         const Ticket* p = R.issue(put(0, 1, src, n, dst));
         const Ticket* s = R.issue(signal_only(0, 1, 0, strong));
         R.run_steps(1);
-        set_where("hold");
-        const auto start = Clock::now();
-        while (g_shared->flag[0].load(std::memory_order_acquire) == 0 and
-               Clock::now() - start < std::chrono::milliseconds(kHoldMs))
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (strong) {
+            // The flag cannot come before the signal, and the signal cannot come before the put.
+            set_where("hold");
+            const auto start = Clock::now();
+            while (g_shared->flag[0].load(std::memory_order_acquire) == 0 and
+                   Clock::now() - start < std::chrono::milliseconds(kHoldMs))
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+        } else {
+            wait_flag(0, "target-looked");
+        }
         R.resume();
         R.wait_retired(p, "put");
         R.wait_retired(s, "signal");
@@ -103,8 +109,7 @@ void put_then_signal(Rank& R, bool strong, int salt) {
         set_flag(0);
         if (strong and bad != 0) fail("assert", "strong-orders-earlier-put", "%zu bytes missing", bad);
         if (not strong and bad == 0) fail("assert", "control-missed", "%s", "the weak signal arrived after its put");
-        R.wait_until([&] { return mismatches(R.at(dst), n, 0, salt) == 0; }, "put-complete",
-                     [&] { return uint64_t(n - mismatches(R.at(dst), n, 0, salt)); });
+        R.wait_peer([&] { return mismatches(R.at(dst), n, 0, salt) == 0; }, "put-complete");
         wait_flag(1, "sender-done");
         expect_guards(R, dst, n);
         expect_signals(R, {{0, 1}});
@@ -155,19 +160,22 @@ void violate_control(Rank& R) {
         const size_t bad = mismatches(R.at(dst), n, 0, 3);
         set_flag(0);
         if (bad == 0) fail("assert", "control-missed", "%s", "the signal arrived with its whole put");
-        R.wait_until([&] { return mismatches(R.at(dst), n, 0, 3) == 0; }, "put-complete",
-                     [&] { return uint64_t(n - mismatches(R.at(dst), n, 0, 3)); });
+        R.wait_peer([&] { return mismatches(R.at(dst), n, 0, 3) == 0; }, "put-complete");
         expect_guards(R, dst, n);
         expect_signals(R, {{2, 1}});
     }
 }
 
-// Polls for up to `ms` for `t` to retire, without failing either way.
+// Waits for `t` to retire, without failing either way, and gives up only once both kStopMs have passed
+// and the rank's own proxy has run kStopSteps iterations: a starved proxy is not a get that waits.
 constexpr int kStopMs = 2000;
-void wait_retired_for(const Ticket* t, int ms) {
+constexpr uint64_t kStopSteps = 1000;
+void wait_retired_while_stopped(Rank& R, const Ticket* t) {
     set_where("peer-stopped");
     const auto start = Clock::now();
-    while (t->retired.load(std::memory_order_acquire) == 0 and Clock::now() - start < std::chrono::milliseconds(ms))
+    const uint64_t first = R.steps.load();
+    while (t->retired.load(std::memory_order_acquire) == 0 and
+           (Clock::now() - start < std::chrono::milliseconds(kStopMs) or R.steps.load() - first < kStopSteps))
         std::this_thread::sleep_for(std::chrono::microseconds(100));
 }
 
@@ -182,11 +190,11 @@ void get_completes_with_data(Rank& R) {
     if (g_rank == 0) {
         stop_peer(1);
         const Ticket* g = R.issue(get(0, 1, remote, n, local));
-        wait_retired_for(g, kStopMs);
+        wait_retired_while_stopped(R, g);
         const bool early = g->retired.load(std::memory_order_acquire) != 0;
         const size_t bad_early = early ? mismatches(R.at(local), n, 1, 5) : 0;
         continue_peer(1);
-        if (bad_early) fail("assert", "data-at-completion", "%zu bytes", bad_early);
+        if (bad_early) fail("assert", "data-at-early-completion", "%zu bytes", bad_early);
         R.wait_retired(g, "get");
         if (size_t bad = mismatches(R.at(local), n, 1, 5)) fail("assert", "data-at-completion", "%zu bytes", bad);
         expect_guards(R, local, n);
@@ -248,11 +256,11 @@ void get_one_chunk_early_flush(Rank& R) {
         stop_peer(1);
         R.issue(get(0, 1, remote, n, local));
         const Ticket* f = R.issue(flush(0, 1));
-        wait_retired_for(f, kStopMs);
+        wait_retired_while_stopped(R, f);
         const bool early = f->retired.load(std::memory_order_acquire) != 0;
         const size_t bad_early = early ? mismatches(R.at(local), n, 1, 11) : 0;
         continue_peer(1);
-        if (bad_early) fail("assert", "flush-before-data", "%zu bytes", bad_early);
+        if (bad_early) fail("assert", "early-flush-without-data", "%zu bytes", bad_early);
         R.wait_retired(f, "flush");
         if (size_t bad = mismatches(R.at(local), n, 1, 11)) fail("assert", "data-at-flush", "%zu bytes", bad);
         expect_guards(R, local, n);
@@ -288,18 +296,30 @@ void register_during_traffic(Rank& R) {
     constexpr size_t n = (64 << 10) + 13, src = 4099, base = 1 << 20;
     constexpr int rounds = 8;
     // A source per put: each is overwritten when its own put retires, while the others may still be read.
+    // The sender's proxy is slowed so that the puts are still in flight while the windows are registered.
     if (g_rank == 0) {
+        R.step_delay_us.store(20000);
         for (int r = 0; r < rounds; ++ r) {
             fill(R.at(src + size_t(r) * n), n, 0, 12 + r);
             R.issue(put_signal(r % kContexts, 1, src + size_t(r) * n, n, base + kGuard + size_t(r) * (n + kGuard), 4, false));
         }
     }
-    for (int k = 0; k < 4; ++ k) R.register_and_release((64 << 10) + 4096 * size_t(k));
+    const Ticket* last = nullptr;
+    if (g_rank == 0) last = R.last_ticket();
+    for (int k = 0; k < 4; ++ k) {
+        R.register_and_release((64 << 10) + 4096 * size_t(k));
+        // The case is about registration while traffic is in flight; if all of it has already retired, it
+        // tested nothing that setup does not.
+        if (k == 0 and last and last->retired.load(std::memory_order_acquire) != 0)
+            fail("harness", "no-overlap", "%s", "every put retired before the first registration returned");
+    }
+    R.step_delay_us.store(0);
     if (g_rank == 1) {
         R.wait_peer([&] { return R.signal_word(4) >= uint64_t(rounds); }, "signal-word");
         for (int r = 0; r < rounds; ++ r)
             if (size_t bad = mismatches(R.at(base + kGuard + size_t(r) * (n + kGuard)), n, 0, 12 + r))
                 fail("assert", "data", "round %d: %zu bytes", r, bad);
+        for (int r = 0; r < rounds; ++ r) expect_guards(R, base + kGuard + size_t(r) * (n + kGuard), n);
         expect_signals(R, {{4, uint64_t(rounds)}});
     }
 }
@@ -337,7 +357,7 @@ const std::vector<Scenario>& scenarios() {
 // table of 0 match any. A fix removes its entry; the run fails if a listed case passes or fails differently.
 struct Expected { const char* scenario; const char* mode; int table; const char* status; const char* issue; };
 const Expected kExpected[] = {
-    {"get_completes_with_data", "*", 0, "assert:data-at-completion", "#26: a get completes when its request is sent"},
+    {"get_completes_with_data", "*", 0, "assert:data-at-early-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
     {"get_multichunk_flush", "*", 0, "stall:flush", "#26: pending_gets is decremented once per chunk of a get"},
     {"dry_run", "*", 0, "stall:put-second", "#26: every dry-run request is numbered 0, which never completes"},
@@ -373,10 +393,11 @@ Result run_case(const std::string& plugin, int table, const Scenario& sc, const 
     for (int r = 0; r < nranks; ++ r) {
         const pid_t pid = fork();
         if (pid < 0) {
+            const int err = errno;
             kill_all(pids, exited);
             for (pid_t p : pids) waitpid(p, nullptr, 0);
             munmap(mem, sizeof(Shared));
-            return {-1, "harness:fork errno " + std::to_string(errno)};
+            return {-1, "harness:fork errno " + std::to_string(err)};
         }
         if (pid == 0) {
             setpgid(0, 0);
@@ -471,14 +492,14 @@ int main(int argc, char** argv) {
     clear_srdsim_env();
     g_verbose = std::getenv("HARNESS_VERBOSE") != nullptr;
 
-    int passed = 0, xfailed = 0, failed = 0, wall_kills = 0, ran = 0;
+    int passed = 0, xfailed = 0, failed = 0, wall_kills = 0, ran = 0, not_run = 0;
     for (const auto& sc : scenarios()) {
         if (only and std::strcmp(only, sc.name) != 0) continue;
         for (const char* mode : sc.modes) {
             if (only_mode and std::strcmp(only_mode, mode) != 0) continue;
             for (int seed : sc.seeds) {
                 if (only_seed >= 0 and only_seed != seed) continue;
-                if (wall_kills >= kMaxWallKills) { ++ failed; continue; }
+                if (wall_kills >= kMaxWallKills) { ++ not_run; continue; }
                 ++ ran;
                 const Result r = run_case(plugin, table, sc, mode, seed);
                 if (r.wall_clock) ++ wall_kills;
@@ -504,7 +525,8 @@ int main(int argc, char** argv) {
     }
     if (wall_kills >= kMaxWallKills)
         std::printf("ABORT  %d cases hit the wall clock; the rest were not run\n", wall_kills);
-    std::printf("%d cases: %d passed, %d expected failures, %d failed\n", ran, passed, xfailed, failed);
+    std::printf("%d cases: %d passed, %d expected failures, %d failed, %d not run\n", ran + not_run, passed, xfailed,
+                failed, not_run);
     if (ran == 0) { std::printf("no case matched the filter\n"); return 1; }
-    return failed == 0 ? 0 : 1;
+    return failed == 0 and not_run == 0 ? 0 : 1;
 }

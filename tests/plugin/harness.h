@@ -22,8 +22,11 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
+
+#include <cerrno>
 
 #if defined(__SANITIZE_ADDRESS__)
 #define HARNESS_ASAN 1
@@ -116,7 +119,36 @@ inline void wait_flag(int i, const char* what) {
     }
 }
 // Stops and continues a whole peer process, its plugin threads included.
-inline void stop_peer(int r) { kill(g_shared->pid[r], SIGSTOP); }
+// stop_peer returns only once every thread of the peer is stopped: the signal alone is only queued.
+inline void stop_peer(int r) {
+    const pid_t pid = g_shared->pid[r];
+    if (kill(pid, SIGSTOP) != 0) fail("harness", "stop", "kill errno %d", errno);
+#if defined(__linux__)
+    const auto start = Clock::now();
+    for (;;) {
+        bool all = true;
+        const std::string dir = "/proc/" + std::to_string(pid) + "/task";
+        if (DIR* d = opendir(dir.c_str())) {
+            while (dirent* e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                char state = 0;
+                if (FILE* f = std::fopen((dir + "/" + e->d_name + "/stat").c_str(), "r")) {
+                    // The state follows the command name, which is in parentheses and may contain spaces.
+                    char buf[512] = {0};
+                    const size_t len = std::fread(buf, 1, sizeof(buf) - 1, f);
+                    std::fclose(f);
+                    if (const char* close = static_cast<const char*>(memrchr(buf, ')', len))) state = close[2];
+                }
+                if (state != 'T' and state != 't' and state != 0) all = false;
+            }
+            closedir(d);
+        }
+        if (all) return;
+        if (Clock::now() - start > std::chrono::seconds(1)) fail("harness", "stop", "%s", "peer not stopped after 1 s");
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+#endif
+}
 inline void continue_peer(int r) { kill(g_shared->pid[r], SIGCONT); }
 inline void set_flag(int i) { g_shared->flag[i].store(1, std::memory_order_release); }
 
@@ -146,7 +178,7 @@ inline unsigned char pattern(size_t i, int sender, int salt) {
     x ^= x >> 32;
     return static_cast<unsigned char>(x);
 }
-// Not instrumented either: a window filled here is read by the plugin's threads only after a barrier
+// Not instrumented: a window filled here is read by the plugin's threads only after a barrier
 // between processes, which ThreadSanitizer cannot see.
 __attribute__((no_sanitize("thread"))) inline void fill(unsigned char* d, size_t n, int sender, int salt) {
     for (size_t i = 0; i < n; ++ i) d[i] = pattern(i, sender, salt);
@@ -199,6 +231,8 @@ struct Rank {
     void* dataMh = nullptr;
     void* signalMh = nullptr;
     std::atomic<uint64_t> completions{0};   // requests that completed: the stall detector's observable
+    std::atomic<uint64_t> steps{0};         // proxy iterations run
+    std::atomic<int> step_delay_us{0};      // a pause after each iteration, to keep work in flight longer
 
     // Submits `op` through the proxy and returns its ticket, which stays valid until teardown.
     Ticket* issue(const Op& op) {
@@ -208,6 +242,11 @@ struct Rank {
         t->op = op;
         queue_[op.context][op.peer].push_back(t);
         return t;
+    }
+
+    const Ticket* last_ticket() {
+        std::lock_guard<std::mutex> g(mu_);
+        return tickets_.empty() ? nullptr : &tickets_.back();
     }
 
     // Registers a window of `size` bytes and deregisters it again, on the main thread while the proxy runs.
@@ -365,9 +404,11 @@ private:
             const long b = budget_.load();
             if (b == 0) { g.unlock(); std::this_thread::sleep_for(std::chrono::microseconds(20)); continue; }
             step();
+            steps.fetch_add(1);
             if (b > 0) budget_.store(b - 1);
             g.unlock();
-            std::this_thread::yield();
+            if (const int d = step_delay_us.load()) std::this_thread::sleep_for(std::chrono::microseconds(d));
+            else std::this_thread::yield();
         }
     }
 
