@@ -76,6 +76,7 @@ public:
     ncclResult_t closeListen(void* listenComm) { return SRDSIM_TABLE_CALL(closeListen(listenComm)); }
     ncclResult_t test(void* collComm, void* request, int* done) { return SRDSIM_TABLE_CALL(test(collComm, request, done)); }
     ncclResult_t progress(void* rmaCtx) { return SRDSIM_TABLE_CALL(rmaProgress(rmaCtx)); }
+    ncclResult_t queryLastError(void* rmaCtx, bool* hasError) { return SRDSIM_TABLE_CALL(queryLastError(rmaCtx, hasError)); }
     ncclResult_t finalize(void* ctx) { return SRDSIM_TABLE_CALL(finalize(ctx)); }
 
     ncclResult_t iput(void* rmaCtx, int context, uint64_t srcOff, void* srcMh, size_t size, uint64_t dstOff,
