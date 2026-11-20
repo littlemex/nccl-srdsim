@@ -20,7 +20,7 @@ def draw(L):
         ("Placement", L.t("window + offset, length bytes of payload", "window + offset に、length バイトを書く")),
         ("Signal", L.t("add value to the 8 bytes at window + offset", "window + offset の 8 バイトに value を足す")),
         ("GetRequest", L.t("read value bytes (length is 0); reply to requester at dest_window", "value バイトを読み (length は 0)、requester の dest_window に返す")),
-        ("GetResponse", L.t("a placement, counted for the requester's RMA context in op_id", "配置として書き、op_id が指す要求側の RMA コンテキストの分として数える")),
+        ("GetResponse", L.t("a placement, counted for the requester's get whose id is op_id", "配置として書き、op_id の番号を持つ要求側の get の分として数える")),
         ("Shutdown", L.t("the sender is closing the stream", "送り手が接続を閉じる")),
     ]
     yy = 180
