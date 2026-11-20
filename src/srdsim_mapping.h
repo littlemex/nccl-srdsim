@@ -6,15 +6,16 @@
 // Both are easy to get wrong in ways a small run does not reach:
 //
 //   * a signal's eight bytes carved out of the end of the pool lie inside the last staging slot, so a
-//     thread holding that slot and the signal path write the same bytes. Few threads never reach the last
-//     slot;
+//     thread holding that slot and the signal path write the same bytes. A run with only a few threads
+//     never reaches the last slot;
 //   * a mapping created with the window's length, while accesses are offset by the distance from the
 //     pinned page to the window, runs off its end by exactly that distance. A window that begins on a
 //     page has a distance of zero.
 //
 // Neither needs a GPU to be wrong or to be checked, but the code that uses them only compiles with
-// `gdrapi.h` and only runs where `/dev/gdrdrv` exists. Pulled out here it is ordinary integer arithmetic over `uintptr_t`, so the
-// suite can enumerate the cases that matter -- offset windows, page boundaries, the last slot, and values
+// `gdrapi.h` and only runs where `/dev/gdrdrv` exists. Pulled out here it is ordinary integer arithmetic
+// over `uintptr_t`, so the suite can enumerate the cases that matter -- offset windows, page boundaries, the
+// last slot, and values
 // chosen to overflow if the arithmetic is written the obvious way.
 //
 // The rule these follow, and the reason they are written the way they are: no expression here adds two

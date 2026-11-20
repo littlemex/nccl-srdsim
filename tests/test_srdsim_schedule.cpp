@@ -574,7 +574,7 @@ void test_the_id_contract() {
         expect(not s.submit(make_op(7, f, 2048, 2048, 1), &why),
                "S10 a second operation with the same id is refused while the first is pending");
     }
-    // And `defer-one` terminates and drains even when the caller submits zero or repeated ids.
+    // And `defer-one` terminates and drains.
     {
         auto s = scheduler(srdsim::Mode::DeferOne);
         std::string why;

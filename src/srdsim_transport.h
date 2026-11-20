@@ -4,8 +4,8 @@
 //
 // WHY THE RECEIVER WRITES, NOT THE SENDER
 // The obvious design has the sender map the peer's window and copy into it. That needs two things the
-// hardware may not give: GPU-to-GPU peer access, which many instances do not have, and a cuMem allocation
-// exported across the process boundary. Across hosts the first is impossible in principle.
+// hardware may not give: GPU-to-GPU peer access, which is not always available, and a cuMem allocation
+// exported across the process boundary (which works). Across hosts the first is impossible in principle.
 //
 // So the roles are inverted: the sender ships a descriptor and the bytes over a stream, and the
 // **receiving** side's agent writes into its own window. That needs neither peer access nor an
@@ -63,7 +63,7 @@ namespace srdsim {
 // consistent with a thread that died, a thread blocked inside this code, and a report that is itself
 // stale -- three different bugs with three different owners. "no progress call for 104312 ms" is
 // consistent with only the first two, and pairing it with a mark taken on entry to each call
-// separates those: a frozen counter is a statement about the caller, not a scheduler defect.
+// separates those.
 inline uint64_t mono_ms() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -669,8 +669,8 @@ private:
             // The length decides how much of the stream belongs to this frame, so it has to be
             // checked before it is used for anything at all -- including for deciding how much to
             // drain. A length no window could hold cannot be trusted to drain either, so the only
-            // safe action is to stop reading this stream. A desynchronised stream produces exactly
-            // such a length.
+            // safe action is to stop reading this stream. A desynchronised stream can produce such a
+            // length.
             // The bound is the largest frame this side can *emit*, not the largest window that exists.
             // Those can differ by orders of magnitude: a window may be gigabytes, so a garbage length of
             // hundreds of megabytes would pass a window bound, and the agent would allocate it and wait
@@ -816,6 +816,7 @@ private:
                 // A signal frame has no payload, so a non-zero length means the stream is no longer
                 // framed and the next header would be read out of somebody's data. There is no
                 // resynchronising from that, so the link is closed and the refusal counted.
+                // `tests/model_srdsim_framing.cpp` does not enumerate this case.
                 if (h.length != 0) {
                     char m[200];
                     std::snprintf(m, sizeof(m),
@@ -1211,8 +1212,9 @@ private:
             // Refused rather than queued once the peer is this far behind, and this is a bound the design
             // needs rather than a tidiness. The outbox exists because the socket may refuse bytes and the
             // caller must not block; with no limit, a peer that stops reading turns that into unbounded
-            // memory: the adversarial suite sends 4 MB frames as fast as it can into a link with a 4 kB
-            // send buffer. The bound makes the memory a property of the transport, not of the machine.
+            // memory, and the process dies of `std::bad_alloc` (the adversarial suite provokes this with
+            // 4 MB frames into a 4 kB send buffer). With the bound, the outcome does not depend on how soon
+            // the platform breaks the link.
             //
             // Refusing is the correct answer rather than dropping. A reliable transport may not lose a
             // frame it accepted, so the release is declined and the scheduler still holds the unit: the
