@@ -23,7 +23,15 @@ while read -r s; do
         echo "missing export: $s"; fail=1
     fi
 done <<<"$expected"
+# shellcheck disable=SC1091
+. "$ROOT/versions.env"
 for s in $exported; do
-    grep -qx -e "$s" -e "!$s" <<<"$expected" || { echo "exported but not a table this release defines: $s"; fail=1; }
+    grep -qx -e "$s" -e "!$s" <<<"$expected" && continue
+    if [ "${s#ncclRmaPlugin_v}" -lt "$RMA_TABLE_MIN" ]; then
+        echo "exported below RMA_TABLE_MIN=$RMA_TABLE_MIN: $s"
+    else
+        echo "exported but not a table this release defines: $s"
+    fi
+    fail=1
 done
 exit "$fail"

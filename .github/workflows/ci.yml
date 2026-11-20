@@ -244,9 +244,10 @@ jobs:
       - name: The export check fails without a release to check against
         run: |
           mkdir -p "$RUNNER_TEMP/empty"
-          if ./ci/check_exports.sh build/libnccl-rma-srdsim.so "$RUNNER_TEMP/empty"; then
+          if ./ci/check_exports.sh build/libnccl-rma-srdsim.so "$RUNNER_TEMP/empty" 2> "$RUNNER_TEMP/err"; then
             echo "check_exports.sh passed with no NCCL source"; exit 1
           fi
+          grep -q 'no rma_vN.h' "$RUNNER_TEMP/err" || { echo "check_exports.sh failed for another reason:"; cat "$RUNNER_TEMP/err"; exit 1; }
 
   # The GPU test compiles against NCCL's device API headers. It runs on a GPU host (tests/gpu/run.sh).
   gpu-test-compile:

@@ -48,7 +48,7 @@ The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specifica
 
 NCCL tries `ncclRmaPlugin_vN` from the newest version it knows downwards and uses the first the plugin exports, so one build serves several NCCL releases. Built against the newest supported headers, the plugin exports `ncclRmaPlugin_v14`, `ncclRmaPlugin_v15` and `ncclRmaPlugin_v16`:
 
-| NCCL release | Table it looks up first and finds in this plugin |
+| NCCL release | First table it tries that this plugin exports |
 |---|---|
 | 2.31.2 | v15 |
 | 2.32.3 | v16 |

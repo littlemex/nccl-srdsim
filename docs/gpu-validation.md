@@ -111,7 +111,7 @@ The test program's exit status, which the verdict is built from:
 
 ## Run
 
-`tests/gpu/recipe.sh` takes every version from `versions.env`. It installs the pinned NCCL wheel (2.32.6), fetches the pinned NCCL source for the plugin's build headers and checks its commit, builds the plugin, compiles the test against the wheel's NCCL, and runs every mode with 3 ranks and 5 seeds; any failing step stops it. The run takes about 75 seconds after the build.
+`tests/gpu/recipe.sh` takes every version from `versions.env`. It installs the pinned NCCL wheel, fetches the pinned NCCL source for the plugin's build headers and checks its commit, builds the plugin, compiles the test against the wheel's NCCL, and runs every mode with 3 ranks and 5 seeds; any failing step stops it. The run takes about 75 seconds after the build.
 
 ```bash
 export PATH=/usr/local/cuda/bin:$PATH
@@ -130,7 +130,7 @@ All seven modes produced their required outcome in each of four runs of `run.sh`
 
 ![For each of the seven modes, the exit status of each of the five seeds, the same in every run: 0 in every seed of the six modes that keep I1, which means no mismatched element, and 1 in every seed of violate-i1, which means mismatched elements were found; every mode met its required outcome. Below, the range of mismatched elements rank 0 found per seed under violate-i1: from 3,157,632 (24%) to 11,900,672 (91%) of the 13,107,200 elements it checks per seed.](images/gpu-result.svg)
 
-The runs measured the plugin and the test at commit `ff11cc9`; since then only comments in `src/` and the host tests have changed, and `tests/gpu/` not at all. They ran on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The commands under Run were executed four times: once exactly as written above, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run used three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and took about 75 seconds.
+The runs measured the plugin and the test at commit `ff11cc9`; since then only comments in `src/` and the host tests have changed, and `tests/gpu/` not at all. They ran on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The earlier form of the commands, which wrote out each step that `tests/gpu/recipe.sh` now runs, was executed four times: once as then written, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run used three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and took about 75 seconds.
 
 | Mode | Exit status per seed, in every run | Mismatched elements reported by rank 0 |
 |---|---|---|
