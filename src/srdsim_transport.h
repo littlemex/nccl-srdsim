@@ -1009,6 +1009,13 @@ public:
         return drain_locked(peer);
     }
 
+    // Whether nothing is waiting in the outbox for `peer`: everything appended has reached the socket.
+    bool outbox_empty(int peer) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (static_cast<size_t>(peer) >= outboxes_.size()) return true;
+        return outboxes_[static_cast<size_t>(peer)].size() == 0;
+    }
+
     bool flush_all() {
         size_t n;
         {
