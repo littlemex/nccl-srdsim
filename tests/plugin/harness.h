@@ -244,6 +244,12 @@ struct Rank {
         return t;
     }
 
+    bool last_error() {
+        bool has = false;
+        check(rma.queryLastError(rmaCtx, &has), "queryLastError");
+        return has;
+    }
+
     const Ticket* last_ticket() {
         std::lock_guard<std::mutex> g(mu_);
         return tickets_.empty() ? nullptr : &tickets_.back();
