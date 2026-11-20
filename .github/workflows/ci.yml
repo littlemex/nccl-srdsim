@@ -33,7 +33,7 @@ jobs:
       # entropy; the value before the change is logged so the step's effect is visible.
       - name: Lower ASLR entropy for the sanitizers
         run: |
-          sysctl vm.mmap_rnd_bits
+          sudo sysctl vm.mmap_rnd_bits
           sudo sysctl -w vm.mmap_rnd_bits=28
       - name: Build
         run: |
