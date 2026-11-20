@@ -102,3 +102,5 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to repo
 ## License
 
 This project is licensed under the Apache-2.0 License. See [LICENSE](LICENSE).
+
+Built with NCCL 2.30.1 (v2.30.1-1) and pip install nvidia-nccl-cu13==2.31.2.
