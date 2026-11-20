@@ -493,7 +493,9 @@ void out_of_range_context(Rank& R) {
     constexpr size_t n = (16 << 10) + 13, src = 4099, dst = (512 << 10) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 21);
-        R.wait_retired(R.issue(put(kContexts, 1, src, n, dst)), "put-bad-context");
+        Op bad = put(0, 1, src, n, dst);
+        bad.plugin_context = kContexts;
+        R.wait_retired(R.issue(bad), "put-bad-context");
         if (not R.last_error()) fail("assert", "context-reported", "%s", "queryLastError reports nothing");
         R.wait_retired(R.issue(signal_only(0, 1, 9, true)), "signal");
     } else {
