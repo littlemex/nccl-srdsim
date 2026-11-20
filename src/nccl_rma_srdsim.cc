@@ -343,35 +343,46 @@ struct RmaCtx;   // declared below; CollComm keeps the contexts created on it so
 
 // Sends the replies to gets this rank serves, on a thread of its own, so a reply never waits for this rank's
 // NCCL progress thread and never blocks the receive thread that read its request. The bytes are copied when
-// the request is read, under the transport's lease on the window; the thread then sends them in frames of
-// `chunk_bytes` as the link takes them, retrying what the outbox refuses, and keeps pushing the outbox until
-// the reply has reached the socket. Replies go out in the order their requests arrived.
+// the request is read, under the transport's lease on the window. The thread sends each reply in frames of
+// `chunk_bytes` as the link takes them, retrying what the outbox refuses, and keeps pushing a peer's outbox
+// until it is empty. Replies to one peer go out in the order their requests arrived; peers are served in turn,
+// so a requester that stops reading holds up only its own replies.
 class GetResponder {
 public:
     explicit GetResponder(srdsim::SendLinks* links) : links_(links) {}
     ~GetResponder() { stop(); }
 
-    void enqueue(int peer, uint32_t dest_window, uint64_t dest_off, uint64_t token, std::vector<char> bytes,
+    // False once teardown has begun: the reply is not sent.
+    bool enqueue(int peer, uint32_t dest_window, uint64_t dest_off, uint64_t token, std::vector<char> bytes,
                  size_t chunk) {
         std::lock_guard<std::mutex> g(mu_);
-        replies_.push_back({peer, dest_window, dest_off, token, std::move(bytes), chunk, 0});
+        if (stopping_) return false;
+        queues_[peer].push_back({dest_window, dest_off, token, std::move(bytes), chunk, 0});
         if (not thread_.joinable()) thread_ = std::thread([this] { loop(); });
         cv_.notify_one();
+        return true;
     }
+
+    // Sends what it can for up to kDrainMs, then gives up on the rest and reports it.
     void stop() {
         {
             std::lock_guard<std::mutex> g(mu_);
+            if (stopping_) return;
             stopping_ = true;
+            deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDrainMs);
             cv_.notify_one();
         }
         if (thread_.joinable()) thread_.join();
-        if (not replies_.empty()) logf("%zu get reply(ies) not sent at teardown", replies_.size());
-        replies_.clear();
+        std::lock_guard<std::mutex> g(mu_);
+        size_t left = 0;
+        for (const auto& q : queues_) left += q.second.size();
+        if (left != 0) logf("%zu get reply(ies) not sent at teardown", left);
+        queues_.clear();
     }
 
 private:
+    static constexpr int kDrainMs = 1000;
     struct Reply {
-        int peer;
         uint32_t dest_window;
         uint64_t dest_off;
         uint64_t token;
@@ -380,33 +391,54 @@ private:
         size_t sent;      // bytes appended to the link so far
     };
 
+    bool past_deadline() const { return stopping_ and std::chrono::steady_clock::now() >= deadline_; }
+
     void loop() {
         std::unique_lock<std::mutex> g(mu_);
-        while (not stopping_) {
-            if (replies_.empty()) { cv_.wait(g); continue; }
-            Reply& r = replies_.front();
-            g.unlock();
-            bool refused = false;
-            while (r.sent < r.bytes.size()) {
-                const size_t n = std::min(r.chunk, r.bytes.size() - r.sent);
-                if (not links_->send_placement(r.peer, r.dest_window, r.dest_off + r.sent, r.bytes.data() + r.sent, n,
-                                               r.token, srdsim::WireKind::GetResponse)) { refused = true; break; }
-                r.sent += n;
+        for (;;) {
+            bool any = not flushing_.empty();
+            for (const auto& q : queues_) any = any or not q.second.empty();
+            if (not any and stopping_) break;
+            if (not any) { cv_.wait(g); continue; }
+            if (past_deadline()) break;
+            bool moved = false;
+            for (auto& q : queues_) {
+                if (q.second.empty()) continue;
+                const int peer = q.first;
+                Reply& r = q.second.front();   // only this thread pops, and a deque keeps references on push
+                g.unlock();
+                while (r.sent < r.bytes.size()) {
+                    const size_t n = std::min(r.chunk, r.bytes.size() - r.sent);
+                    if (not links_->send_placement(peer, r.dest_window, r.dest_off + r.sent, r.bytes.data() + r.sent,
+                                                   n, r.token, srdsim::WireKind::GetResponse)) break;
+                    r.sent += n;
+                    moved = true;
+                }
+                const bool appended = r.sent == r.bytes.size();
+                g.lock();
+                if (appended) { q.second.pop_front(); flushing_.insert(peer); }
             }
-            links_->flush(r.peer);
-            const bool done = not refused and links_->outbox_empty(r.peer);
-            g.lock();
-            if (done) replies_.pop_front();
-            else cv_.wait_for(g, std::chrono::microseconds(200));   // the socket or the outbox is full: retry
+            // A reply fully appended may still sit in the outbox; push it until the socket has taken it.
+            for (auto it = flushing_.begin(); it != flushing_.end();) {
+                const int peer = *it;
+                g.unlock();
+                links_->flush(peer);
+                const bool empty = links_->outbox_empty(peer);
+                g.lock();
+                it = empty ? flushing_.erase(it) : std::next(it);
+            }
+            if (not moved) cv_.wait_for(g, std::chrono::microseconds(200));   // the links are full: retry
         }
     }
 
     srdsim::SendLinks* links_;
     std::mutex mu_;
     std::condition_variable cv_;
-    std::deque<Reply> replies_;
+    std::map<int, std::deque<Reply>> queues_;   // by requesting rank
+    std::set<int> flushing_;                    // peers whose outbox still holds a reply
     std::thread thread_;
     bool stopping_ = false;
+    std::chrono::steady_clock::time_point deadline_{};
 };
 
 struct CollComm {
@@ -414,8 +446,9 @@ struct CollComm {
     int rank = 0;
     srdsim::WindowTable windows;                       // this rank's own windows, by id
     srdsim::SendLinks links;                           // one stream per peer
-    std::unique_ptr<srdsim::ReceiveAgent> agent;       // applies what peers send us
+    // Before `agent`, so that on destruction the receive threads, which hand it replies, stop first.
     GetResponder responder{&links};                    // sends the replies to gets this rank serves
+    std::unique_ptr<srdsim::ReceiveAgent> agent;       // applies what peers send us
     // How many peers actually connected to this rank's agent. A mesh that came up half-formed is
     // indistinguishable from a peer that never sent anything unless this is counted.
     int accepted_connections = 0;
@@ -3348,9 +3381,17 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
                                uint64_t owner_token, void* user) {
     auto* cc = static_cast<CollComm*>(user);
     if (cc == nullptr) return false;
-    std::vector<char> bytes(length);
+    if (requester_rank >= static_cast<uint32_t>(cc->nranks)) {
+        logf("get %llu: the request names rank %u, outside the communicator's %d; dropping",
+             static_cast<unsigned long long>(owner_token), requester_rank, cc->nranks);
+        return false;
+    }
+    // Frames no larger than the requester accepts (the transport's default frame limit), and never empty.
+    const size_t chunk = std::min<size_t>(std::max<size_t>(scheduler_options().chunk_bytes, 1), size_t{1} << 22);
+    std::vector<char> bytes;
 #ifdef SRDSIM_WITH_CUDA
     if (src_is_device) {
+        bytes.resize(length);
         if (length != 0 and not read_device(bytes.data(), src, length)) {
             logf("get %llu: could not read %zu byte(s) of the device window for the reply; it is lost",
                  static_cast<unsigned long long>(owner_token), length);
@@ -3360,9 +3401,12 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
 #else
     (void)src_is_device;
 #endif
-    if (length != 0) std::memcpy(bytes.data(), src, length);
-    cc->responder.enqueue(static_cast<int>(requester_rank), dest_window, dest_off, owner_token, std::move(bytes),
-                          scheduler_options().chunk_bytes);
+    bytes.assign(static_cast<const char*>(src), static_cast<const char*>(src) + length);
+    if (not cc->responder.enqueue(static_cast<int>(requester_rank), dest_window, dest_off, owner_token,
+                                  std::move(bytes), chunk)) {
+        logf("get %llu: the communicator is closing; the reply is not sent", static_cast<unsigned long long>(owner_token));
+        return false;
+    }
     return true;
 }
 
