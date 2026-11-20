@@ -215,6 +215,7 @@ struct Op {
     uint64_t value = 1;
     bool strong = false;
     bool refused = false;              // the case expects the plugin to refuse it; it may name memory outside the window
+    bool keep_source = false;          // the source is shared with later operations, so it is not overwritten on retirement
 };
 
 // What the rank's main thread sees of one operation: `done` when `test` reported it, `retired` when it
@@ -504,7 +505,7 @@ private:
             if (f.t->done.load(std::memory_order_relaxed) != 0 and f.index == frontier_[c][peer]) {
                 ++ frontier_[c][peer];
                 const Op& o = f.t->op;
-                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0 and not o.refused) {
+                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0 and not o.refused and not o.keep_source) {
                     if (o.srcOff > data.size() or o.size > data.size() - o.srcOff)
                         fail("harness", "source-outside-window", "offset %llu size %zu",
                              static_cast<unsigned long long>(o.srcOff), o.size);
