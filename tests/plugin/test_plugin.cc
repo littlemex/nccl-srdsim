@@ -360,7 +360,6 @@ const Expected kExpected[] = {
     {"get_completes_with_data", "*", 0, "assert:data-at-early-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
     {"get_multichunk_flush", "*", 0, "stall:flush", "#26: pending_gets is decremented once per chunk of a get"},
-    {"dry_run", "*", 0, "stall:put-second", "#26: every dry-run request is numbered 0, which never completes"},
 };
 
 const Expected* expected_for(const Scenario& sc, const char* mode, int table) {
