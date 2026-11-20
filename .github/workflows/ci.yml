@@ -319,6 +319,7 @@ jobs:
           sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-driver-dev-$CUDA_PKG" \
             "cuda-nvrtc-dev-$CUDA_PKG" "$CI_DRIVER_LIB_PKG"
           ls -l /usr/lib/x86_64-linux-gnu/libcuda.so.1
+          dpkg-query -W "$CI_DRIVER_LIB_PKG"
       - name: Build and run
         env:
           NCCL_TAG: ${{ needs.versions.outputs.nccl_default_tag }}

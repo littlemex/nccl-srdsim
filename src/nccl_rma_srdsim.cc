@@ -1191,9 +1191,8 @@ public:
     DeliveryContext(const DeliveryContext&) = delete;
     DeliveryContext& operator=(const DeliveryContext&) = delete;
     bool ok() const { return ok_; }
-    // Whether a delivery context exists at all. It is created when the first device window is registered;
-    // without it nothing has been put on the delivery stream, so "not ok" means there is nothing to wait for
-    // rather than a failure.
+    // Whether a delivery context exists. Without one there is no delivery stream, so "not ok" then means
+    // there is nothing to wait for rather than a failure.
     bool exists() const { return d_.ctx != nullptr; }
     CUstream stream() const { return d_.stream; }
 
@@ -3061,12 +3060,13 @@ ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
                     drained = false;
                 }
             } else if (in_delivery_context.exists()) {
-                // The context exists but this thread cannot enter it (the process is exiting, or the push
-                // failed, already logged): the copies cannot be confirmed. That is not a fault of the stream,
-                // so delivery is not stopped for it.
+                // The context exists but this thread cannot enter it: the copies cannot be confirmed. That is not
+                // a fault of the stream, so delivery is not stopped for it.
+                logf("window %u: cannot enter the delivery context to wait for its copies (%s)", mr->window_id,
+                     g_exiting.load() ? "the process is exiting" : "cuCtxPushCurrent failed, logged above");
                 drained = false;
             }
-            // Without a context no device window was ever registered and nothing is on the stream.
+            // Without a context there is no delivery stream, so nothing to wait for.
             if (not drained)
                 logf("window %u was deregistered with copies or sends that could not be confirmed", mr->window_id);
         }

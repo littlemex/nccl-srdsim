@@ -383,10 +383,12 @@ struct Rank {
 
     // The case passed on this rank. Under AddressSanitizer, what teardown left allocated is a finding.
     [[noreturn]] void pass() {
+        std::string poison;
         {
             std::lock_guard<std::mutex> g(g_log_mu);
-            if (not g_poison_line.empty()) fail("assert", "delivery-poisoned", "%s", g_poison_line.c_str());
+            poison = g_poison_line;
         }
+        if (not poison.empty()) fail("assert", "delivery-poisoned", "%s", poison.c_str());
 #if defined(HARNESS_ASAN)
         if (__lsan_do_recoverable_leak_check() != 0) fail("leak", "teardown", "%s", "see the report above");
 #endif
