@@ -34,7 +34,6 @@ public:
         const std::string sym = "ncclRmaPlugin_v" + std::to_string(version);
         void* t = dlsym(lib_, sym.c_str());
         if (t == nullptr) { *why = "no symbol " + sym; return false; }
-        version_ = version;
         switch (version) {
             case 14: v14_ = static_cast<ncclRma_v14_t*>(t); break;
             case 15: v15_ = static_cast<ncclRma_v15_t*>(t); break;
@@ -46,7 +45,6 @@ public:
         return true;
     }
 
-    int version() const { return version_; }
     bool hasRmaProperties() const { return HAS_V16(); }
 
     // Every call below goes to the same field of whichever table was loaded.
@@ -109,7 +107,6 @@ public:
 
 private:
     void* lib_ = nullptr;
-    int version_ = 0;
     ncclRma_v14_t* v14_ = nullptr;
     ncclRma_v15_t* v15_ = nullptr;
 #if defined(RMA_V16_H_)

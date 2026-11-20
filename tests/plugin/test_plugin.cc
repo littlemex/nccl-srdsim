@@ -71,54 +71,47 @@ Op flush(int context, int peer) { Op o; o.kind = Op::Flush; o.context = context;
 // Offsets and sizes are not multiples of the chunk size, and source and destination offsets differ, so
 // an ignored offset, a swapped pair or a dropped tail shows.
 
-// A put of several chunks, then a strong signal of size 0 on the same context and in the same proxy
-// iteration: when the signal word reaches its value, every byte of the earlier put has landed.
-// weak_signal_control is its negative control.
-void put_then_strong_signal(Rank& R) {
-    constexpr size_t n = (24 << 10) + 13, src = 4099, dst = (512 << 10) + 37;
+// A put of many chunks, then a signal of size 0 on the same context, submitted in the same proxy
+// iteration. The sender runs that one iteration (which releases at most a few chunks), then waits up to
+// kHoldMs for the target to say it has looked before running freely.
+//
+// strong: the signal is ordered behind every byte of the put, so it cannot arrive during the hold and the
+// target sees the whole put when it does. weak, under reverse-ops (newest operation first): the signal
+// overtakes the put and arrives during the hold, so the target must see most of the put missing. The two
+// differ only in the flag; the weak case fails if the check cannot see what the flag guards.
+constexpr int kHoldMs = 300;
+void put_then_signal(Rank& R, bool strong, int salt) {
+    constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
-        fill(R.at(src), n, 0, 1);
+        fill(R.at(src), n, 0, salt);
         R.pause();
         const Ticket* p = R.issue(put(0, 1, src, n, dst));
-        const Ticket* s = R.issue(signal_only(0, 1, 0, /*strong=*/true));
+        const Ticket* s = R.issue(signal_only(0, 1, 0, strong));
+        R.run_steps(1);
+        set_where("hold");
+        const auto start = Clock::now();
+        while (g_shared->flag[0].load(std::memory_order_acquire) == 0 and
+               Clock::now() - start < std::chrono::milliseconds(kHoldMs))
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         R.resume();
         R.wait_retired(p, "put");
         R.wait_retired(s, "signal");
-        set_flag(0);
+        set_flag(1);
     } else {
         R.wait_until([&] { return R.signal_word(0) >= 1; }, "signal-word");
-        if (size_t bad = mismatches(R.at(dst), n, 0, 1)) fail("assert", "strong-orders-earlier-put", "%zu bytes", bad);
-        wait_flag(0, "sender-done");
+        const size_t bad = mismatches(R.at(dst), n, 0, salt);
+        set_flag(0);
+        if (strong and bad != 0) fail("assert", "strong-orders-earlier-put", "%zu bytes missing", bad);
+        if (not strong and bad == 0) fail("assert", "control-missed", "%s", "the weak signal arrived after its put");
+        R.wait_until([&] { return mismatches(R.at(dst), n, 0, salt) == 0; }, "put-complete",
+                     [&] { return uint64_t(n - mismatches(R.at(dst), n, 0, salt)); });
+        wait_flag(1, "sender-done");
         expect_guards(R, dst, n);
         expect_signals(R, {{0, 1}});
     }
 }
-
-// The same pair with a weak signal, under reverse-ops, which releases the newest operation first: the
-// signal overtakes the put, so the target must see the word while most of the put is missing. If it
-// does not, put_then_strong_signal's pass says nothing about the strong flag.
-void weak_signal_control(Rank& R) {
-    constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
-    if (g_rank == 0) {
-        fill(R.at(src), n, 0, 2);
-        R.pause();
-        const Ticket* p = R.issue(put(0, 1, src, n, dst));
-        R.issue(signal_only(0, 1, 3, /*strong=*/false));
-        R.run_steps(1);
-        wait_flag(0, "target-looked");
-        R.resume();
-        R.wait_retired(p, "put");
-    } else {
-        R.wait_until([&] { return R.signal_word(3) >= 1; }, "signal-word");
-        const size_t bad = mismatches(R.at(dst), n, 0, 2);
-        set_flag(0);
-        if (bad == 0) fail("assert", "control-missed", "%s", "the weak signal arrived after its put");
-        R.wait_until([&] { return mismatches(R.at(dst), n, 0, 2) == 0; }, "put-complete",
-                     [&] { return uint64_t(n - mismatches(R.at(dst), n, 0, 2)); });
-        expect_guards(R, dst, n);
-        expect_signals(R, {{3, 1}});
-    }
-}
+void put_then_strong_signal(Rank& R) { put_then_signal(R, true, 1); }
+void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 
 // I1 over many rounds, alternating contexts: when a weak signal's word reaches its value, the put it was
 // bundled with has landed. The source is overwritten as soon as the put retires, so a plugin that still
@@ -164,6 +157,7 @@ void violate_control(Rank& R) {
         if (bad == 0) fail("assert", "control-missed", "%s", "the signal arrived with its whole put");
         R.wait_until([&] { return mismatches(R.at(dst), n, 0, 3) == 0; }, "put-complete",
                      [&] { return uint64_t(n - mismatches(R.at(dst), n, 0, 3)); });
+        expect_guards(R, dst, n);
         expect_signals(R, {{2, 1}});
     }
 }
@@ -267,7 +261,7 @@ const std::vector<const char*> kKeepI1 = {"srd", "inorder", "peer-seq", "reverse
 const std::vector<Scenario>& scenarios() {
     static const std::vector<Scenario> s = {
         {"put_then_strong_signal", put_then_strong_signal, 2, kKeepI1, {1, 2, 3}, nullptr},
-        {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1}, nullptr},
+        {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, nullptr},
         {"i1_holds", i1_holds, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"violate_control", violate_control, 2, {"violate-i1"}, {1, 2, 3}, nullptr},
         {"get_completes_with_data", get_completes_with_data, 2, {"srd"}, {1}, nullptr},

@@ -202,9 +202,10 @@ struct Rank {
 
     // The proxy thread runs freely after setup. pause() returns once no iteration is in flight;
     // run_steps(n) runs exactly n iterations and then pauses again.
-    void pause() { std::lock_guard<std::mutex> g(step_mu_); budget_.store(0); }
+    void pause() { set_where("pause"); std::lock_guard<std::mutex> g(step_mu_); budget_.store(0); }
     void resume() { std::lock_guard<std::mutex> g(step_mu_); budget_.store(-1); }
     void run_steps(long n) {
+        set_where("run_steps");
         { std::lock_guard<std::mutex> g(step_mu_); budget_.store(n); }
         while (budget_.load() != 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
@@ -382,7 +383,8 @@ private:
                 check(rma.iflush(rmaCtx, c, signalMh, uint32_t(o.peer), &req), "iflush");
                 break;
         }
-        // NCCL treats a NULL request as done for a flush only (gin_host_proxy.cc, proxyGinProcessGfd).
+        // NCCL treats a NULL request as done for a flush only (gin_host_proxy.cc, proxyGinProcessGfd). For any
+        // other call NCCL would pass the NULL to test(); the harness fails it outright, which is stricter.
         if (req == nullptr and o.kind != Op::Flush) fail("error", "null-request", "kind %d", int(o.kind));
         if (req == nullptr) t->done.store(1, std::memory_order_release);
         inflight_[c].push_back({t, req, issued_[c][o.peer] ++});
