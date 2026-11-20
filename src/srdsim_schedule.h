@@ -299,7 +299,9 @@ public:
     // unit it could not send after the scheduler had already counted it as released.
     struct Room {
         virtual ~Room() = default;
-        virtual bool fits(int peer) const = 0;          // room for one more unit of up to chunk_bytes
+        // Room for one more unit of up to `bytes` of payload to `peer`. Within one `progress` call the answer for
+        // a peer may go from yes to no but not back, so the schedule does not depend on when a socket drains.
+        virtual bool fits(int peer, size_t bytes) = 0;
         virtual void take(int peer, size_t bytes) = 0;  // a unit of `bytes` was released to this peer
     };
 
@@ -508,18 +510,22 @@ private:
             }
         }
 
-        // `signal-last` may release no signal while any placement anywhere is still unreleased.
+        // `signal-last` may release no signal while any placement anywhere is still unreleased. Placements held for
+        // room on another peer's link do not count, or one full link would hold every other peer's signals.
         bool any_placement_left = false;
         if (opt_.mode == Mode::SignalLast)
             for (const Pending& p : pending_)
-                if (p.remaining != 0) { any_placement_left = true; break; }
+                if (p.remaining != 0 and has_room(p)) { any_placement_left = true; break; }
+        bool skipped_for_room = false;
 
         for (size_t i = 0; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
             if (opt_.mode == Mode::PeerSeq and oldest_for_peer[p.op.peer] != i)
                 continue;                // this peer has older work outstanding
-            if (room_ and not room_->fits(p.op.peer))
+            if (not has_room(p)) {
+                skipped_for_room = true;
                 continue;                // the link to this peer is full: nothing for it is released now
+            }
             if (opt_.mode == Mode::DeferOne and have_deferred_ and p.op.id == deferred_id_ and
                 pending_.size() > 1)
                 continue;                // held until it is the only one left
@@ -536,12 +542,14 @@ private:
             // The deferred operation is the only thing left: stop deferring it and look once more, in a
             // loop rather than by recursion, so the scheduler never reports itself idle with work
             // outstanding and no sequence of ids can make it re-choose the same operation without bound.
-            if (opt_.mode == Mode::DeferOne and have_deferred_) {
+            // Not while something else is only waiting for room: the deferred operation is then not the only one
+            // left, and releasing it would change which operation the mode holds.
+            if (opt_.mode == Mode::DeferOne and have_deferred_ and not skipped_for_room) {
                 have_deferred_ = false;
                 deferred_id_ = 0;
                 for (size_t i = 0; i < pending_.size(); ++ i) {
                     const Pending& p = pending_[i];
-                    if (room_ and not room_->fits(p.op.peer)) continue;
+                    if (not has_room(p)) continue;
                     for (int c = 0; c < p.chunk_count; ++ c)
                         if (not p.placed[static_cast<size_t>(c)])
                             return {static_cast<int>(i), c};
@@ -595,6 +603,12 @@ private:
     Options opt_;
     Rng rng_;
     Room* room_ = nullptr;   // set for the duration of one `progress` call
+
+    bool has_room(const Pending& p) {
+        if (room_ == nullptr) return true;
+        const size_t unit = p.op.is_get_request or p.op.bytes == 0 ? 0 : std::min(opt_.chunk_bytes, p.op.bytes);
+        return room_->fits(p.op.peer, unit);
+    }
     std::vector<Pending> pending_;
     uint64_t units_released_ = 0;
     uint64_t largest_issued_id_ = 0;

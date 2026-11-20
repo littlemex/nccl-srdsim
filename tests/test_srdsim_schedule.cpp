@@ -635,7 +635,7 @@ void test_room_holds_a_full_peer() {
     struct Blocked final : srdsim::Scheduler::Room {
         bool open = false;
         size_t taken0 = 0;
-        bool fits(int peer) const override { return peer != 1 or open; }
+        bool fits(int peer, size_t) override { return peer != 1 or open; }
         void take(int peer, size_t bytes) override { if (peer == 0) taken0 += bytes; }
     };
     for (srdsim::Mode m : {srdsim::Mode::Srd, srdsim::Mode::InOrder, srdsim::Mode::PeerSeq, srdsim::Mode::ReverseOps,

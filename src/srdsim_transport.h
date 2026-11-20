@@ -986,14 +986,14 @@ public:
     // since the two are identical on the wire apart from that one byte -- same window/offset/length
     // addressing, same framing.
     bool send_placement(int peer, uint32_t window_id, uint64_t offset, const void* src,
-                        uint64_t length, uint64_t op_id, WireKind kind = WireKind::Placement) {
+                        uint64_t length, uint64_t op_id, WireKind kind = WireKind::Placement, bool reserved = false) {
         WireHeader h{};
         h.kind = static_cast<uint32_t>(kind);
         h.window_id = window_id;
         h.offset = offset;
         h.length = length;
         h.op_id = op_id;
-        return send_framed(peer, h, src, length);
+        return send_framed(peer, h, src, length, reserved);
     }
 
     // Pushes whatever is queued for a peer, as far as the socket will take it, and returns. Called from
@@ -1009,13 +1009,27 @@ public:
         return drain_locked(peer);
     }
 
-    // Bytes waiting in the outbox for `peer`, and the most the outbox holds before it refuses a frame.
-    size_t queued_bytes(int peer) {
+    // Holds room in the outbox for `peer` for frames of `bytes` in all (headers included) that the caller will
+    // send with `reserved`, or returns false when it would not fit beside what is queued and reserved. A link that
+    // is down grants it, so that the send fails as a link failure rather than waiting for room forever.
+    bool reserve(int peer, size_t bytes) {
         std::lock_guard<std::mutex> g(mu_);
-        if (static_cast<size_t>(peer) >= outboxes_.size()) return 0;
-        return outboxes_[static_cast<size_t>(peer)].size();
+        if (static_cast<size_t>(peer) >= fds_.size() or fds_[static_cast<size_t>(peer)] < 0) return true;
+        if (outboxes_.size() < fds_.size()) outboxes_.resize(fds_.size());
+        if (reserved_.size() < fds_.size()) reserved_.resize(fds_.size(), 0);
+        auto& r = reserved_[static_cast<size_t>(peer)];
+        const size_t used = outboxes_[static_cast<size_t>(peer)].size() + r;
+        if (used != 0 and bytes > outbox_budget_ - std::min(used, outbox_budget_)) return false;
+        r += bytes;
+        return true;
     }
-    size_t outbox_budget() const { return outbox_budget_; }
+    // Returns room reserved and not used.
+    void unreserve(int peer, size_t bytes) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (static_cast<size_t>(peer) >= reserved_.size()) return;
+        auto& r = reserved_[static_cast<size_t>(peer)];
+        r -= std::min(r, bytes);
+    }
 
     // Whether nothing is waiting in the outbox for `peer`: everything appended has reached the socket.
     bool outbox_empty(int peer) {
@@ -1096,7 +1110,8 @@ public:
         return st;
     }
 
-    bool send_signal(int peer, uint32_t window_id, uint64_t offset, uint64_t value, uint64_t op_id) {
+    bool send_signal(int peer, uint32_t window_id, uint64_t offset, uint64_t value, uint64_t op_id,
+                     bool reserved = false) {
         WireHeader h{};
         h.kind = static_cast<uint32_t>(WireKind::Signal);
         h.window_id = window_id;
@@ -1104,7 +1119,7 @@ public:
         h.length = 0;
         h.value = value;
         h.op_id = op_id;
-        return send_framed(peer, h, nullptr, 0);
+        return send_framed(peer, h, nullptr, 0, reserved);
     }
 
     // No payload: the requester does not have the bytes yet. `src_window_id`/`src_offset`/`fetch_bytes`
@@ -1114,7 +1129,7 @@ public:
     // requester chose, to be echoed back unchanged in the GetResponse.
     bool send_get_request(int peer, uint32_t src_window_id, uint64_t src_offset, uint64_t fetch_bytes,
                           uint32_t dest_window_id, uint64_t dest_offset, uint32_t requester_rank,
-                          uint64_t owner_token) {
+                          uint64_t owner_token, bool reserved = false) {
         WireHeader h{};
         h.kind = static_cast<uint32_t>(WireKind::GetRequest);
         h.window_id = src_window_id;
@@ -1125,7 +1140,7 @@ public:
         h.dest_window_id = dest_window_id;
         h.dest_offset = dest_offset;
         h.requester_rank = requester_rank;
-        return send_framed(peer, h, nullptr, 0);
+        return send_framed(peer, h, nullptr, 0, reserved);
     }
 
     // Sends a Shutdown to every peer and closes the link.
@@ -1210,7 +1225,10 @@ private:
     //
     // A frame is appended in one piece under the peer's lock, so the stream stays framed and ordered no
     // matter how many threads send or how often the socket refuses bytes.
-    bool send_framed(int peer, const WireHeader& h, const void* payload, uint64_t length) {
+    // `reserved`: the caller holds a reservation for this frame (`reserve`), which it consumes; such a frame is
+    // never refused for budget. Any other frame is refused when it would not fit beside what is queued and what
+    // is reserved.
+    bool send_framed(int peer, const WireHeader& h, const void* payload, uint64_t length, bool reserved = false) {
         std::mutex* lock = nullptr;
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -1218,6 +1236,7 @@ private:
             if (fds_[static_cast<size_t>(peer)] < 0) return false;
             lock = &locks_[static_cast<size_t>(peer)];
             if (outboxes_.size() < fds_.size()) outboxes_.resize(fds_.size());
+            if (reserved_.size() < fds_.size()) reserved_.resize(fds_.size(), 0);
         }
         note("transport: waiting for the peer's send lock");
         std::lock_guard<std::mutex> g(*lock);
@@ -1236,11 +1255,16 @@ private:
             // frame it accepted, so the release is declined and the scheduler still holds the unit: the
             // caller retries, which is backpressure. Dropping would be silent data loss, which is the one
             // thing this emulator's calibration forbids outright.
-            const size_t queued = out.size();
             const size_t incoming = sizeof(h) + static_cast<size_t>(length);
-            if (queued != 0 and incoming > outbox_budget_ - std::min(queued, outbox_budget_)) {
-                ++ refused_for_budget_;
-                return false;
+            if (reserved) {
+                auto& r = reserved_[static_cast<size_t>(peer)];
+                r -= std::min(r, incoming);
+            } else {
+                const size_t queued = out.size() + reserved_[static_cast<size_t>(peer)];
+                if (queued != 0 and incoming > outbox_budget_ - std::min(queued, outbox_budget_)) {
+                    ++ refused_for_budget_;
+                    return false;
+                }
             }
             const auto* hb = reinterpret_cast<const char*>(&h);
             ++ out.frames;
@@ -1344,6 +1368,7 @@ private:
     };
     std::vector<Outbox> outboxes_;
     size_t outbox_budget_ = 64u << 20;              // 64 MB per peer
+    std::vector<size_t> reserved_;                  // per peer: room held for frames not yet appended (`reserve`)
     std::atomic<uint64_t> refused_for_budget_{0};
     std::deque<std::mutex> locks_;   // deque: a mutex is not movable, so the vector cannot grow it
 };
