@@ -1,0 +1,161 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # The plugin against NCCL's plugin ABI for each supported NCCL release, in each delivery
+  # configuration, with declaration-only CUDA stand-ins. Checks the generated NCCL version, the op
+  # tables exported, and that each configuration really compiled its delivery path in.
+  plugin-abi:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        delivery: [host-only, cuda, cuda-gdrcopy]
+        nccl: [v2.31.2-1, v2.32.3-1, v2.32.6-1]
+        include:
+          - { nccl: v2.31.2-1, commit: 7b83616df3ae082a1f32bb74c27458bfe8153a13, version_code: "23102", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
+          - { nccl: v2.32.3-1, commit: 12df1a11afad322be5a204a2db890161cbf8131d, version_code: "23203", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
+          - { nccl: v2.32.6-1, commit: ad2d192c1f279aefcaf340f67e07880b65a1116b, version_code: "23206", exports: "ncclRmaPlugin_v14 ncclRmaPlugin_v15" }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Fetch NCCL
+        env:
+          NCCL_TAG: ${{ matrix.nccl }}
+          NCCL_COMMIT: ${{ matrix.commit }}
+        run: |
+          git clone --quiet --depth 1 --branch "$NCCL_TAG" https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = "$NCCL_COMMIT"
+      - name: Generate the headers and check the version
+        env:
+          VERSION_CODE: ${{ matrix.version_code }}
+        run: |
+          NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
+          grep -Eq "^#define NCCL_VERSION_CODE $VERSION_CODE\$" "$RUNNER_TEMP/inc/nccl/nccl.h"
+      - name: Build, check the exports and the delivery path
+        env:
+          DELIVERY: ${{ matrix.delivery }}
+          EXPORTS: ${{ matrix.exports }}
+        run: |
+          case "$DELIVERY" in
+            host-only) DEFS=""; LINK="-Wl,-z,defs" ;;
+            cuda) DEFS="-DSRDSIM_WITH_CUDA"; LINK="" ;;
+            cuda-gdrcopy) DEFS="-DSRDSIM_WITH_CUDA -DSRDSIM_WITH_GDRCOPY"; LINK="" ;;
+          esac
+          SO="$RUNNER_TEMP/libnccl-rma-srdsim.so"
+          c++ -std=c++17 -O2 -fPIC -shared -Wall -Wextra -Werror $DEFS \
+            -isystem "$RUNNER_TEMP/inc/nccl" -isystem "$RUNNER_TEMP/inc/cuda-stub" -I src \
+            src/nccl_rma_srdsim.cc -o "$SO" $LINK -pthread
+          nm -D --defined-only "$SO" > "$RUNNER_TEMP/defined"
+          nm -D --undefined-only "$SO" > "$RUNNER_TEMP/undefined"
+          for s in $EXPORTS; do
+            grep -Eq " [BDR] ${s}\$" "$RUNNER_TEMP/defined" || { echo "missing export: $s"; exit 1; }
+            echo "exported: $s"
+          done
+          has() { grep -Eq " U $1" "$RUNNER_TEMP/undefined"; }
+          case "$DELIVERY" in
+            host-only)
+              ! has 'cu[A-Z]' && ! has nvrtc && ! has gdr_ || { echo "host-only build references CUDA or GDRCopy"; exit 1; }
+              cc ci/dlopen_check.c -o "$RUNNER_TEMP/dlopen_check" -ldl
+              "$RUNNER_TEMP/dlopen_check" "$SO" $EXPORTS ;;
+            cuda)
+              has 'cu[A-Z]' && has nvrtc && ! has gdr_ || { echo "cuda build lacks the CUDA path or references GDRCopy"; exit 1; } ;;
+            cuda-gdrcopy)
+              has 'cu[A-Z]' && has nvrtc && has gdr_ || { echo "cuda-gdrcopy build lacks a delivery path"; exit 1; } ;;
+          esac
+
+  # The documented CMake path, against the real CUDA headers and libraries of two major versions
+  # (the code branches on CUDA_VERSION), with and without a real GDRCopy.
+  plugin-cuda:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12-8", "13-0"]
+        gdrcopy: ["OFF", "ON"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install CUDA development packages
+        env:
+          CUDA_PKG: ${{ matrix.cuda }}
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          echo "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba  cuda-keyring_1.1-1_all.deb" | sha256sum -c
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-driver-dev-$CUDA_PKG" "cuda-nvrtc-dev-$CUDA_PKG"
+      - name: Build GDRCopy's user library
+        if: matrix.gdrcopy == 'ON'
+        run: |
+          git clone --quiet --depth 1 --branch v2.5.2 https://github.com/NVIDIA/gdrcopy.git "$RUNNER_TEMP/gdrcopy"
+          test "$(git -C "$RUNNER_TEMP/gdrcopy" rev-parse HEAD)" = c91ad9f178e5fb729fc5b6dc62a77c3bb364d6c9
+          make -C "$RUNNER_TEMP/gdrcopy" prefix="$RUNNER_TEMP/gdr" lib_install
+      - name: Fetch NCCL
+        run: |
+          git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = ad2d192c1f279aefcaf340f67e07880b65a1116b
+      - name: Build the plugin with CMake
+        env:
+          CUDA_PKG: ${{ matrix.cuda }}
+          GDRCOPY: ${{ matrix.gdrcopy }}
+        run: |
+          NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
+          cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON \
+            -DCUDAToolkit_ROOT="/usr/local/cuda-${CUDA_PKG/-/.}" \
+            -DSRDSIM_WITH_GDRCOPY="$GDRCOPY" -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/gdr" \
+            -DCMAKE_CXX_FLAGS=-Werror \
+            -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
+          cmake --build build -j
+          nm -D --defined-only build/libnccl-rma-srdsim.so > defined
+          nm -D --undefined-only build/libnccl-rma-srdsim.so > undefined
+          for s in ncclRmaPlugin_v14 ncclRmaPlugin_v15; do
+            grep -Eq " [BDR] ${s}\$" defined || { echo "missing export: $s"; exit 1; }
+          done
+          grep -Eq ' U cu[A-Z]' undefined && grep -q ' U nvrtc' undefined || { echo "the CUDA delivery path is not compiled in"; exit 1; }
+          if [ "$GDRCOPY" = ON ]; then
+            grep -q ' U gdr_' undefined || { echo "SRDSIM_WITH_GDRCOPY=ON but GDRCopy is not compiled in"; exit 1; }
+          else
+            ! grep -q ' U gdr_' undefined || { echo "SRDSIM_WITH_GDRCOPY=OFF but GDRCopy is referenced"; exit 1; }
+          fi
+
+  # The CMake path without the CUDA delivery path: CUDA headers only (nccl.h needs them), no driver
+  # API or NVRTC linked.
+  plugin-host-only-cmake:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install the CUDA runtime headers
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          echo "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba  cuda-keyring_1.1-1_all.deb" | sha256sum -c
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0
+      - name: Build
+        run: |
+          git clone --quiet --depth 1 --branch v2.32.6-1 https://github.com/NVIDIA/nccl.git "$RUNNER_TEMP/nccl-src"
+          test "$(git -C "$RUNNER_TEMP/nccl-src" rev-parse HEAD)" = ad2d192c1f279aefcaf340f67e07880b65a1116b
+          NCCL_SRC="$RUNNER_TEMP/nccl-src" ./scripts/prepare_nccl_headers.sh "$RUNNER_TEMP/inc"
+          cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DSRDSIM_WITH_CUDA=OFF \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DCMAKE_CXX_FLAGS=-Werror -DNCCL_PLUGIN_INCLUDE_DIRS="$RUNNER_TEMP/inc/nccl"
+          cmake --build build -j
+          if nm -D --undefined-only build/libnccl-rma-srdsim.so | grep -Eq ' U (cu[A-Z]|nvrtc|gdr_)'; then
+            echo "built without the CUDA delivery path but references CUDA or GDRCopy"; exit 1
+          fi
+          cc ci/dlopen_check.c -o dlopen_check -ldl
+          ./dlopen_check "$PWD/build/libnccl-rma-srdsim.so" ncclRmaPlugin_v14 ncclRmaPlugin_v15
