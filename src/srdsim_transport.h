@@ -535,8 +535,9 @@ public:
         return out;
     }
 
-    uint64_t applied_placements() const { return placements_.load(std::memory_order_relaxed); }
-    uint64_t applied_signals() const { return signals_.load(std::memory_order_relaxed); }
+    // Acquire, paired with the release on every count: a caller that sees the count see the bytes too.
+    uint64_t applied_placements() const { return placements_.load(std::memory_order_acquire); }
+    uint64_t applied_signals() const { return signals_.load(std::memory_order_acquire); }
 
     // Two kinds of failure with two different owners. A frame this agent declined is the peer's
     // mistake; a write that did not happen is local. Reporting one number for both means a run where
@@ -758,7 +759,7 @@ private:
                 // Counted only when the write actually happened. Counting attempts as applications
                 // would make a run where every write failed look identical to a healthy one, and the
                 // whole point of these counters is to tell "never sent" from "never landed".
-                if (ok) { placements_.fetch_add(1, std::memory_order_relaxed);
+                if (ok) { placements_.fetch_add(1, std::memory_order_release);
                           if (conn) { conn->placements.fetch_add(1, std::memory_order_relaxed);
                                       conn->bytes.fetch_add(h.length, std::memory_order_relaxed); }
                           note(h.window_id, false, h.offset, h.length);
@@ -863,7 +864,7 @@ private:
                     // in the code under test, which is one of the things this is meant to catch.
                     __atomic_fetch_add(static_cast<uint64_t*>(dst), h.value, __ATOMIC_RELAXED);
                 }
-                if (ok) { signals_.fetch_add(1, std::memory_order_relaxed);
+                if (ok) { signals_.fetch_add(1, std::memory_order_release);
                           if (conn) conn->signals.fetch_add(1, std::memory_order_relaxed);
                           note(h.window_id, true, h.offset, sizeof(uint64_t), h.value); }
                 else    failed_writes_.fetch_add(1, std::memory_order_relaxed);

@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -99,7 +100,8 @@ constexpr uint64_t kSentinel = 0x4c'49'56'45'4e'45'53'53ull;   // "LIVENESS"
 // how slowly the machine underneath it does that is a property of the machine.
 srdsim::Impairments g_recv_imp;
 std::atomic<uint64_t> g_applied{0};
-Clock::time_point g_last_apply;
+Clock::time_point g_last_apply;  // guarded by g_apply_mutex
+std::mutex g_apply_mutex;
 // The freeze has to be applied by the side that stops reading, which is the receiver. It was declared
 // and never wired in the first version, so the knob did nothing and the two cases that depend on it
 // passed without exercising anything -- exactly the failure mode this suite exists to catch.
@@ -130,13 +132,18 @@ bool throttled_copy(void* dst, const void* src, size_t bytes, void* user) {
     maybe_freeze(user);
     if (const int link = link_of(user); link >= 0 and link < kMaxLinks)
         ++ g_applied_on_link[link];
-    if (g_recv_imp.apply_interval_us != 0) {
-        const auto wait = std::chrono::microseconds(g_recv_imp.apply_interval_us);
-        while (Clock::now() - g_last_apply < wait)
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        g_last_apply = Clock::now();
+    {
+        // One lock for the whole receiver: the throttle limits how fast the receiving side as a whole
+        // applies writes, and every link writes the same scratch window.
+        std::lock_guard<std::mutex> lock(g_apply_mutex);
+        if (g_recv_imp.apply_interval_us != 0) {
+            const auto wait = std::chrono::microseconds(g_recv_imp.apply_interval_us);
+            while (Clock::now() - g_last_apply < wait)
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            g_last_apply = Clock::now();
+        }
+        std::memcpy(dst, src, bytes);
     }
-    std::memcpy(dst, src, bytes);
     ++ g_applied;
     return true;
 }
