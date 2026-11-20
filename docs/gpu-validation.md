@@ -42,7 +42,7 @@ The last command prints, for each mode, a line ending in `PASS` or `FAIL` follow
 
 ## Result on record
 
-The plugin and the test at commit `7e0cc05`, on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The Run block was run four times: once exactly as written above, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run is three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and takes about 75 seconds.
+The plugin and the test at commit `baff27f` (measured before a rebase that removed only copyright comment lines from it and from its parents; no other line differs), on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The Run block was run four times: once exactly as written above, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run is three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and takes about 75 seconds.
 
 | Mode | Exit status per seed, in every run | Wrong elements reported by rank 0 |
 |---|---|---|
