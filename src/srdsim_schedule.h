@@ -438,12 +438,9 @@ private:
         int chunk_index = -1;   // -1 means the signal unit
     };
 
-    // Which operation `defer-one` is holding. The flag is separate from the id, because zero used to mean
-    // both "not chosen yet" and a legal id: with two pending operations numbered zero, every operation
-    // was skipped, `options` came out empty, and the escape at the bottom of `pick()` was guarded by the
-    // same sentinel so it never fired -- a permanent stall whose shape (ops == chunks == signals, no
-    // refusal, no log) is exactly what a real run reported. With duplicate non-zero ids the escape did
-    // fire and re-chose the same id, recursing until the stack ran out. Both were measured.
+    // Which operation `defer-one` is holding. The flag is separate from the id so that "not chosen yet"
+    // is never confused with a legal id; ids are also checked non-zero and unique on submit, since a
+    // repeated id would make `pick()` re-choose the same operation forever.
     uint64_t deferred_id_ = 0;
     bool     have_deferred_ = false;
 

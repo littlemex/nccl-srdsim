@@ -6,34 +6,29 @@
 // sender would never send, because that is where a simulator earns its keep: a fabric emulator that
 // crashes on a malformed frame cannot be used to investigate a crash.
 //
-// Every case here maps to a numbered item in `layer2/CONTRACT.md`, and every case was chosen from the
-// contract before the fix was written, so that the test says what the contract says rather than what
-// the code happens to do.
+// Each case states the property it checks, written before the code it checks was fixed, so that the test
+// says what the transport promises rather than what the code happens to do.
 //
-//   A1  contract I1. A frame whose length is enormous is refused without allocating it, the link is
-//       closed, and the process survives. On 2026-09-04 a desynchronised stream produced exactly this
-//       and survived only because the garbage length happened to be small.
-//   A2  contract I2. `offset + length` overflowing 64 bits does not pass the bounds check.
-//   A3  contract I3. The same, on the signal path.
-//   A4  contract I4. `serve` after `stop` is refused rather than starting a thread nobody joins.
-//   A5  contract I6. Rebinding a peer closes the descriptor it replaces.
-//   A6  contract I7. An operation id the scheduler never issued is not reported complete.
-//   A7  contract I8. A zero chunk size is refused with a reason instead of dividing by zero.
-//   A8  contract I9. A frame the peer got wrong and a write that failed locally move different
-//       counters, because they have different owners.
-//   A9  contract C-WIRE-2. After each refusal the stream is still framed: a well-formed frame that
-//       follows still applies. Checked for every refusal that is survivable.
-//   A10 contract C-WIRE-3. A refusal that cannot leave the stream framed closes the link instead.
-// Not here, and worth saying why: the correctness of a device signal update. Two host-side designs were
-// tried and both were wrong -- a read-modify-write loses increments between agents, and a host-side
-// absolute store overwrites the reset the GPU performs. The mechanism is now a device-side atomic add,
-// which cannot be checked without a GPU. `pseudo/test_plugin_conformance.cpp` covers everything about
-// the plugin that is host-side; this one property is verified on hardware and nowhere else.
-//   A11 contract I5. `shutdown_all` racing a sender never leaves a half-written frame on the wire.
-//       The receiver is the witness: a Shutdown header interleaved into the middle of a payload would
-//       desynchronise it, and a desynchronised receiver reports refusals.
+//   A1  A frame whose length is enormous is refused without allocating it, the link is closed, and the
+//       process survives. A desynchronised stream produces exactly such a length.
+//   A2  `offset + length` overflowing 64 bits does not pass the bounds check.
+//   A3  The same, on the signal path.
+//   A4  `serve` after `stop` is refused rather than starting a thread nobody joins.
+//   A5  Rebinding a peer closes the descriptor it replaces.
+//   A6  An operation id the scheduler never issued is not reported complete.
+//   A7  A zero chunk size is refused with a reason instead of dividing by zero.
+//   A8  A frame the peer got wrong and a write that failed locally move different counters, because
+//       they have different owners.
+//   A9  After each refusal the stream is still framed: a well-formed frame that follows still applies.
+//       Checked for every refusal that is survivable.
+//   A10 A refusal that cannot leave the stream framed closes the link instead.
+//   A11 `shutdown_all` racing a sender never leaves a half-written frame on the wire. The receiver is
+//       the witness: a Shutdown header interleaved into the middle of a payload would desynchronise it,
+//       and a desynchronised receiver reports refusals.
 //
-// Build: c++ -std=c++17 -O2 -I layer2 tests/test_srdsim_adversarial.cpp -o test_srdsim_adversarial
+// Not here: the correctness of a signal update in device memory, which needs a GPU.
+//
+// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <atomic>
 #include <chrono>
@@ -491,8 +486,8 @@ void test_shutdown_does_not_interleave_with_a_sender() {
 
     // A small send buffer is what makes this deterministic rather than lucky. With the default buffer
     // the kernel swallows a whole frame in one call and the sender is almost never inside one, so the
-    // race the test exists for is reached only by chance -- the first version of this test passed
-    // against the very defect it was written for. Four kilobytes against a four mebibyte payload means
+    // race the test exists for is reached only by chance, and the test would pass against the defect it
+    // is written for. Four kilobytes against a four mebibyte payload means
     // the sender is blocked in `send` for essentially the entire run.
     int small = 4096;
     ::setsockopt(s.fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
@@ -539,9 +534,8 @@ void test_shutdown_does_not_interleave_with_a_sender() {
     // The order matters and getting it wrong deadlocks. `shutdown_all` waits for the peer's send lock,
     // which is exactly what the fix under test makes it do, and a sender in a loop re-acquires that
     // lock immediately after every frame. Telling the sender to stop first bounds the wait to the one
-    // frame already in flight, which is still mid-frame and still the race this test exists for. The
-    // first version called shutdown first and starved on a machine whose receiver drained more slowly
-    // than the laptop it was written on.
+    // frame already in flight, which is still mid-frame and still the race this test exists for. Calling
+    // shutdown first can starve when the receiver drains slowly.
     stop_sending.store(true, std::memory_order_release);
     links.shutdown_all();
     sender.join();
