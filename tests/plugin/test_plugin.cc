@@ -596,6 +596,21 @@ void device_signal_reset(Rank& R) { device_signal(R, 0); }
 void device_signal_never_reset(Rank& R) { device_signal(R, NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET); }
 #endif
 
+// With SRDSIM_CHUNK_BYTES above the transport's default frame limit of 4 MiB, a put of one chunk larger than
+// that lands: the receiver accepts the frames the sender is configured to send.
+void large_chunk(Rank& R) {
+    constexpr size_t n = (5u << 20) + 13, src = 4099, dst = (2u << 20) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 20);
+        R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 8, false)), "put-with-signal");
+    } else {
+        R.wait_peer([&] { return R.signal_word(8) >= 1; }, "signal-word");
+        if (size_t bad = mismatches(R.at(dst), n, 0, 20)) fail("assert", "data", "%zu bytes", bad);
+        expect_guards(R, dst, n);
+        expect_signals(R, {{8, 1}});
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -635,6 +650,7 @@ const std::vector<Scenario>& scenarios() {
         {"device_signal_never_reset", device_signal_never_reset, 2, {"srd"}, {1}, "SRDSIM_DELIVERY_CONTEXT=primary"},
         {"device_put_signal", device_put_signal, 2, {"srd", "reverse-ops"}, {1, 2}, "SRDSIM_DELIVERY_CONTEXT=primary"},
 #endif
+        {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=6291456"},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
