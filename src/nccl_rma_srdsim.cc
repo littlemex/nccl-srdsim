@@ -3254,6 +3254,8 @@ ncclResult_t srdsim_close_coll(void* collComm) {
         if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
 #endif
         cc->responder.stop();          // before the links it sends on go
+        if (const size_t r = cc->links.reserved_total())
+            logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
         cc->links.shutdown_all();      // tells every peer's agent to finish
         if (cc->agent) cc->agent->stop();
         delete cc;
@@ -3717,7 +3719,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     size_t failed = 0;
     for (size_t i = 0; i < batch.size(); ++ i) {
         const auto& u = batch[i];
-        if (send_unit(ctx->coll, u, owners[i]))
+        if (send_unit(owners[i]->coll, u, owners[i]))
             continue;
         release_reservation(owners[i]->coll, u);
         ++ failed;

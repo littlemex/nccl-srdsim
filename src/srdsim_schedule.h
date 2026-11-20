@@ -536,7 +536,7 @@ private:
                 not (opt_.mode == Mode::SignalLast and any_placement_left))
                 options.push_back({static_cast<int>(i), -1});
             if (opt_.mode == Mode::InOrder and not options.empty())
-                break;                   // never look past the oldest operation
+                break;                   // never look past the oldest operation that can be released now
         }
         if (options.empty()) {
             // The deferred operation is the only thing left: stop deferring it and look once more, in a
@@ -606,7 +606,9 @@ private:
 
     bool has_room(const Pending& p) {
         if (room_ == nullptr) return true;
-        const size_t unit = p.op.is_get_request or p.op.bytes == 0 ? 0 : std::min(opt_.chunk_bytes, p.op.bytes);
+        // Only the signal is left once every placement is released, and a signal carries no payload.
+        const size_t unit = p.op.is_get_request or p.op.bytes == 0 or p.remaining == 0
+                          ? 0 : std::min(opt_.chunk_bytes, p.op.bytes);
         return room_->fits(p.op.peer, unit);
     }
     std::vector<Pending> pending_;

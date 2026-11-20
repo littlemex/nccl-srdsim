@@ -1023,6 +1023,13 @@ public:
         r += bytes;
         return true;
     }
+    // Room reserved and not yet used, over every peer: zero whenever nothing released is waiting to be sent.
+    size_t reserved_total() {
+        std::lock_guard<std::mutex> g(mu_);
+        size_t t = 0;
+        for (size_t r : reserved_) t += r;
+        return t;
+    }
     // Returns room reserved and not used.
     void unreserve(int peer, size_t bytes) {
         std::lock_guard<std::mutex> g(mu_);

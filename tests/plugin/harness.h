@@ -165,7 +165,8 @@ inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int,
     va_end(ap);
     std::lock_guard<std::mutex> g(g_log_mu);
     if (std::strncmp(buf, "SRD simulator: ", 15) == 0) g_init_line = buf;
-    if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped")))
+    if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped") or
+                                   std::strstr(buf, "outbox room still reserved")))
         g_poison_line = buf;
     if (g_verbose or level == NCCL_LOG_WARN) std::fprintf(stderr, "[rank %d] %s\n", g_rank, buf);
 }
