@@ -29,8 +29,9 @@ jobs:
         sanitizer: [address, undefined, thread]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      # The sanitizers of this toolchain cannot always map their shadow memory with the runner's ASLR
-      # entropy; the value before the change is logged so the step's effect is visible.
+      # The sanitizers of this toolchain cannot map their shadow memory with more ASLR entropy than 28
+      # bits. The runner image already uses 28; setting it keeps the jobs working on an image that does
+      # not, and the value before the change is logged.
       - name: Lower ASLR entropy for the sanitizers
         run: |
           sudo sysctl vm.mmap_rnd_bits
