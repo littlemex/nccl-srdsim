@@ -485,7 +485,9 @@ private:
             if (f.t->done.load(std::memory_order_relaxed) != 0 and f.index == frontier_[c][peer]) {
                 ++ frontier_[c][peer];
                 const Op& o = f.t->op;
-                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0)
+                // Only a source inside the window: an operation the plugin refuses can name more.
+                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0 and o.srcOff <= data.size() and
+                    o.size <= data.size() - o.srcOff)
                     std::memset(at(o.srcOff), kScribble, o.size);
                 f.t->retired.store(1, std::memory_order_release);
                 continue;
