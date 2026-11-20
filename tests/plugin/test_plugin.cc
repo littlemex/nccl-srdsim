@@ -423,7 +423,6 @@ const std::vector<Scenario>& scenarios() {
 // table of 0 match any. A fix removes its entry; the run fails if a listed case passes or fails differently.
 struct Expected { const char* scenario; const char* mode; int table; const char* status; const char* issue; };
 const Expected kExpected[] = {
-    {"get_completes_with_data", "*", 0, "assert:data-at-early-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
 };
 

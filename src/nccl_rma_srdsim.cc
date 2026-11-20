@@ -48,6 +48,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <chrono>
@@ -407,6 +408,8 @@ struct Request {
     // Complete when it was handed back: a dry-run operation, or one the scheduler refused. It names no
     // operation, so `test` must not ask the scheduler about it.
     bool     done_at_issue = false;
+    // A get: its entry in `g_gets`, which says how many of its bytes have still to land. Zero otherwise.
+    uint64_t get_id = 0;
 };
 
 // Requests are handed back to NCCL as opaque pointers and tested until done, so the address of a
@@ -446,6 +449,7 @@ struct RequestSlab {
         r->ctx = nullptr;
         r->is_flush = false;
         r->done_at_issue = false;
+        r->get_id = 0;
         return r;
     }
 
@@ -2430,18 +2434,21 @@ struct CrossOverlaps {
 };
 CrossOverlaps& g_cross = *new CrossOverlaps;
 
-// Every `RmaCtx*` currently alive, maintained unconditionally in `createContext`/`destroyContext` (not
-// gated behind `log_ops()` the way `StallMonitor`'s own list is, so this stays complete regardless of
-// logging). The one thing it exists for: a GetResponse's token (`Op::get_response_token`, not
-// `Op::id`) is a context pointer the requester chose and the peer only ever echoed back, so it crossed
-// a socket -- the same "attacker-controlled in
-// effect" reasoning the frame-length bound above is built on -- and must be checked against something
-// still alive before it is dereferenced, not trusted because it happens to look like a pointer.
-struct LiveContexts {
-    std::mutex mu;
-    std::set<RmaCtx*> live;
+// Every get whose reply has not yet fully landed, by an id this process never reuses. The id is the token a
+// GetRequest carries and its GetResponse echoes back, so a reply finds its get, and through it the context,
+// without trusting anything that crossed the socket: an id with no entry is dropped. A get completes when its
+// entry has no bytes left to land, and `destroyContext` removes the entries of the context it destroys, so
+// a late reply for a destroyed context finds nothing.
+struct GetRecord {
+    RmaCtx* ctx;
+    int64_t remaining;   // bytes of the reply that have not landed
 };
-LiveContexts& g_live_contexts = *new LiveContexts;
+struct OutstandingGets {
+    std::mutex mu;
+    uint64_t next = 1;
+    std::unordered_map<uint64_t, GetRecord> gets;
+};
+OutstandingGets& g_gets = *new OutstandingGets;
 
 // Called with `ctx->mu` held, after the scheduler accepted `op`.
 void note_cross_overlap(RmaCtx* ctx, const srdsim::Op& op) {
@@ -2932,10 +2939,6 @@ ncclResult_t srdsim_create_context(void* collComm, ncclRmaConfig_v14_t* config, 
         std::lock_guard<std::mutex> g(cc->mu);
         cc->rma_contexts.push_back(ctx);
     }
-    {
-        std::lock_guard<std::mutex> g(g_live_contexts.mu);
-        g_live_contexts.live.insert(ctx);
-    }
     *rmaCtx = ctx;
     logf("context created: %d contexts requested", ctx->contexts);
     return ncclSuccess;
@@ -3115,12 +3118,14 @@ ncclResult_t srdsim_destroy_context(void* rmaCtx) {
             it = it->first.first == ctx ? g_snapshots.snaps.erase(it) : std::next(it);
     }
     {
-        // Held across the erase *and* the delete, and matched by the same lock on the read side
-        // (`srdsim_handle_get_response_landed`), so a GetResponse that is already in flight for this
-        // context either finishes its check-and-use before this erase, or sees it gone -- never a
-        // pointer that is mid-free.
-        std::lock_guard<std::mutex> g(g_live_contexts.mu);
-        g_live_contexts.live.erase(ctx);
+        // Held across the erase *and* the delete, and matched by the same lock where a reply lands
+        // (`srdsim_handle_get_response_landed`), so a GetResponse already in flight for this context either
+        // finishes before the erase or finds no entry -- never a context that is mid-free.
+        std::lock_guard<std::mutex> g(g_gets.mu);
+        size_t dropped = 0;
+        for (auto it = g_gets.gets.begin(); it != g_gets.gets.end();)
+            if (it->second.ctx == ctx) { it = g_gets.gets.erase(it); ++ dropped; } else ++ it;
+        if (dropped != 0) logf("context %p destroyed with %zu get(s) whose reply had not landed", rmaCtx, dropped);
         delete ctx;
     }
     return ncclSuccess;
@@ -3205,9 +3210,9 @@ ncclResult_t srdsim_iput_signal(void* rmaCtx, int /*context*/, uint64_t srcOff, 
 }
 
 // A get travels as a request (below, answered on the peer's own context by `srdsim_handle_get_request`)
-// and comes back as an ordinary placement tagged GetResponse. Its own local completion, like a put's,
-// means only "handed to the wire" -- the data landing is what `iflush`/`flushAsync` fence on, tracked by
-// `RmaCtx::pending_get_bytes`.
+// and comes back as an ordinary placement tagged GetResponse. The get completes when every byte of the reply
+// has landed in the local window (`g_gets`), as an RDMA read completes once its data is in local memory; a
+// flush also waits for every outstanding get of the context (`RmaCtx::pending_get_bytes`).
 //
 // EFA-GDA itself has no Get: the capability this reproduces is aws-ofi-nccl's host-proxy GIN backend
 // (`nccl_ofi_gin.h`'s `iget`, over `fi_read`), which DeepEP's engram fetch is written against. Enabling
@@ -3230,14 +3235,31 @@ ncclResult_t srdsim_iget(void* rmaCtx, int /*context*/, uint64_t remoteOff, void
     op.get_dst_off = localOff;
     op.bytes = size;
     op.requester_rank = ctx->coll ? ctx->coll->rank : 0;
-    // The token the peer will do nothing with except echo back on the GetResponse (see
-    // `srdsim_handle_get_response_landed`'s comment): this rank's own `RmaCtx*`, chosen here rather
-    // than left to default to 0, which is what `op.get_response_token` would otherwise carry all the
-    // way to the wire -- a GetResponse any rank's receive loop would then validate against its own
-    // `g_live_contexts` and (if that set happens to be non-empty, since 0 can never be a real pointer)
-    // always drop.
-    op.get_response_token = reinterpret_cast<uint64_t>(ctx);
-    return submit(ctx, op, request);
+    // A get completes when its bytes are in the local window. With nothing to fetch it is complete now.
+    if (size == 0) {
+        Request* r = g_requests.acquire();
+        r->done_at_issue = true;
+        r->ctx = ctx;
+        *request = r;
+        return ncclSuccess;
+    }
+    // The token the peer echoes back on every frame of the reply: this get's entry in `g_gets`.
+    uint64_t id;
+    {
+        std::lock_guard<std::mutex> g(g_gets.mu);
+        id = g_gets.next ++;
+        g_gets.gets.emplace(id, GetRecord{ctx, static_cast<int64_t>(size)});
+    }
+    op.get_response_token = id;
+    const ncclResult_t rc = submit(ctx, op, request);
+    auto* r = static_cast<Request*>(*request);
+    if (rc != ncclSuccess or r == nullptr or r->done_at_issue) {   // refused, or a dry run: no reply will come
+        std::lock_guard<std::mutex> g(g_gets.mu);
+        g_gets.gets.erase(id);
+    } else {
+        r->get_id = id;
+    }
+    return rc;
 }
 
 // Answers a GetRequest this rank received: read from `src` (already resolved and bounds checked by the
@@ -3276,21 +3298,25 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
     return true;
 }
 
-// Releases the `iflush`/`flushAsync` request that is fencing on this get, now that its reply has
-// actually landed rather than merely been sent.
+// A frame of a get's reply has landed in the local window: its bytes come off the get's entry, and off the
+// context's total that a flush waits on.
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, void* /*user*/) {
-    // The token is this rank's own `RmaCtx*`, chosen at `iget()` time and never interpreted by the
-    // peer in between (the peer only ever echoes it back). Validated against `g_live_contexts` and used
-    // under the same lock `destroy_context` erases and deletes under, rather than trusted outright and
-    // checked-then-used across a gap: it crossed a socket, and a corrupted, stale, or merely
-    // concurrently-freed value must not become a wild write.
-    auto* ctx = reinterpret_cast<RmaCtx*>(static_cast<uintptr_t>(owner_token));
-    std::lock_guard<std::mutex> g(g_live_contexts.mu);
-    if (g_live_contexts.live.count(ctx) == 0) {
-        logf("a get response named a context (%p) that is not currently live; dropping", static_cast<void*>(ctx));
+    std::lock_guard<std::mutex> g(g_gets.mu);
+    auto it = g_gets.gets.find(owner_token);
+    if (it == g_gets.gets.end()) {
+        logf("a get response named get %llu, which is not outstanding; dropping",
+             static_cast<unsigned long long>(owner_token));
         return;
     }
-    ctx->pending_get_bytes.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
+    GetRecord& rec = it->second;
+    if (static_cast<int64_t>(bytes) > rec.remaining) {
+        logf("get %llu received %llu byte(s) with only %lld outstanding; counting what was outstanding",
+             static_cast<unsigned long long>(owner_token), static_cast<unsigned long long>(bytes),
+             static_cast<long long>(rec.remaining));
+        bytes = static_cast<uint64_t>(rec.remaining);
+    }
+    rec.remaining -= static_cast<int64_t>(bytes);
+    rec.ctx->pending_get_bytes.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
 }
 
 ncclResult_t srdsim_iflush(void* rmaCtx, int /*context*/, void* /*mhandle*/, uint32_t /*rank*/,
@@ -3347,7 +3373,13 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
         return ncclInternalError;
     }
     bool complete = r->done_at_issue;
-    if (not complete) {
+    if (not complete and r->get_id != 0) {
+        // A get is complete when its reply has landed, which also means its request was sent.
+        std::lock_guard<std::mutex> g(g_gets.mu);
+        auto it = g_gets.gets.find(r->get_id);
+        complete = it == g_gets.gets.end() or it->second.remaining <= 0;
+        if (complete and it != g_gets.gets.end()) g_gets.gets.erase(it);
+    } else if (not complete) {
         std::lock_guard<std::mutex> g(r->ctx->mu);
         // A flush fences both directions on this context: the scheduler being idle is the put side
         // (everything this rank sent has been released), `pending_get_bytes` is the get side (every reply
@@ -3360,7 +3392,7 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
 #ifdef SRDSIM_WITH_CUDA
     // Released is not finished while a unit still waits for its source to be staged: reporting it done
     // would let NCCL reuse a source that has not been read yet.
-    if (complete and not r->done_at_issue and delivery_async()) {
+    if (complete and not r->done_at_issue and r->get_id == 0 and delivery_async()) {
         drain_sends();
         complete = r->is_flush
                  ? not send_holds_any_of(r->ctx) and r->ctx->pending_get_bytes.load(std::memory_order_relaxed) == 0
