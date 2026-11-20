@@ -84,4 +84,22 @@ if(SRDSIM_BUILD_PLUGIN)
   endif()
   include(GNUInstallDirs)
   install(TARGETS nccl-rma-srdsim LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+  # The plugin harness (tests/plugin): drives the built plugin through its op table as NCCL does, once
+  # per table version listed here. Host windows only, so it needs no GPU.
+  if(SRDSIM_BUILD_TESTS)
+    set(SRDSIM_HARNESS_TABLES "14;15;16" CACHE STRING "Op-table versions the plugin harness runs against")
+    add_executable(test_plugin tests/plugin/test_plugin.cc)
+    target_include_directories(test_plugin SYSTEM PRIVATE ${NCCL_PLUGIN_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(test_plugin PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    target_compile_options(test_plugin PRIVATE ${SRDSIM_WARNINGS})
+    foreach(v IN LISTS SRDSIM_HARNESS_TABLES)
+      add_test(NAME plugin_harness_v${v} COMMAND test_plugin $<TARGET_FILE:nccl-rma-srdsim> ${v})
+      set_tests_properties(plugin_harness_v${v} PROPERTIES TIMEOUT 900)
+      if(SRDSIM_SANITIZER)
+        set_tests_properties(plugin_harness_v${v} PROPERTIES ENVIRONMENT
+          "ASAN_OPTIONS=abort_on_error=1;UBSAN_OPTIONS=print_stacktrace=1;TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+      endif()
+    endforeach()
+  endif()
 endif()
