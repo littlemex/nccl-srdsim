@@ -145,7 +145,7 @@ using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length
 // Called each time a frame of a GetResponse has actually landed in memory -- not merely been sent, which is
 // all a placement's own completion ever meant -- with the bytes it carried, so the plugin can release the
 // `iflush` request that is fencing on the get. A reply of several chunks lands as several frames.
-// `owner_token` is the GetRequest's `op_id`, echoed back unchanged.
+// `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
 using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
 
 class WindowTable {
