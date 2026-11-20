@@ -697,6 +697,32 @@ void test_strong_signal_is_scoped_to_its_context() {
            "S10 a strong signal on the same context waits for the earlier put");
 }
 
+// S11: peer-seq keeps one sequence per context and peer: a later operation to the same peer on another context
+// is released while an earlier one has bytes left, and one on the same context is not.
+void test_peer_seq_is_per_context() {
+    for (int other : {1, 0}) {
+        Fabric f(1 << 16, 4);
+        srdsim::Scheduler::Options o;
+        o.mode = srdsim::Mode::PeerSeq;
+        o.chunk_bytes = 1000;
+        srdsim::Scheduler s(o);
+        srdsim::Op a = make_op(1, f, 0, 10'000, -1);
+        srdsim::Op b = make_op(2, f, 20'000, 10'000, -1);
+        a.context = 0;
+        b.context = other;
+        std::string why;
+        expect(s.submit(a, &why) and s.submit(b, &why), "S11 submit");
+        // Nine units: the first operation has ten chunks, so it is not finished after them whichever order the
+        // scheduler chooses. The seed is fixed, so the choice is the same on every run.
+        std::vector<srdsim::Unit> batch;
+        s.progress(9, &batch);
+        bool second = false;
+        for (const auto& u : batch) second = second or u.op_id == 2;
+        if (other == 1) expect(second, "S11 another context's operation is not held behind the first");
+        else expect(not second, "S11 the same context's operation waits for the first");
+    }
+}
+
 int main() {
     test_overlapping_writes_are_named();
     test_overlap_detection_is_opt_in();
@@ -710,6 +736,7 @@ int main() {
     test_oversized_is_refused();
     test_room_holds_a_full_peer();
     test_strong_signal_is_scoped_to_its_context();
+    test_peer_seq_is_per_context();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

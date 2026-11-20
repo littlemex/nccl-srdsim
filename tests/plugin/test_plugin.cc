@@ -122,13 +122,15 @@ void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 // Contexts are independent: a strong signal on context 1 is not ordered behind a put on context 0 to the same
 // peer. Under reverse-ops the newest operation goes first, so the signal arrives while most of the earlier put
 // on the other context is missing. The sender holds after one proxy iteration until the target has looked.
-void strong_signal_other_context(Rank& R) {
+// Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
+// can be dropped without a failure.
+void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
     constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 19);
         R.pause();
-        const Ticket* p = R.issue(put(0, 1, src, n, dst));
-        R.issue(signal_only(1, 1, 7, /*strong=*/true));
+        const Ticket* p = R.issue(put(put_ctx, 1, src, n, dst));
+        R.issue(signal_only(sig_ctx, 1, 7, /*strong=*/true));
         R.run_steps(1);
         wait_flag(0, "target-looked");
         R.resume();
@@ -138,13 +140,16 @@ void strong_signal_other_context(Rank& R) {
         R.wait_peer([&] { return R.signal_word(7) >= 1; }, "signal-word");
         const size_t bad = mismatches(R.at(dst), n, 0, 19);
         set_flag(0);
-        if (bad == 0) fail("assert", "ordered-across-contexts", "%s", "the strong signal on context 1 waited for context 0's put");
+        if (bad == 0) fail("assert", "ordered-across-contexts", "%s", "the strong signal waited for the other context's put");
         R.wait_peer([&] { return mismatches(R.at(dst), n, 0, 19) == 0; }, "put-complete");
         wait_flag(1, "sender-done");
         expect_guards(R, dst, n);
         expect_signals(R, {{7, 1}});
     }
 }
+
+void strong_signal_other_context_01(Rank& R) { strong_signal_other_context(R, 0, 1); }
+void strong_signal_other_context_10(Rank& R) { strong_signal_other_context(R, 1, 0); }
 
 // I1 over many rounds, alternating contexts: when a weak signal's word reaches its value, the put it was
 // bundled with has landed. The source is overwritten as soon as the put retires, so a plugin that still
@@ -492,7 +497,8 @@ const std::vector<Scenario>& scenarios() {
     static const std::vector<Scenario> s = {
         {"put_then_strong_signal", put_then_strong_signal, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, nullptr},
-        {"strong_signal_other_context", strong_signal_other_context, 2, {"reverse-ops"}, {1, 2, 3}, nullptr},
+        {"strong_signal_other_context", strong_signal_other_context_01, 2, {"reverse-ops"}, {1}, nullptr},
+        {"strong_signal_other_context_10", strong_signal_other_context_10, 2, {"reverse-ops"}, {1}, nullptr},
         {"i1_holds", i1_holds, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"violate_control", violate_control, 2, {"violate-i1"}, {1, 2, 3}, nullptr},
         {"get_completes_with_data", get_completes_with_data, 2, {"srd"}, {1}, nullptr},

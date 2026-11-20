@@ -3272,6 +3272,24 @@ ncclResult_t srdsim_close_listen(void* listenComm) {
     return ncclSuccess;
 }
 
+// A context index outside what `createContext` was asked for is a caller error. It is reported through
+// `queryLastError` rather than returned, since an error from a submit entry point stops NCCL's GIN progress
+// thread, and the operation is still carried out in an ordering domain of its own.
+void check_context(RmaCtx* ctx, int context) {
+    if (context >= 0 and context < ctx->contexts) return;
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "an operation names context %d, but the RMA context has %d", context,
+                  ctx->contexts);
+    logf("%s", detail);
+    {
+        std::lock_guard<std::mutex> g(ctx->mu);
+        ctx->has_error = true;
+        ctx->error = detail;
+    }
+    std::lock_guard<std::mutex> g(ctx->coll->mu);
+    if (ctx->coll->last_error.empty()) ctx->coll->last_error = detail;
+}
+
 srdsim::Op build_op(MrHandle* src, uint64_t srcOff, MrHandle* dst, uint64_t dstOff, size_t size,
                     uint32_t rank) {
     srdsim::Op op;
@@ -3294,6 +3312,7 @@ ncclResult_t srdsim_iput(void* rmaCtx, int context, uint64_t srcOff, void* srcMh
     auto op = build_op(static_cast<MrHandle*>(srcMhandle), srcOff,
                        static_cast<MrHandle*>(dstMhandle), dstOff, size, rank);
     op.context = context;
+    check_context(ctx, context);
     return submit(ctx, op, request);
 }
 
@@ -3306,6 +3325,7 @@ ncclResult_t srdsim_iput_signal(void* rmaCtx, int context, uint64_t srcOff, void
     auto op = build_op(static_cast<MrHandle*>(srcMhandle), srcOff,
                        static_cast<MrHandle*>(dstMhandle), dstOff, size, rank);
     op.context = context;
+    check_context(ctx, context);
     auto* sig = static_cast<MrHandle*>(signalMhandle);
     op.has_signal = true;
     op.signal_window = sig ? sig->window_id : 0;
@@ -3347,6 +3367,7 @@ ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* re
     auto* local = static_cast<MrHandle*>(localMhandle);
     srdsim::Op op;
     op.context = context;
+    check_context(ctx, context);
     op.peer = static_cast<int>(rank);
     op.is_get_request = true;
     op.get_src_window = remote ? remote->window_id : 0;
