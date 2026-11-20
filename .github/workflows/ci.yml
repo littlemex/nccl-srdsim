@@ -17,6 +17,31 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # The host tests under each sanitizer. The transport and send-queue tests run threads and child
+  # processes, which is what ThreadSanitizer is for.
+  host-tests-sanitized:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined, thread]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # ThreadSanitizer cannot map its shadow memory with the runner's default ASLR entropy.
+      - name: Lower ASLR entropy for ThreadSanitizer
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSRDSIM_SANITIZER=${{ matrix.sanitizer }}
+          cmake --build build -j
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure
+
   # The plugin against NCCL's plugin ABI for each supported NCCL release, in each delivery
   # configuration, with declaration-only CUDA stand-ins. Checks the generated NCCL version, the op
   # tables exported, and that each configuration really compiled its delivery path in.

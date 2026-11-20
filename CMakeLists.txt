@@ -10,14 +10,20 @@ option(SRDSIM_BUILD_TESTS "Build the host tests (no GPU, no NCCL needed)" ON)
 option(SRDSIM_BUILD_PLUGIN "Build libnccl-rma-srdsim.so (needs the NCCL plugin headers)" OFF)
 option(SRDSIM_WITH_CUDA "Plugin: deliver into device windows through the CUDA driver API" ON)
 option(SRDSIM_WITH_GDRCOPY "Plugin: deliver into device windows through GDRCopy when available" OFF)
-option(SRDSIM_ASAN "Plugin and tests: build with AddressSanitizer" OFF)
+set(SRDSIM_SANITIZER "" CACHE STRING
+    "Plugin and tests: build with a sanitizer (address, undefined or thread; empty for none)")
+set_property(CACHE SRDSIM_SANITIZER PROPERTY STRINGS "" address undefined thread)
 set(NCCL_PLUGIN_INCLUDE_DIRS "" CACHE STRING
     "Directories holding nccl.h and the plugin headers (nccl_rma.h), separated by ;")
 
 set(SRDSIM_WARNINGS -Wall -Wextra)
-if(SRDSIM_ASAN)
-  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
-  add_link_options(-fsanitize=address)
+if(SRDSIM_SANITIZER)
+  if(NOT SRDSIM_SANITIZER MATCHES "^(address|undefined|thread)$")
+    message(FATAL_ERROR "SRDSIM_SANITIZER must be address, undefined or thread, not '${SRDSIM_SANITIZER}'")
+  endif()
+  # A finding stops the program, so a test that triggers one fails rather than printing and passing.
+  add_compile_options(-fsanitize=${SRDSIM_SANITIZER} -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=${SRDSIM_SANITIZER})
 endif()
 
 find_package(Threads REQUIRED)
