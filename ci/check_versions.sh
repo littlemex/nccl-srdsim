@@ -27,7 +27,7 @@ for f in $files; do
         for v in $(grep -oE 'NCCL (version )?2\.[0-9]+\.[0-9]+' <<<"$text" | grep -oE '2\.[0-9]+\.[0-9]+' || true); do
             [[ "$releases" == *" v$v-"* ]] || report "$f:$n: NCCL $v is not in NCCL_RELEASES"
         done
-        for v in $(grep -oE '(nvidia-nccl-cu[0-9]+==|NCCL_VERSION=)[0-9.]+' <<<"$text" | grep -oE '[0-9][0-9.]+$' || true); do
+        for v in $(grep -oE '(nvidia-nccl-cu[0-9]+==|NCCL_VERSION=)[0-9]+(\.[0-9]+)*' <<<"$text" | grep -oE '[0-9]+(\.[0-9]+)*$' || true); do
             [ "$v" = "$NCCL_WHEEL" ] || report "$f:$n: NCCL wheel $v differs from NCCL_WHEEL=$NCCL_WHEEL"
         done
     done < <(grep -nE '[0-9a-f]{40}|v2\.[0-9]+\.[0-9]+-[0-9]|NCCL (version )?2\.[0-9]|nvidia-nccl-cu[0-9]+==|NCCL_VERSION=[0-9]' "$f" || true)
