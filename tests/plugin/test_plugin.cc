@@ -98,7 +98,7 @@ void put_then_signal(Rank& R, bool strong, int salt) {
         R.wait_retired(s, "signal");
         set_flag(1);
     } else {
-        R.wait_until([&] { return R.signal_word(0) >= 1; }, "signal-word");
+        R.wait_peer([&] { return R.signal_word(0) >= 1; }, "signal-word");
         const size_t bad = mismatches(R.at(dst), n, 0, salt);
         set_flag(0);
         if (strong and bad != 0) fail("assert", "strong-orders-earlier-put", "%zu bytes missing", bad);
@@ -127,7 +127,7 @@ void i1_holds(Rank& R) {
             fill(R.at(src), n, 0, r);
             R.wait_retired(R.issue(put_signal(r % kContexts, 1, src, n, dst, 1, false)), "put-with-signal");
         } else {
-            R.wait_until([&] { return R.signal_word(1) >= uint64_t(r + 1); }, "signal-word");
+            R.wait_peer([&] { return R.signal_word(1) >= uint64_t(r + 1); }, "signal-word");
             if (size_t bad = mismatches(R.at(dst), n, 0, r)) fail("assert", "i1", "round %d: %zu bytes", r, bad);
         }
         barrier("round");
@@ -151,7 +151,7 @@ void violate_control(Rank& R) {
         R.resume();
         R.wait_retired(t, "put-with-signal");
     } else {
-        R.wait_until([&] { return R.signal_word(2) >= 1; }, "signal-word");
+        R.wait_peer([&] { return R.signal_word(2) >= 1; }, "signal-word");
         const size_t bad = mismatches(R.at(dst), n, 0, 3);
         set_flag(0);
         if (bad == 0) fail("assert", "control-missed", "%s", "the signal arrived with its whole put");
@@ -162,24 +162,28 @@ void violate_control(Rank& R) {
     }
 }
 
-// A get completes when its bytes are in the local window. The owner's proxy holds off for a while after
-// the get is issued and then runs, so an early completion is seen before the reply can land.
+// A get completes when its bytes are in the local window. The owner's whole process is stopped while the
+// get is issued, so a get that reports completion within kHoldMs has completed without its reply, whether
+// the reply would come from the owner's proxy or from a one-sided read; one that does not is given the
+// owner back and must have its data when it retires.
 void get_completes_with_data(Rank& R) {
     constexpr size_t n = (4 << 10) + 13, remote = (256 << 10) + 7, local = (300 << 10) + kGuard;
-    if (g_rank == 1) { fill(R.at(remote), n, 1, 5); R.pause(); }
+    if (g_rank == 1) fill(R.at(remote), n, 1, 5);
     barrier("owner filled");
     if (g_rank == 0) {
+        stop_peer(1);
         const Ticket* g = R.issue(get(0, 1, remote, n, local));
-        set_flag(0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kHoldMs));
+        const bool early = g->retired.load(std::memory_order_acquire) != 0;
+        const size_t bad_early = early ? mismatches(R.at(local), n, 1, 5) : 0;
+        continue_peer(1);
+        if (bad_early) fail("assert", "data-at-completion", "%zu bytes", bad_early);
         R.wait_retired(g, "get");
         if (size_t bad = mismatches(R.at(local), n, 1, 5)) fail("assert", "data-at-completion", "%zu bytes", bad);
         expect_guards(R, local, n);
-        set_flag(1);
+        set_flag(0);
     } else {
-        wait_flag(0, "get-issued");
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        R.resume();
-        wait_flag(1, "requester-done");
+        wait_flag(0, "requester-done");
     }
 }
 
@@ -225,7 +229,29 @@ void get_then_flush(Rank& R, size_t n, int salt, bool data_first) {
 }
 void get_one_chunk_flush(Rank& R) { get_then_flush(R, (4 << 10) + 13, 7, true); }
 void get_multichunk_flush(Rank& R) { get_then_flush(R, (64 << 10) + 13, 8, true); }
-void get_one_chunk_early_flush(Rank& R) { get_then_flush(R, (4 << 10) + 13, 11, false); }
+// A flush issued straight after a one-chunk get, with the owner stopped: the flush must not complete
+// before the get's reply has landed, and the data must be in place when it does.
+void get_one_chunk_early_flush(Rank& R) {
+    constexpr size_t n = (4 << 10) + 13, remote = (768 << 10) + 7, local = (900 << 10) + kGuard;
+    if (g_rank == 1) fill(R.at(remote), n, 1, 11);
+    barrier("owner filled");
+    if (g_rank == 0) {
+        stop_peer(1);
+        R.issue(get(0, 1, remote, n, local));
+        const Ticket* f = R.issue(flush(0, 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(kHoldMs));
+        const bool early = f->retired.load(std::memory_order_acquire) != 0;
+        const size_t bad_early = early ? mismatches(R.at(local), n, 1, 11) : 0;
+        continue_peer(1);
+        if (bad_early) fail("assert", "flush-before-data", "%zu bytes", bad_early);
+        R.wait_retired(f, "flush");
+        if (size_t bad = mismatches(R.at(local), n, 1, 11)) fail("assert", "data-at-flush", "%zu bytes", bad);
+        expect_guards(R, local, n);
+        set_flag(0);
+    } else {
+        wait_flag(0, "requester-done");
+    }
+}
 void flush_without_get(Rank& R) { get_then_flush(R, 0, 9, false); }
 
 // Under SRDSIM_DRY_RUN=1 every operation completes without moving data. Two puts, the second waited for
@@ -244,6 +270,25 @@ void dry_run(Rank& R) {
     } else {
         wait_flag(0, "sender-done");
         if (size_t bad = nonzero(R.at(dst - kGuard), 2 * n + 2 * kGuard)) fail("assert", "dry-run-wrote", "%zu bytes", bad);
+    }
+}
+
+// Windows registered and deregistered on the main thread while puts with signals are in flight on the
+// proxy thread, as NCCL registers user buffers while its progress thread runs.
+void register_during_traffic(Rank& R) {
+    constexpr size_t n = (64 << 10) + 13, src = 4099, base = 1 << 20;
+    constexpr int rounds = 8;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 12);
+        for (int r = 0; r < rounds; ++ r) R.issue(put_signal(r % kContexts, 1, src, n, base + kGuard + size_t(r) * (n + kGuard), 4, false));
+    }
+    for (int k = 0; k < 4; ++ k) R.register_and_release((64 << 10) + 4096 * size_t(k));
+    if (g_rank == 1) {
+        R.wait_peer([&] { return R.signal_word(4) >= uint64_t(rounds); }, "signal-word");
+        for (int r = 0; r < rounds; ++ r)
+            if (size_t bad = mismatches(R.at(base + kGuard + size_t(r) * (n + kGuard)), n, 0, 12))
+                fail("assert", "data", "round %d: %zu bytes", r, bad);
+        expect_signals(R, {{4, uint64_t(rounds)}});
     }
 }
 
@@ -270,6 +315,7 @@ const std::vector<Scenario>& scenarios() {
         {"get_multichunk_flush", get_multichunk_flush, 2, {"srd"}, {1}, nullptr},
         {"get_one_chunk_early_flush", get_one_chunk_early_flush, 2, {"srd"}, {1}, nullptr},
         {"flush_without_get", flush_without_get, 2, {"srd"}, {1}, nullptr},
+        {"register_during_traffic", register_during_traffic, 2, {"srd"}, {1, 2, 3}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
@@ -336,6 +382,7 @@ Result run_case(const std::string& plugin, int table, const Scenario& sc, const 
             R.pass();
         }
         setpgid(pid, pid);                      // both sides, so an early kill(-pid) cannot miss
+        shared->pid[r] = pid;
         pids.push_back(pid);
         exited.push_back(false);
     }
@@ -445,7 +492,7 @@ int main(int argc, char** argv) {
     }
     if (wall_kills >= kMaxWallKills)
         std::printf("ABORT  %d cases hit the wall clock; the rest were not run\n", wall_kills);
-    std::printf("%d passed, %d expected failures, %d failed\n", passed, xfailed, failed);
+    std::printf("%d cases: %d passed, %d expected failures, %d failed\n", ran, passed, xfailed, failed);
     if (ran == 0) { std::printf("no case matched the filter\n"); return 1; }
     return failed == 0 ? 0 : 1;
 }

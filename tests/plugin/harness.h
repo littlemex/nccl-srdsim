@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include <signal.h>
 #include <unistd.h>
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -53,6 +54,7 @@ struct Shared {
     char handles[kMaxRanks][NCCL_NET_HANDLE_MAXSIZE];
     char status[kMaxRanks][256];
     char where[kMaxRanks][64];        // the wait a rank is in, for a driver that has to kill it
+    pid_t pid[kMaxRanks];             // so a rank can stop and continue a peer
     std::atomic<int> flag[16]{};
 };
 
@@ -60,7 +62,12 @@ inline Shared* g_shared = nullptr;
 inline int g_rank = -1, g_nranks = 0;
 inline bool g_verbose = false;        // HARNESS_VERBOSE, read once in the driver before any fork
 
+[[noreturn]] inline void pause_forever() { for (;;) std::this_thread::sleep_for(std::chrono::seconds(1)); }
+
+// The first caller on either of the rank's threads writes the status and exits; a second waits for that.
 [[noreturn]] inline void finish(const char* status) {
+    static std::atomic<bool> finishing{false};
+    if (finishing.exchange(true)) pause_forever();
     std::snprintf(g_shared->status[g_rank], sizeof(g_shared->status[g_rank]), "%s", status);
     std::fflush(stdout);
     std::fflush(stderr);
@@ -93,7 +100,7 @@ inline void barrier(const char* what) {
     }
     const auto start = Clock::now();
     while (g_shared->generation.load(std::memory_order_acquire) == gen) {
-        if (Clock::now() - start > std::chrono::milliseconds(kRankWallMs)) fail("stall", "barrier", "%s", what);
+        if (Clock::now() - start > std::chrono::milliseconds(kRankWallMs)) fail("timeout", "barrier", "%s", what);
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
@@ -104,10 +111,13 @@ inline void wait_flag(int i, const char* what) {
     set_where(what);
     const auto start = Clock::now();
     while (g_shared->flag[i].load(std::memory_order_acquire) == 0) {
-        if (Clock::now() - start > std::chrono::milliseconds(kRankWallMs)) fail("stall", what, "flag %d", i);
+        if (Clock::now() - start > std::chrono::milliseconds(kRankWallMs)) fail("timeout", what, "flag %d", i);
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
+// Stops and continues a whole peer process, its plugin threads included.
+inline void stop_peer(int r) { kill(g_shared->pid[r], SIGSTOP); }
+inline void continue_peer(int r) { kill(g_shared->pid[r], SIGCONT); }
 inline void set_flag(int i) { g_shared->flag[i].store(1, std::memory_order_release); }
 
 // The plugin's log. Warnings are always printed; everything when HARNESS_VERBOSE is set. The line the
@@ -200,6 +210,15 @@ struct Rank {
         return t;
     }
 
+    // Registers a window of `size` bytes and deregisters it again, on the main thread while the proxy runs.
+    // Collective, as regMrSym is: every rank calls it.
+    void register_and_release(size_t size) {
+        std::vector<unsigned char> w(size, 0);
+        void* mh = nullptr;
+        check(rma.regMrSym(coll, w.data(), w.size(), NCCL_PTR_HOST, 0, &mh), "regMrSym extra");
+        check(rma.deregMrSym(coll, mh), "deregMrSym extra");
+    }
+
     // The proxy thread runs freely after setup. pause() returns once no iteration is in flight;
     // run_steps(n) runs exactly n iterations and then pauses again.
     void pause() { set_where("pause"); std::lock_guard<std::mutex> g(step_mu_); budget_.store(0); }
@@ -211,9 +230,17 @@ struct Rank {
     }
 
     // Waits until `pred` holds while the proxy runs. Fails as a stall named `what` when neither the
-    // completion count nor `observable` changes for kStallMs, or when the wait passes kRankWallMs.
+    // completion count nor `observable` changes for kStallMs, and as a timeout past kRankWallMs.
     void wait_until(const std::function<bool()>& pred, const char* what,
                     const std::function<uint64_t()>& observable = nullptr) {
+        wait_impl(pred, what, observable, true);
+    }
+    // Waits for what a peer's work makes visible here, such as a signal word. Bounded by kRankWallMs
+    // only, so that a stall is reported by the rank whose own requests stopped moving.
+    void wait_peer(const std::function<bool()>& pred, const char* what) { wait_impl(pred, what, nullptr, false); }
+
+    void wait_impl(const std::function<bool()>& pred, const char* what, const std::function<uint64_t()>& observable,
+                   bool detect_stall) {
         set_where(what);
         uint64_t last = ~0ull;
         const auto start = Clock::now();
@@ -223,8 +250,8 @@ struct Rank {
             const uint64_t seen = completions.load() + (observable ? observable() : 0);
             const auto now = Clock::now();
             if (seen != last) { last = seen; changed_at = now; }
-            else if (now - changed_at > std::chrono::milliseconds(kStallMs)) fail("stall", what, "%s", "");
-            if (now - start > std::chrono::milliseconds(kRankWallMs)) fail("stall", what, "%s", "wall clock");
+            else if (detect_stall and now - changed_at > std::chrono::milliseconds(kStallMs)) fail("stall", what, "%s", "");
+            if (now - start > std::chrono::milliseconds(kRankWallMs)) fail("timeout", what, "%s", "");
         }
     }
     void wait_retired(const Ticket* t, const char* what) {
@@ -272,6 +299,8 @@ struct Rank {
         }
 #endif
         check(rma.createContext(coll, kContexts, &rmaCtx), "createContext");
+        // From here on the proxy runs, as NCCL's progress thread does while windows are registered.
+        proxy_ = std::thread([this] { loop(); });
         data.assign(kDataBytes, 0);
         signals.assign(kSignalWords, 0);
         // The same windows in the same order on every rank, with the flags NCCL's GIN proxy uses for
@@ -280,12 +309,19 @@ struct Rank {
         check(rma.regMrSym(coll, signals.data(), signals.size() * sizeof(uint64_t), NCCL_PTR_HOST,
                            NCCL_NET_MR_FLAG_FORCE_SO | NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET, &signalMh),
               "regMrSym signals");
-        proxy_ = std::thread([this] { loop(); });
         barrier("registered");
     }
 
     // NCCL's order: the progress thread stops, then the context, the windows and the connection go.
     void teardown() {
+        // Every operation a case issued must have retired: one that never completes is a failure of the
+        // case, not something for teardown to absorb.
+        resume();
+        wait_until([&] {
+            std::lock_guard<std::mutex> g(mu_);
+            for (const Ticket& t : tickets_) if (t.retired.load(std::memory_order_acquire) == 0) return false;
+            return true;
+        }, "unretired");
         barrier("before teardown");
         stop_.store(true);
         proxy_.join();
@@ -340,20 +376,15 @@ private:
             poll(c);
             for (int t = 0; t < g_nranks; ++ t) {
                 std::vector<Ticket*> batch;
-                bool more = false;
                 {
                     std::lock_guard<std::mutex> g(mu_);
                     auto& q = queue_[c][t];
                     while (not q.empty() and int(batch.size()) < kPollBatch) { batch.push_back(q.front()); q.pop_front(); }
-                    more = not q.empty();
                 }
-                for (size_t p = 0; p < batch.size(); ++ p) {
-                    // Aggregate only when this peer's next operation is already queued and this is not the
-                    // last of the batch, as NCCL decides it.
-                    const bool next_queued = p + 1 < batch.size() or more;
-                    const bool last_in_batch = int(p) == kPollBatch - 1;
-                    submit(c, batch[p], next_queued and not last_in_batch);
-                }
+                // Aggregate only when this peer's next operation is already queued and this is not the last
+                // of the batch, as NCCL decides it. Past the end of a full batch the last-of-batch rule decides,
+                // so whether more is queued there does not matter.
+                for (size_t p = 0; p < batch.size(); ++ p) submit(c, batch[p], p + 1 < batch.size());
             }
         }
         (void)rma.progress(rmaCtx);
