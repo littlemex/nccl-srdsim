@@ -85,6 +85,7 @@ struct OwnerCtx {
 // What the requester's agent reports after the owner's reply landed.
 struct RequesterReport {
     uint64_t landed_token = 0;
+    uint64_t landed_bytes = 0;
     bool landed_called = false;
     uint64_t data_checksum = 0;   // over the whole destination window, so a reply at the wrong offset
                                    // or the wrong length shows up as a mismatch, not a missed check
@@ -128,10 +129,11 @@ bool requester_host_copy(void* dst, const void* src, size_t bytes, void* /*user*
     return true;
 }
 
-void requester_get_landed(uint64_t owner_token, void* user) {
+void requester_get_landed(uint64_t owner_token, uint64_t bytes, void* user) {
     auto* r = static_cast<RequesterReport*>(user);
     r->landed_called = true;
     r->landed_token = owner_token;
+    r->landed_bytes += bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +287,8 @@ void test_get_round_trip() {
           ctx("requester applied %llu placement(s), want 1",
              static_cast<unsigned long long>(req_agent.applied_placements())));
     expect(report.landed_called, "get_response_landed fired on the requester");
+    expect(report.landed_bytes == kFetchBytes, ctx("get_response_landed reported %llu byte(s), want %zu",
+          static_cast<unsigned long long>(report.landed_bytes), kFetchBytes));
     expect(report.landed_token == token, ctx("landed token 0x%llx == 0x%llx",
           static_cast<unsigned long long>(report.landed_token), static_cast<unsigned long long>(token)));
     expect(checksum(dest.data() + kFetchBytes, kFetchBytes) == want_checksum, "fetched bytes landed at the right offset");

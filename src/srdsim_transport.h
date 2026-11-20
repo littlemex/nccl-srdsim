@@ -142,10 +142,11 @@ using DeviceAddFn  = bool (*)(void* dst_u64, uint64_t value, void* user);
 using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length,
                               uint32_t dest_window, uint64_t dest_off, uint32_t requester_rank,
                               uint64_t owner_token, void* user);
-// Called once a GetResponse has actually landed in memory -- not merely been sent, which is all a
-// placement's own completion ever meant -- so the plugin can release the `iflush` request that is
-// fencing on it. `owner_token` is the GetRequest's `op_id`, echoed back unchanged.
-using GetResponseLandedFn = void (*)(uint64_t owner_token, void* user);
+// Called each time a frame of a GetResponse has actually landed in memory -- not merely been sent, which is
+// all a placement's own completion ever meant -- with the bytes it carried, so the plugin can release the
+// `iflush` request that is fencing on the get. A reply of several chunks lands as several frames.
+// `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
+using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
 
 class WindowTable {
 public:
@@ -764,7 +765,7 @@ private:
                           // merely that it was sent -- the distinction `iflush`/`flushAsync` exist for.
                           if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and
                               hooks_.get_response_landed)
-                              hooks_.get_response_landed(h.op_id, conn->user ? conn->user : hooks_.user); }
+                              hooks_.get_response_landed(h.op_id, h.length, conn->user ? conn->user : hooks_.user); }
                 else    failed_writes_.fetch_add(1, std::memory_order_relaxed);
             } else if (h.kind == static_cast<uint32_t>(WireKind::GetRequest)) {
                 // No payload on the wire -- the requester does not have the bytes yet -- so the fetch
