@@ -15,8 +15,6 @@
 //       the GetRequest carried -- unchanged, since the owner never interprets it.
 //   G3  a GetRequest naming a range past the end of its window is refused and the stream survives.
 //   G4  a GetRequest naming a window the receiver never registered is refused and the stream survives.
-//
-// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <cstdarg>
 #include <cstdio>

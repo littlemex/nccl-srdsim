@@ -29,8 +29,6 @@
 //       nobody has watched fail is not a monitor.
 //   L6  memory stays bounded while a receiver is slow but present. A queue is allowed to grow; it is not
 //       allowed to grow without limit while the peer is still draining.
-//
-// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <algorithm>
 #include <atomic>
@@ -418,8 +416,8 @@ std::vector<Case> cases() {
     // Six seconds, not three: the receiver's socket buffer absorbs a few hundred kilobytes before a
     // sender feels anything, and that head start is worth about two seconds here. A blocking descriptor
     // then waits about four seconds inside one progress call, well past the budget, while a
-    // non-blocking one waits about a millisecond. A shorter freeze would leave the blocking case under
-    // the budget, and the case would not tell the two apart.
+    // non-blocking one waits about a millisecond. A freeze of about three seconds would leave the blocking
+    // case under the budget, and the case would not tell the two apart.
     frozen.freeze_ms = 6000;
     // Big enough not to trigger silly-window behaviour, small enough to backpressure. What makes the
     // freeze visible here is the volume above, not the buffer: see the note on Case.

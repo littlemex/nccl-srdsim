@@ -290,7 +290,8 @@ private:
 
 // Never destroyed, like every global that NCCL's threads or the plugin's own touch on the data path. A
 // process that exits without destroying its communicators runs static destructors while those threads still
-// run, so a destroyed `g_where` would be written by NCCL's GIN proxy thread after `exit` had freed it.
+// run, so a destroyed `g_where` would be written by NCCL's GIN proxy thread after `exit` had freed it (a
+// heap-use-after-free under ASan; otherwise glibc's `malloc_consolidate(): unaligned fastbin chunk detected`).
 Checkpoints& g_where = *new Checkpoints;
 
 // Marks a scope, so a thread's breadcrumb says what it is inside rather than what it last finished.
@@ -496,7 +497,7 @@ CUstream device_stream();
 // Device windows, mapped into this process's address space so the CPU can read and write them with
 // ordinary stores.
 //
-// WHY THIS REPLACES THE CUDA COPY
+// WHY A BAR MAPPING, NOT A CUDA COPY
 // While kernels are resident and spinning for data, a host-issued transfer in the same context does not
 // complete, whatever its size, stream, source allocation or pinning: it blocks until the kernel times out,
 // then returns CUDA_ERROR_LAUNCH_FAILED and the context is lost. The kernel waits for bytes the copy would
@@ -506,14 +507,15 @@ CUstream device_stream();
 // write submits nothing to CUDA, so there is nothing for the kernel to be ahead of in a queue.
 //
 // This is also what the backend being simulated does: `aws-ofi-nccl` maps device memory with GDRCopy for
-// exactly this class of write (`src/nccl_ofi_gdrcopy.cpp`). Moving to it makes the emulator more faithful
-// rather than less.
+// exactly this class of write (`src/nccl_ofi_gdrcopy.cpp`). Using it makes the emulator more faithful,
+// not less.
 //
 // WHAT IS PINNED, AND WHEN
 // Everything, once, at registration. `gdr_pin_buffer` commits BAR aperture rather than deferring it to
 // `gdr_map`, so pinning a subrange is the only way to use less -- and pinning on the data path would
-// replace one risky driver operation in the hot path with another. BAR aperture is normally far larger than
-// a window, so there is no reason to be clever.
+// replace one risky driver operation in the hot path with another. This assumes a BAR aperture much larger
+// than the windows (128 GB against a 1.82 GB window on the card this was sized for); where it is not, pin
+// subranges.
 class GdrWindows {
 public:
     // Opened lazily and once. A host without the module gets a single message and the CUDA fallback.
@@ -561,8 +563,7 @@ public:
         // Already mapped ranges are reused rather than pinned again. NCCL registers the same window on
         // more than one communicator, and pinning and mapping it afresh for each registration spends BAR
         // aperture on a range that is already resident, doubles the kernel's bookkeeping, and leaves two host
-        // mappings for one piece of device memory, of which the lookup
-        // can only ever use the first. Nothing good comes of the second one.
+        // mappings for one piece of device memory, of which the lookup can only ever use the first.
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (const Region& existing : regions_) {
@@ -1866,8 +1867,7 @@ thread_local bool t_unsettled = false;
 
 // The agent is about to wait for its next frame. Whatever this thread submitted is waited for now, once per
 // burst rather than once per frame, so no copy into a window is still pending while the link is quiet --
-// which is when an application that skips its teardown frees its windows without deregistering them. Once
-// per burst, so the wait is not visible in end-to-end run time.
+// which is when an application that skips its teardown frees its windows without deregistering them.
 void delivery_idle(void* /*user*/) {
     if (not t_unsettled) return;
     t_unsettled = false;
@@ -2220,7 +2220,8 @@ void prebuild_signal_kernel() {
 
 // A counter written the way a NIC writes one: by DMA, from a value the transport already knows.
 //
-// A kernel would be the unfaithful choice. A NIC does not launch a kernel to increment a counter; it writes
+// This is the default; the kernel in `DeviceAtomicAdd` is used only with SRDSIM_SIGNAL_KERNEL=1, to compare the
+// two. A NIC does not launch a kernel to increment a counter; it writes
 // eight bytes over the bus. Launching a kernel would give the emulator a dependency on GPU compute that no
 // fabric has, and resident kernels (DeepEP's forwarding CTAs, for example) spin while they wait for exactly
 // these counters -- so the emulator would need an SM at the moment the code under test occupies them all,
@@ -2380,8 +2381,8 @@ bool device_add(void* dst_u64, uint64_t value, void* /*user*/) {
 #endif
 
 // Signal counters used two ways. A counter one sender increments both with puts and with bare signals holds two
-// kinds of increment; a receiver that counts it as completions will count the bare ones too. The count records only
-// that the counter is shared, not what the receiver does with it. NCCL lays a signal out at
+// kinds of increment; a receiver that counts it as completions will count the bare ones too. What is recorded is
+// only that the counter is shared, not what the receiver does with it. NCCL lays a signal out at
 // (signalId + contextId * nSignalsPerContext) * 8, so the offset names one counter. Always on: the entries are
 // bounded by the counters this rank signals, and the lookup is taken under the lock `submit` already holds for the
 // signal-window check.
@@ -3394,8 +3395,8 @@ void report_receive_side(CollComm* cc, uint64_t progress_calls) {
 // looked at. So the plugin watches itself -- from `StallMonitor`, on its own thread.
 //
 // A reporter that runs on the thread it is reporting about, such as one inside `rmaProgress`, cannot report
-// the one failure that matters, because a blocked progress call never reaches it. Anything a per-comm
-// function remembers belongs on the comm.
+// the one failure that matters, because a blocked progress call never reaches it. What a per-comm function
+// remembers belongs on the comm, not in a function-local static, which every communicator shares.
 void report_windows_once(CollComm* cc);   // defined below, next to the window bookkeeping
 
 // Records a unit the link refused, where a report and `queryLastError` will find it. NCCL discards what
