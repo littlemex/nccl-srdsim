@@ -48,6 +48,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -2440,12 +2441,15 @@ CrossOverlaps& g_cross = *new CrossOverlaps;
 // entry has no bytes left to land, and `destroyContext` removes the entries of the context it destroys, so
 // a late reply for a destroyed context finds nothing.
 struct GetRecord {
-    RmaCtx* ctx;
+    RmaCtx* ctx;         // null once the context was destroyed with the reply outstanding
     int64_t remaining;   // bytes of the reply that have not landed
 };
+// A leaf lock: nothing else is taken while it is held.
 struct OutstandingGets {
     std::mutex mu;
-    uint64_t next = 1;
+    // Ids start at a random 32-bit epoch, so a reply addressed to another process, or to an earlier run of
+    // this one, does not match a live get by accident.
+    uint64_t next = (static_cast<uint64_t>(std::random_device{}()) << 32) | 1u;
     std::unordered_map<uint64_t, GetRecord> gets;
 };
 OutstandingGets& g_gets = *new OutstandingGets;
@@ -3118,14 +3122,15 @@ ncclResult_t srdsim_destroy_context(void* rmaCtx) {
             it = it->first.first == ctx ? g_snapshots.snaps.erase(it) : std::next(it);
     }
     {
-        // Held across the erase *and* the delete, and matched by the same lock where a reply lands
-        // (`srdsim_handle_get_response_landed`), so a GetResponse already in flight for this context either
-        // finishes before the erase or finds no entry -- never a context that is mid-free.
-        std::lock_guard<std::mutex> g(g_gets.mu);
-        size_t dropped = 0;
-        for (auto it = g_gets.gets.begin(); it != g_gets.gets.end();)
-            if (it->second.ctx == ctx) { it = g_gets.gets.erase(it); ++ dropped; } else ++ it;
-        if (dropped != 0) logf("context %p destroyed with %zu get(s) whose reply had not landed", rmaCtx, dropped);
+        // Its gets are marked aborted, not erased: `test` on one must not report it as landed. After this no
+        // landed hook can reach the context, so it is deleted outside the lock.
+        size_t aborted = 0;
+        {
+            std::lock_guard<std::mutex> g(g_gets.mu);
+            for (auto& entry : g_gets.gets)
+                if (entry.second.ctx == ctx) { entry.second.ctx = nullptr; ++ aborted; }
+        }
+        if (aborted != 0) logf("context %p destroyed with %zu get(s) whose reply had not landed", rmaCtx, aborted);
         delete ctx;
     }
     return ncclSuccess;
@@ -3243,6 +3248,7 @@ ncclResult_t srdsim_iget(void* rmaCtx, int /*context*/, uint64_t remoteOff, void
         *request = r;
         return ncclSuccess;
     }
+    if (dry_run()) return submit(ctx, op, request);   // completes at once and fetches nothing
     // The token the peer echoes back on every frame of the reply: this get's entry in `g_gets`.
     uint64_t id;
     {
@@ -3309,6 +3315,11 @@ void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, voi
         return;
     }
     GetRecord& rec = it->second;
+    if (rec.ctx == nullptr) {
+        logf("a get response for get %llu arrived after its context was destroyed; dropping",
+             static_cast<unsigned long long>(owner_token));
+        return;
+    }
     if (static_cast<int64_t>(bytes) > rec.remaining) {
         logf("get %llu received %llu byte(s) with only %lld outstanding; counting what was outstanding",
              static_cast<unsigned long long>(owner_token), static_cast<unsigned long long>(bytes),
@@ -3377,8 +3388,20 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
         // A get is complete when its reply has landed, which also means its request was sent.
         std::lock_guard<std::mutex> g(g_gets.mu);
         auto it = g_gets.gets.find(r->get_id);
-        complete = it == g_gets.gets.end() or it->second.remaining <= 0;
-        if (complete and it != g_gets.gets.end()) g_gets.gets.erase(it);
+        if (it == g_gets.gets.end()) {
+            logf("test() called on get %llu, which has no entry; refusing", static_cast<unsigned long long>(r->get_id));
+            return ncclInternalError;
+        }
+        if (it->second.ctx == nullptr) {
+            // Its context is gone, so the reply will never be counted. Reported, and finished, so the request
+            // does not stay live forever; its data did not land.
+            logf("get %llu completed without its data: its context was destroyed first",
+                 static_cast<unsigned long long>(r->get_id));
+            complete = true;
+        } else {
+            complete = it->second.remaining <= 0;
+        }
+        if (complete) g_gets.gets.erase(it);
     } else if (not complete) {
         std::lock_guard<std::mutex> g(r->ctx->mu);
         // A flush fences both directions on this context: the scheduler being idle is the put side
