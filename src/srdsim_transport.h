@@ -3,10 +3,9 @@
 // The wire side of the SRD simulator: how a released unit actually lands in the peer's window.
 //
 // WHY THE RECEIVER WRITES, NOT THE SENDER
-// The obvious design has the sender map the peer's window and copy into it. Measured on 2026-09-04,
-// that needs two things the hardware may not give: GPU-to-GPU peer access (absent on the box tested,
-// where P2P access was 0 between every pair) and a cuMem allocation exported across the process
-// boundary (which worked, and is byte-verified). Across hosts the first is impossible in principle.
+// The obvious design has the sender map the peer's window and copy into it. That needs two things the
+// hardware may not give: GPU-to-GPU peer access, which many instances do not have, and a cuMem allocation
+// exported across the process boundary. Across hosts the first is impossible in principle.
 //
 // So the roles are inverted: the sender ships a descriptor and the bytes over a stream, and the
 // **receiving** side's agent writes into its own window. That needs neither peer access nor an
@@ -64,8 +63,7 @@ namespace srdsim {
 // consistent with a thread that died, a thread blocked inside this code, and a report that is itself
 // stale -- three different bugs with three different owners. "no progress call for 104312 ms" is
 // consistent with only the first two, and pairing it with a mark taken on entry to each call
-// separates those. Two rounds of this investigation were spent reading a frozen counter as a
-// scheduler defect when it was a statement about the caller.
+// separates those: a frozen counter is a statement about the caller, not a scheduler defect.
 inline uint64_t mono_ms() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -199,12 +197,9 @@ public:
     // registration order -- so an entry is invalidated rather than erased.
     //
     // Without this the table outlives the memory it describes. NCCL deregisters a window, the allocation
-    // is freed, and a frame still in flight for that id is applied to the old base. Measured under vLLM on
-    // 2026-09-07, from a core file: the worker died in CPython's garbage collector dereferencing
-    // `0x100000001`, which is not a pointer but DeepEP's packed `(finish, tail)` pair -- a scale-out
-    // signalled tail written into freed heap that CPython had since taken for an object header. vLLM
-    // registers fifteen 512 byte host windows and deregisters them during start-up; the two-rank
-    // reproducer never frees a window, which is why it never showed this.
+    // is freed, and a frame still in flight for that id is applied to the old base. For a host window that
+    // base is ordinary heap, so the write corrupts whatever the application allocated there next.
+    // Applications such as vLLM register and deregister host windows during start-up.
     //
     // Waits for every outstanding lease on the window: a write already under way finishes first, and no new
     // one can start.
@@ -301,9 +296,8 @@ inline void ignore_sigpipe_once() {
 
 // Bounded, because every send descriptor is deliberately non-blocking. Retrying EAGAIN with no wait and
 // no limit is a busy spin that never ends if the reader has gone, and the caller holds a per-peer lock
-// while it happens -- so every other thread with work for that peer stops too. Measured: a full socket
-// pair with no reader spun at full CPU indefinitely, and on the loopback link the reader is a thread in
-// this same process that teardown had already stopped.
+// while it happens -- so every other thread with work for that peer stops too. On the loopback link the
+// reader is a thread in this same process, which teardown may already have stopped.
 // How many threads are inside `write_all` right now, and when the oldest of them entered. A blocking
 // write inside a call the caller expects to return promptly is invisible from outside: the counters it
 // would have advanced simply do not advance, which looks exactly like never being called. These two
@@ -517,7 +511,7 @@ public:
     }
 
     // Per-connection counts. Which link stopped is not derivable from the totals, and "one peer went
-    // quiet" and "every peer went quiet" call for different investigations.
+    // quiet" and "every peer went quiet" have different causes.
     struct ConnectionState {
         int fd = -1;
         uint64_t placements = 0;
@@ -675,17 +669,14 @@ private:
             // The length decides how much of the stream belongs to this frame, so it has to be
             // checked before it is used for anything at all -- including for deciding how much to
             // drain. A length no window could hold cannot be trusted to drain either, so the only
-            // safe action is to stop reading this stream. On 2026-09-04 a desynchronised stream
-            // produced a length of 84326656 here and survived only because that happened to be small
-            // enough to allocate.
+            // safe action is to stop reading this stream. A desynchronised stream produces exactly
+            // such a length.
             // The bound is the largest frame this side can *emit*, not the largest window that exists.
-            // Those differ by six orders of magnitude in production: one window is 1.82 GB, so a garbage
-            // length of 800 MB passed as "legitimate", the agent allocated it and waited forever for
-            // bytes that were never coming -- silently, with nothing refused and nothing failed. The
-            // scheduler never emits a placement larger than `chunk_bytes`, and `chunk_bytes` does not
-            // come from the wire, so it is the honest bound. Reasoning from the window size was the
-            // mistake: it is attacker-controlled in effect, because a desynchronised stream produces
-            // arbitrary lengths and only lengths above the bound get caught.
+            // Those can differ by orders of magnitude: a window may be gigabytes, so a garbage length of
+            // hundreds of megabytes would pass a window bound, and the agent would allocate it and wait
+            // forever for bytes that never come. The scheduler never emits a placement larger than
+            // `chunk_bytes`, and `chunk_bytes` does not come from the wire, so it is the honest bound: a
+            // desynchronised stream produces arbitrary lengths, and only lengths above the bound get caught.
             const uint64_t max_frame = max_frame_bytes_;
             if (h.length > max_frame) {
                 char m[220];
@@ -824,8 +815,7 @@ private:
             } else if (h.kind == static_cast<uint32_t>(WireKind::Signal)) {
                 // A signal frame has no payload, so a non-zero length means the stream is no longer
                 // framed and the next header would be read out of somebody's data. There is no
-                // resynchronising from that. It is counted, unlike the silent exits this loop used to
-                // take, and the exhaustive framing model explicitly excluded this case.
+                // resynchronising from that, so the link is closed and the refusal counted.
                 if (h.length != 0) {
                     char m[200];
                     std::snprintf(m, sizeof(m),
@@ -885,8 +875,8 @@ private:
         if (conn) conn->finished.store(true, std::memory_order_release);
         // Out of the table before it is closed. Without this, `fds_` keeps a number the loop has already
         // closed, and a later `stop()` calls `::shutdown` on whatever the operating system has since
-        // handed that number to. Measured: an unrelated socket pair lost a byte that way. The close and
-        // the table entry have to be owned by the same code.
+        // handed that number to, and an unrelated socket loses data. The close and the table entry have
+        // to be owned by the same code.
         forget(fd);
         ::close(fd);
     }
@@ -947,9 +937,7 @@ public:
     // because everything keeps working until it suddenly does not.
     // Discards whatever a peer's outbox still holds, and says how much. Called when a link is replaced or
     // killed: a frame is only meaningful whole, so carrying a partial one into a new connection puts the
-    // remainder of it at the head of the new stream and desynchronises the receiver immediately. Measured:
-    // a rebind left 258,088 bytes of a partial frame queued, and the new connection's first header was
-    // read out of the middle of it.
+    // remainder of it at the head of the new stream and desynchronises the receiver immediately.
     void discard_outbox_locked(int peer) {
         const size_t i = static_cast<size_t>(peer);
         if (i >= outboxes_.size()) return;
@@ -1149,11 +1137,9 @@ public:
             }
             std::lock_guard<std::mutex> sending(*lock);
             // Everything already accepted goes out before the link closes, or this side says how much it
-            // dropped. The bound used to be ten thousand iterations, and `drain_locked` returns
-            // immediately on EAGAIN, so ten thousand of them burned through in under a millisecond -- a
-            // peer that was reading but slower than that lost the rest of its queue, silently. Measured:
-            // 395 of 400 frames discarded with nothing refused and nothing failed. The bound is now time,
-            // and the loop stops early only when it stops making progress.
+            // dropped. The bound is time, not iterations: `drain_locked` returns immediately on EAGAIN, so
+            // an iteration bound expires in under a millisecond and a peer that reads slowly would lose
+            // the rest of its queue silently. The loop stops early only when it stops making progress.
             {
                 const auto started = std::chrono::steady_clock::now();
                 size_t last = pending_bytes(static_cast<int>(i));
@@ -1200,12 +1186,10 @@ public:
 private:
     // Appends a whole frame to the peer's outbox and pushes as much of it as the socket will take.
     //
-    // This never blocks, and that is the point. The first version wrote with a blocking `send`, and it
-    // was called from NCCL's progress callback -- a callback whose contract is to make what progress it
-    // can and return. When a peer stopped reading, the socket filled, the write did not return, and
-    // NCCL's proxy stopped entirely, including the half of it that would have drained the other
-    // direction. The stall report named the exact line: `send_unit: writing a placement to the wire`,
-    // 53 million visits, still inside it.
+    // This never blocks, and that is the point. It is called from NCCL's progress callback, whose contract
+    // is to make what progress it can and return. A blocking write to a peer that stopped reading would
+    // not return, and NCCL's proxy would stop entirely, including the half of it that drains the other
+    // direction.
     //
     // A frame is appended in one piece under the peer's lock, so the stream stays framed and ordered no
     // matter how many threads send or how often the socket refuses bytes.
@@ -1227,10 +1211,8 @@ private:
             // Refused rather than queued once the peer is this far behind, and this is a bound the design
             // needs rather than a tidiness. The outbox exists because the socket may refuse bytes and the
             // caller must not block; with no limit, a peer that stops reading turns that into unbounded
-            // memory. Measured on 2026-09-07: the adversarial suite sends 4 MB frames as fast as it can
-            // into a link with a 4 kB send buffer, and the process died of `std::bad_alloc` -- on Linux,
-            // while passing on macOS, because there the link happened to break sooner. The bound is what
-            // makes that a property of the transport instead of a property of the machine.
+            // memory: the adversarial suite sends 4 MB frames as fast as it can into a link with a 4 kB
+            // send buffer. The bound makes the memory a property of the transport, not of the machine.
             //
             // Refusing is the correct answer rather than dropping. A reliable transport may not lose a
             // frame it accepted, so the release is declined and the scheduler still holds the unit: the

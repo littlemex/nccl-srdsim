@@ -3,16 +3,15 @@
 // Proves the receiver cannot desynchronise, by enumerating every frame sequence it can be given.
 //
 // WHY THIS PROPERTY AND NOT ANOTHER
-// On 2026-09-04 the receiver read a header out of the middle of a payload and reported `unknown window
-// id 84326656`. Nothing crashed; it simply stopped making sense, and it took a day to find because the
-// symptom named a window. The property that rules this out is narrow and checkable:
+// A receiver that loses its place reads a header out of the middle of a payload. Nothing crashes; it
+// reports nonsense such as an unknown window id, which points away from the cause. The property that
+// rules this out is narrow and checkable:
 //
 //   **After the receiver finishes handling any frame, it is either positioned exactly at the start of
 //   the next frame, or the link is closed.** There is no third state.
 //
 // That is a claim about every sequence of frame kinds and outcomes, so it is enumerated rather than
-// sampled. Two hand-written malformed frames -- which is what the transport test has -- cannot answer
-// it, and the sequence that actually broke was not one of the two.
+// sampled. A few hand-written malformed frames, which is what the transport test has, cannot answer it.
 //
 // WHAT THE MODEL ABSTRACTS
 // Bytes are not modelled; positions are. A frame is (kind, whether the window is known, whether the
@@ -27,7 +26,7 @@
 // appears in that list. The range rule is not re-implemented at all: the model calls the shipped
 // function, so that one cannot drift from the other.
 //
-// Build: c++ -std=c++17 -O2 -I layer2 tests/model_srdsim_framing.cpp -o m
+// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <cstdio>
 #include <map>
@@ -207,7 +206,7 @@ int main() {
     for (const auto& b : reached_branches) std::printf("  - %s\n", b.c_str());
 
     // P-FRAME-5: the model's range rule is the implementation's. Checked against the real function for
-    // the boundary values that matter, including the overflowing pair that used to pass.
+    // the boundary values that matter, including an `offset + length` pair that overflows.
     struct RangeCase { uint64_t offset, length; size_t bytes; bool want; const char* why; };
     const RangeCase cases[] = {
         {0, 0, 1024, true, "an empty range at the start fits"},

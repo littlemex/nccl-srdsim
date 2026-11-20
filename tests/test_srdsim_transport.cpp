@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//
-// Tests for the wire side of the SRD simulator (`layer2/srdsim_transport.h`), driven end to end
+// Tests for the wire side of the SRD simulator (`src/srdsim_transport.h`), driven end to end
 // through the scheduler so that what is checked is the combination that will run under NCCL:
 // scheduler decides the order, transport carries it, the receiving agent applies it.
 //
@@ -21,8 +20,7 @@
 //       somewhere arbitrary, and the payload is still drained so the stream stays framed.
 //   T5  a placement that would run past the end of its window is refused, and the stream survives.
 //
-// Build:
-//   c++ -std=c++17 -O2 -I layer2 tests/test_srdsim_transport.cpp -o test_srdsim_transport
+// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <algorithm>
 #include <cstdarg>
@@ -433,17 +431,15 @@ void test_bad_descriptors_are_refused() {
 }   // namespace
 
 
-// T7. The four losses an independent audit reproduced, each with the measurement that found it.
-//
-// Every one of these passed silently before: nothing refused, no failed write, an empty send queue, and
-// a receiver that had applied a fraction of what was sent. The counters said the run was healthy.
+// T7. Four ways to lose data silently: nothing refused, no failed write, an empty send queue, and a
+// receiver that has applied a fraction of what was sent, so the counters say the run is healthy.
 void test_the_four_silent_losses() {
     // T7a. A wire length below the largest window but far above any frame this transport emits must be
-    // refused. The bound used to be the largest registered window, which in production is 1.82 GB, so a
-    // garbage length of hundreds of megabytes was judged legitimate, allocated, and waited for forever.
+    // refused. Bounded by the largest registered window, which can be gigabytes, a garbage length of hundreds
+    // of megabytes would be judged legitimate, allocated, and waited for forever.
     {
-        // The declared size is production's: 1.82 GB. Nothing reads it, and nothing may -- the point is
-        // that the *old* bound was this number, so it accepted a garbage length of hundreds of megabytes.
+        // The declared size is a large production window, 1.82 GB. Nothing reads it, and nothing may -- the
+        // point is that a window bound would accept a garbage length of hundreds of megabytes.
         // A one-megabyte window would have been refused either way and the check would prove nothing.
         std::vector<char> big(1 << 20, 0);
         srdsim::WindowTable windows;
@@ -480,14 +476,11 @@ void test_the_four_silent_losses() {
         agent.stop();
     }
 
-    // T7b. Teardown either delivers the queue or says how much it dropped. The bound used to be ten
-    // thousand iterations of a loop that returns immediately on EAGAIN, so it expired in under a
-    // millisecond and 395 of 400 frames were discarded with no counter recording it.
+    // T7b. Teardown either delivers the queue or says how much it dropped.
     {
-        // A reader that is present but slow. That is the case the old bound got wrong: ten thousand
-        // iterations of a loop that returns immediately on EAGAIN expire in under a millisecond, so a peer
-        // reading slower than that lost the rest of its queue with no counter recording it. Measured by an
-        // audit: 395 of 400 frames discarded, nothing refused, nothing failed.
+        // A reader that is present but slow. A bound counted in iterations of a loop that returns at once
+        // on EAGAIN expires in under a millisecond, so a peer reading slower than that would lose the rest
+        // of its queue with no counter recording it.
         std::vector<char> data(1 << 22, 0);
         srdsim::WindowTable windows;
         windows.add({data.data(), data.size(), false});
@@ -513,8 +506,8 @@ void test_the_four_silent_losses() {
             links.send_placement(0, 0, 0, chunk.data(), chunk.size(), uint64_t(i) + 1);
         expect(links.pending_bytes(0) > 0, "T7b the queue really is backed up before teardown");
 
-        // Only now is there a reader, so what teardown does with a queue that already exists is what is
-        // being measured.
+        // Only now is there a reader, so what is checked is what teardown does with a queue that already
+        // exists.
         expect(agent.serve(sv[1]), "T7b the agent serves the connection");
         links.shutdown_all();
         for (int i = 0; i < 400 and agent.applied_placements() < kFrames; ++ i)
@@ -579,9 +572,9 @@ void test_the_four_silent_losses() {
 
 // T8. A finished connection's descriptor leaves the agent's table before it is closed.
 //
-// The loop closed the descriptor and left the number in `fds_`, so a later `stop()` called `::shutdown`
-// on whatever the operating system had since handed that number to. An audit measured an unrelated socket
-// pair losing a byte that way. In the plugin the candidates for that number are live send links and the
+// A loop that closes the descriptor and leaves the number in `fds_` makes a later `stop()` call `::shutdown`
+// on whatever the operating system has since handed that number to, and an unrelated socket loses data. In
+// the plugin the candidates for that number are live send links and the
 // loopback pair, so the consequence is a send link dying mid-run with nothing refused anywhere.
 void test_a_finished_connection_releases_its_number() {
     std::vector<char> data(1 << 16, 0);
@@ -667,13 +660,9 @@ void test_a_peer_that_stopped_reading_is_refused_not_queued() {
 
 // T10. A frame for a window that was deregistered is refused, not applied to its old base.
 //
-// This is the defect a core file named under vLLM. The table kept an entry after `deregMrSym`, so a frame
-// still in flight resolved to a freed allocation and was written into it. For a host window that
-// allocation is ordinary heap: the worker died in CPython's garbage collector dereferencing
-// `0x100000001` -- not a pointer but DeepEP's packed `(finish, tail)` pair, sitting where an object header
-// belonged. The write and the crash were far apart, which is why nothing in the backtrace pointed here.
-//
-// The reproducer never frees a window, so only vLLM could show it. Enumerated here instead.
+// A table that keeps an entry after `deregMrSym` resolves a frame still in flight to a freed allocation and
+// writes into it. For a host window that allocation is ordinary heap, so the write corrupts whatever the
+// application allocated there next, and the crash it causes happens far from the write.
 void test_a_deregistered_window_is_refused_not_written() {
     // Two windows so the check is about the retired one and not about an empty table.
     std::vector<char> keep(256, 0);
@@ -732,8 +721,8 @@ void test_a_deregistered_window_is_refused_not_written() {
 // T11. Deregistration waits for a write that is already under way.
 //
 // T10 covers a frame that arrives after the window is gone. This covers the one that was being applied when
-// it went: the lookup and the write used to be two steps with nothing tying them to deregistration, so a
-// write that had looked the window up could land after NCCL freed it. The device hook is held open here to
+// it went: if the lookup and the write were two steps with nothing tying them to deregistration, a write
+// that had looked the window up could land after NCCL freed it. The device hook is held open here to
 // stand for a copy that has not been issued yet, and `retire` must not return until it is released.
 void test_deregistration_waits_for_a_write_under_way() {
     std::vector<char> mem(256, 0);

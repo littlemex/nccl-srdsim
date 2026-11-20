@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The two pieces of arithmetic that vLLM found and the suite did not.
+// The two pieces of arithmetic in `src/srdsim_mapping.h`: the offset of a window within its first page,
+// and the staging slot a thread claims.
 //
-// Both defects were in code that only compiles with `gdrapi.h` and only runs where `/dev/gdrdrv` exists,
-// so the suite could not reach them; and both were invisible to the reproducer for a structural reason
-// rather than by luck. The reproducer registers only page-aligned windows, so the lead offset was always
-// zero. It runs three threads, so the last staging slot was never claimed. Neither fact is a property of
-// the code -- they are properties of one harness -- and a test that depends on them is not a test.
-//
-// So these cases are enumerated: every slot rather than the ones a small run reaches, and lead offsets
-// across a page rather than the one value an aligned allocation gives.
+// The code that uses them only compiles with `gdrapi.h` and only runs where `/dev/gdrdrv` exists, and a
+// small run reaches few of their values: page-aligned windows always have a lead offset of zero, and a few
+// threads never claim the last slot. So the cases are enumerated: every slot, and lead offsets across a
+// page.
 
 #include "srdsim_mapping.h"
 

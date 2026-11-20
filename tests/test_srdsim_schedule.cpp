@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Tests for the SRD simulator's delivery scheduler (`layer2/srdsim_schedule.h`).
+// Tests for the SRD simulator's delivery scheduler (`src/srdsim_schedule.h`).
 //
 // The scheduler is the component whose bugs would fabricate failures that no real fabric can
 // produce. A simulator that cries wolf is worse than none, so its own properties are checked
@@ -21,8 +21,7 @@
 //   S6  an operation larger than the modelled single-write size is refused rather than silently
 //       mismodelled.
 //
-// Build:
-//   c++ -std=c++17 -O2 -I layer2 tests/test_srdsim_schedule.cpp -o test_srdsim_schedule
+// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <algorithm>
 #include <cstdarg>
@@ -30,9 +29,8 @@
 #include <cstring>
 #include <map>
 #include <set>
-// Named explicitly rather than picked up through another header. clang provides these transitively and
-// GCC does not, so a file that compiles locally can fail on the target twelve minutes later -- which has
-// now happened twice in this project, first with <cstdarg>.
+// Named explicitly rather than picked up through another header: clang provides these transitively and
+// GCC does not.
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -306,10 +304,9 @@ void test_oversized_is_refused() {
 
 // S7. Each schedule does what its name says.
 //
-// A mode whose constraint is not checked is a knob that may be wired to nothing -- which has already
-// happened once in this project, to an impairment that was declared and never connected, and the two
-// tests that depended on it passed without exercising anything. Every mode added here gets the check
-// that distinguishes it from `srd`.
+// A mode whose constraint is not checked is a knob that may be wired to nothing, and the tests that depend
+// on it then pass without exercising anything. Every mode added here gets the check that distinguishes it
+// from `srd`.
 void test_each_schedule_keeps_its_promise() {
     struct Event { uint64_t op; bool is_signal; int peer; };
 
@@ -548,13 +545,11 @@ void test_driven_like_the_plugin() {
 }
 
 
-// S10. The id contract, and the two stalls that came of not having one.
+// S10. The id contract: an id is non-zero and unique.
 //
-// The id is the key `complete()` answers by and the key `defer-one` selects by, and neither uniqueness nor
-// non-zero-ness was checked. An audit measured both consequences: two operations numbered zero starve every
-// operation in `defer-one` and stall permanently with ops == chunks == signals and no refusal anywhere --
-// the exact shape a real run reported -- and two operations sharing a non-zero id sent `pick()` into
-// unbounded recursion until the stack ran out.
+// The id is the key `complete()` answers by and the key `defer-one` selects by. Without the check, two
+// operations numbered zero starve every operation in `defer-one` and stall permanently with no refusal
+// anywhere, and two operations sharing a non-zero id send `pick()` into unbounded recursion.
 void test_the_id_contract() {
     Fabric f(1 << 16, 8);
     const auto scheduler = [&](srdsim::Mode mode) {
@@ -579,7 +574,7 @@ void test_the_id_contract() {
         expect(not s.submit(make_op(7, f, 2048, 2048, 1), &why),
                "S10 a second operation with the same id is refused while the first is pending");
     }
-    // And `defer-one` terminates and drains even when the caller tries the shapes that used to break it.
+    // And `defer-one` terminates and drains even when the caller submits zero or repeated ids.
     {
         auto s = scheduler(srdsim::Mode::DeferOne);
         std::string why;
