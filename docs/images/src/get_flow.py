@@ -13,7 +13,7 @@ def draw(L):
     f.line(910, 116, 910, 440, dash=True)
     rows = [
         (150, True, L.t("iget: a GetRequest unit, released like any unit", "iget: GetRequest のユニット。ほかと同じくリリースする")),
-        (215, None, L.t("submit the reply on its own first RMA context", "自分の最初の RMA コンテキストで応答を投入る")),
+        (215, None, L.t("submit the reply on its own first RMA context", "自分の最初の RMA コンテキストで応答を投入する")),
         (280, None, L.t("its rmaProgress releases the reply in chunks", "自分の rmaProgress が応答をチャンクでリリースする")),
         (345, False, L.t("GetResponse chunks, reordered like any put", "GetResponse のチャンク。put と同じく入れ替わる")),
         (410, None, L.t("each chunk applied is counted; iflush waits for all", "反映したチャンクを数え、iflush はすべてを待つ")),
@@ -30,6 +30,6 @@ def draw(L):
             anchor = "end" if i in (1, 2) else "start"
             x = 890 if i in (1, 2) else 210
             f.text(x, y + 5, label, size=13, anchor=anchor)
-    f.text(550, 462, L.t("a get is locally complete once its request is sent", "get は、要求を送った時点で送り手として完了になる"),
+    f.text(550, 462, L.t("a get is locally complete once its request is sent", "get は、要求を送った時点でローカル完了になる"),
            size=12, color="#555555")
     return f

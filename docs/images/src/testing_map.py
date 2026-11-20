@@ -10,8 +10,8 @@ def draw(L):
     rows = [("test_srdsim_schedule", [0]), ("model_srdsim_schedule_exhaustive", [0]),
             ("test_srdsim_transport", [1]), ("model_srdsim_framing", [1]), ("test_srdsim_adversarial", [0, 1]),
             ("test_srdsim_async", [2]), ("test_srdsim_get", [1]), ("test_srdsim_mapping", [3]),
-            ("test_srdsim_liveness", [0, 1]), (L.t("CI: plugin builds and exports", "CI: プラグインのビルドと公開"), [4]),
-            (L.t("tests/gpu (on a GPU, by hand)", "tests/gpu (GPU で、手で走らせる)"), [4])]
+            ("test_srdsim_liveness", [0, 1]), (L.t("CI: plugin builds and exports", "CI: プラグインのビルドとエクスポート"), [4]),
+            (L.t("tests/gpu (on a GPU, by hand)", "tests/gpu (GPU で手動で実行する)"), [4])]
     f = Fig(1100, 120 + 38 * len(rows), L, L.t("What each test exercises", "どのテストが何を確かめるか"))
     x0, cw, y0 = 420, 130, 70
     for j, c in enumerate(cols):
@@ -26,6 +26,6 @@ def draw(L):
                 f.mark(x0 + j * cw + cw / 2, y + 19, True)
     yb = y0 + 20 + len(rows) * 38 + 22
     f.text(30, yb, L.t("Host tests run on every pull request, also under ASan, UBSan and TSan; the GPU test is run by hand.",
-                       "ホストのテストはプルリクエストのたびに走り、ASan、UBSan、TSan の下でも走る。GPU のテストは手で走らせる。"),
+                       "ホストのテストはプルリクエストのたびに走り、ASan、UBSan、TSan の下でも走る。GPU のテストは手動で実行する。"),
            size=12, anchor="start", color="#555555")
     return f

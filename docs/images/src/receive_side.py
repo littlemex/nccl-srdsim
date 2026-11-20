@@ -7,7 +7,7 @@ NAME = "receive-side"
 def draw(L):
     f = Fig(1100, 480, L, L.t("The receive side: the target writes into its own memory",
                                "受信側: 宛先ランクが自分のメモリに書く"))
-    f.box(30, 70, 270, 64, L.t("Peer stream (TCP)", "相手からの接続 (TCP)"), "wire",
+    f.box(30, 70, 270, 64, L.t("Inbound stream (TCP)", "受信接続 (TCP)"), "wire",
           L.t("frames in release order", "リリースした順のフレーム"))
     f.box(400, 70, 300, 64, L.t("Read the frame header", "フレームのヘッダを読む"), "wire",
           L.t("placement, signal, get", "配置、シグナル、get"))
@@ -18,7 +18,7 @@ def draw(L):
     f.box(30, 330, 300, 70, L.t("Host window", "ホストのウィンドウ"), "target", "memcpy")
     f.box(400, 330, 300, 70, L.t("Device window", "デバイスのウィンドウ"), "target",
           L.t("CUDA copy or GDRCopy", "CUDA のコピーか GDRCopy"))
-    f.box(770, 330, 300, 70, L.t("Signal word", "シグナルの値"), "sig",
+    f.box(770, 330, 300, 70, L.t("Signal word", "シグナルワード"), "sig",
           [L.t("host: atomic add, memory_order_release", "ホスト: atomic な加算 (memory_order_release)"),
            L.t("device: a store of the running total", "デバイス: 合計値の書き込み")])
     f.arrow(300, 102, 398, 102)
@@ -31,7 +31,7 @@ def draw(L):
     f.arrow(398, 227, 230, 227, colour="#D55E00", dash=True)
     f.text(225, 210, L.t("refused: the frame is skipped;", "断る: そのフレームを飛ばす。"), size=12, anchor="end", color="#D55E00")
     f.text(225, 226, L.t("if skipping would lose the next", "飛ばすと次のフレームの位置を"), size=12, anchor="end", color="#D55E00")
-    f.text(225, 242, L.t("frame, the link is closed", "失うときは、接続を閉じる"), size=12, anchor="end", color="#D55E00")
+    f.text(225, 242, L.t("frame, the stream is closed", "失うときは、接続を閉じる"), size=12, anchor="end", color="#D55E00")
     f.text(550, 455, L.t("A unit names a window by number, not by address.",
                          "ユニットはウィンドウを、アドレスではなく番号で指す。"),
            size=13, italic=True)

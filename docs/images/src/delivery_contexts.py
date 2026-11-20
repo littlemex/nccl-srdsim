@@ -8,10 +8,10 @@ def draw(L):
     f = Fig(1100, 470, L, L.t("Four ways to write a device window, and what each waits behind",
                                "デバイスのウィンドウへの 4 つの書き方と、それぞれが何の後ろで待つか"))
     cols = [
-        (L.t("own context", "専用のコンテキスト"), L.t("(default)", "(既定)"), "sim",
+        (L.t("own CUDA context", "専用の CUDA コンテキスト"), L.t("(default)", "(既定)"), "sim",
          [L.t("CUDA copy from a", "プラグインが作った"), L.t("context the plugin made", "コンテキストからのコピー")],
          L.t("VMM windows (ncclMemAlloc)", "VMM のウィンドウ (ncclMemAlloc)"),
-         [(True, L.t("not the app's module loads", "モジュールの読み込みを待たない"))]),
+         [(True, L.t("no wait for module loads", "モジュールの読み込みを待たない")), (False, L.t("waits for a time slice", "タイムスライスを待つ (遅い)"))]),
         ("primary", "SRDSIM_DELIVERY_CONTEXT", "neutral",
          [L.t("CUDA copy from the", "デバイスの primary"), L.t("primary context", "context からのコピー")],
          L.t("any allocation", "どんな確保でもよい"),

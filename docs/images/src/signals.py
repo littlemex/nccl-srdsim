@@ -32,11 +32,11 @@ def draw(L):
     f.group(740, 55, 340, 440, L.t("strong signal", "強いシグナル"), "sig")
     for k, (u, role) in enumerate([("A", "nccl"), ("B", "wire"), ("S!", "sig")]):
         f.cell(775 + k * 95, 110, 80, 42, u, role, size=15)
-    f.text(910, 185, L.t("S! is held on its context and peer", "S! は同じコンテキストと相手で"), size=13)
+    f.text(910, 185, L.t("S! is held on its RMA context and target", "S! は同じ RMA コンテキストと宛先ランクで"), size=13)
     f.text(910, 205, L.t("until A and B are released", "A と B をリリースするまで待たされる"), size=13)
     f.text(910, 260, L.t("SRD has no strong signal,", "SRD に強いシグナルは無いが、"), size=13)
-    f.text(910, 280, L.t("but refusing one would stop", "断ると NCCL の GIN の進行"), size=13)
-    f.text(910, 300, L.t("NCCL's GIN progress thread", "スレッドが止まってしまう"), size=13)
+    f.text(910, 280, L.t("but refusing one would stop", "断ると NCCL の GIN プロキシの"), size=13)
+    f.text(910, 300, L.t("NCCL's GIN proxy thread", "スレッドが止まってしまう"), size=13)
     f.text(910, 350, L.t("the value added: the signal's value", "足す値: ADD 指定ならシグナルの値、"), size=12, color="#555555")
     f.text(910, 368, L.t("for NCCL_GIN_SIGNAL_OP_ADD, else 1", "それ以外は 1"), size=12, color="#555555")
     return f

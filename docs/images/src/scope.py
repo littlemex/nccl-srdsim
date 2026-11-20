@@ -8,7 +8,7 @@ def draw(L):
     f = Fig(1100, 430, L, L.t("What the simulator reproduces, and what it does not", "シミュレータが再現するものと、しないもの"))
     f.group(20, 55, 520, 350, L.t("reproduced", "再現する"), "sim")
     inside = [L.t("RMA through NCCL's GIN proxy backend", "NCCL の GIN プロキシバックエンドを通る RMA"),
-              L.t("contract-legal orders among pending operations", "保留中の操作の、契約が許す順番"),
+              L.t("contract-legal orders among pending operations", "未リリースの操作の、契約が許す順番"),
               L.t("orders that break it on purpose (violate-i1)", "わざと契約を破る順番 (violate-i1)"),
               L.t("puts, signals, strong signals and gets", "put、シグナル、強いシグナル、get"),
               L.t("host and device windows", "ホストとデバイスのウィンドウ")]

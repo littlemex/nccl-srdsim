@@ -10,7 +10,7 @@ def draw(L):
           [L.t("op table, connections, windows,", "関数テーブル、接続、ウィンドウ、"),
            L.t("device delivery, completion", "デバイスへの配送、完了")])
     heads = [("srdsim_schedule.h", L.t("order of release", "リリースする順番")),
-             ("srdsim_transport.h", L.t("frames, receive agent", "フレーム、受け取り")),
+             ("srdsim_transport.h", L.t("frames, receiving agent", "フレーム、受信エージェント")),
              ("srdsim_async.h", L.t("send queue", "送信キュー")),
              ("srdsim_mapping.h", L.t("BAR arithmetic", "BAR の計算"))]
     for i, (name, sub) in enumerate(heads):
