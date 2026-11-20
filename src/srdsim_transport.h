@@ -1212,8 +1212,8 @@ private:
             // Refused rather than queued once the peer is this far behind, and this is a bound the design
             // needs rather than a tidiness. The outbox exists because the socket may refuse bytes and the
             // caller must not block; with no limit, a peer that stops reading turns that into unbounded
-            // memory, and the process dies of `std::bad_alloc` (the adversarial suite provokes this with
-            // 4 MB frames into a 4 kB send buffer). With the bound, the outcome does not depend on how soon
+            // memory and eventually `std::bad_alloc`. The adversarial suite creates the condition: 4 MB
+            // frames into a 4 kB send buffer. With the bound, the outcome does not depend on how soon
             // the platform breaks the link.
             //
             // Refusing is the correct answer rather than dropping. A reliable transport may not lose a

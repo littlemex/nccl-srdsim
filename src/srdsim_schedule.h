@@ -519,11 +519,9 @@ private:
                 break;                   // never look past the oldest operation
         }
         if (options.empty()) {
-            // The deferred operation is the only thing left, so stop deferring it. Without this the
-            // scheduler would report itself idle with work outstanding, which is the one thing a
-            // scheduler must never do.
-            // Stop deferring and look once more, iteratively rather than by recursion, so that no
-            // sequence of ids can make it re-choose the same operation without bound.
+            // The deferred operation is the only thing left: stop deferring it and look once more, in a
+            // loop rather than by recursion, so the scheduler never reports itself idle with work
+            // outstanding and no sequence of ids can make it re-choose the same operation without bound.
             if (opt_.mode == Mode::DeferOne and have_deferred_) {
                 have_deferred_ = false;
                 deferred_id_ = 0;

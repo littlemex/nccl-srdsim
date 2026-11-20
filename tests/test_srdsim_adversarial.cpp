@@ -6,8 +6,6 @@
 // sender would never send, because that is where a simulator earns its keep: a fabric emulator that
 // crashes on a malformed frame cannot be used to investigate a crash.
 //
-// Each case states the property it checks: what the transport promises, not what the code happens to do.
-//
 //   A1  A frame whose length is enormous is refused without allocating it, the link is closed, and the
 //       process survives. A desynchronised stream can produce such a length.
 //   A2  `offset + length` overflowing 64 bits does not pass the bounds check.
@@ -26,8 +24,6 @@
 //       and a desynchronised receiver reports refusals.
 //
 // Not here: the correctness of a signal update in device memory, which needs a GPU.
-//
-// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <atomic>
 #include <chrono>

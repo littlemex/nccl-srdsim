@@ -19,8 +19,6 @@
 //   T4  a window id the receiver does not know is reported and skipped rather than writing
 //       somewhere arbitrary, and the payload is still drained so the stream stays framed.
 //   T5  a placement that would run past the end of its window is refused, and the stream survives.
-//
-// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <algorithm>
 #include <cstdarg>

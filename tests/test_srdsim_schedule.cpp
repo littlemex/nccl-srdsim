@@ -20,8 +20,6 @@
 //       reaches every permutation of a small case.
 //   S6  an operation larger than the modelled single-write size is refused rather than silently
 //       mismodelled.
-//
-// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <algorithm>
 #include <cstdarg>
@@ -547,9 +545,8 @@ void test_driven_like_the_plugin() {
 
 // S10. The id contract: an id is non-zero and unique.
 //
-// The id is the key `complete()` answers by and the key `defer-one` selects by. Without the check, two
-// operations numbered zero starve every operation in `defer-one` and stall permanently with no refusal
-// anywhere, and two operations sharing a non-zero id send `pick()` into unbounded recursion.
+// The id is the key `complete()` answers by and the key `defer-one` selects by, so `submit` refuses an id
+// that is zero or already pending.
 void test_the_id_contract() {
     Fabric f(1 << 16, 8);
     const auto scheduler = [&](srdsim::Mode mode) {
@@ -574,7 +571,7 @@ void test_the_id_contract() {
         expect(not s.submit(make_op(7, f, 2048, 2048, 1), &why),
                "S10 a second operation with the same id is refused while the first is pending");
     }
-    // And `defer-one` terminates and drains.
+    // `defer-one` releases six operations with ids 1 to 6 and empties, without stalling or looping.
     {
         auto s = scheduler(srdsim::Mode::DeferOne);
         std::string why;

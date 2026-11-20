@@ -25,8 +25,6 @@
 // those names were reached. A branch added to the loop and not here shows up as a name that never
 // appears in that list. The range rule is not re-implemented at all: the model calls the shipped
 // function, so that one cannot drift from the other.
-//
-// Built and run by CTest: cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 #include <cstdio>
 #include <map>
