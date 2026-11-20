@@ -2220,9 +2220,8 @@ void prebuild_signal_kernel() {
 
 // A counter written the way a NIC writes one: by DMA, from a value the transport already knows.
 //
-// This is the default; the kernel in `DeviceAtomicAdd` is used only with SRDSIM_SIGNAL_KERNEL=1, to compare the
-// two. A NIC does not launch a kernel to increment a counter; it writes
-// eight bytes over the bus. Launching a kernel would give the emulator a dependency on GPU compute that no
+// This is the default; the kernel in `DeviceAtomicAdd` is used only with SRDSIM_SIGNAL_KERNEL=1, so that the
+// two can be compared. A NIC does not launch a kernel to increment a counter; it writes eight bytes over the bus. Launching a kernel would give the emulator a dependency on GPU compute that no
 // fabric has, and resident kernels (DeepEP's forwarding CTAs, for example) spin while they wait for exactly
 // these counters -- so the emulator would need an SM at the moment the code under test occupies them all,
 // and whether a run completes would depend on how many SMs the application leaves free.
@@ -2743,8 +2742,8 @@ public:
 
     // Called before a communicator is destroyed. Without it the monitor keeps a raw pointer and goes on
     // dereferencing `cc->agent`, `cc->links` and `cc->rma_contexts` every half second after `closeColl`
-    // has deleted it, and a monitor reading freed memory can print anything. The monitor watches a comm
-    // only when logging is on, so the hazard is invisible otherwise. `connect` watches the comm before a
+    // has deleted it, and a monitor reading freed memory can print anything. The monitor is armed only
+    // when logging is on, so the hazard exists only in that configuration. `connect` watches the comm before a
     // dial can fail and delete it, so that path calls this too.
     void unwatch(CollComm* cc) {
         std::lock_guard<std::mutex> g(mu_);

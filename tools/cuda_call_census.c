@@ -24,8 +24,8 @@
 // WHY THERE IS ALSO A CUPTI FRONT END
 // The shim sees only callers that link libcuda's exported symbols. The CUDA runtime -- inside PyTorch and
 // NCCL -- does not: it obtains every driver entry point through `cuGetProcAddress`, and intercepting that
-// lookup breaks PyTorch ("context is destroyed"), because the runtime asks the lookup for itself
-// and depends on what comes back. So a count of calls in flight from the shim alone is a lower bound. Built
+// lookup breaks PyTorch ("context is destroyed"), because the runtime asks the lookup for itself and depends
+// on what comes back. So a count of calls in flight from the shim alone is a lower bound. Built
 // with -DCENSUS_WITH_CUPTI and loaded through CUDA_INJECTION64_PATH, the same census is fed by CUPTI's
 // driver-API callbacks instead, which the driver raises for every call whoever made it. The two
 // front ends are alternatives: load the library one way or the other, not both.
