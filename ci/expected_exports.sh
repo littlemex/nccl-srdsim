@@ -2,22 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # ci/expected_exports.sh NCCL_SRC
 # Prints the op-table symbols the plugin must export for this NCCL release: ncclRmaPlugin_vN for every
-# RMA table version N >= 14 whose header the release ships (src/include/plugin/rma/rma_vN.h), except
-# those listed in RMA_TABLES_NOT_EXPORTED in versions.env. Prints those listed ones, prefixed with "!",
-# so the caller can check they are still absent.
+# RMA table version N >= RMA_TABLE_MIN whose header the release ships (src/include/plugin/rma/rma_vN.h),
+# except those in RMA_TABLES_NOT_EXPORTED, which it prints prefixed with "!" so the caller can check
+# they are absent. The headers stand in for NCCL's lookup list (src/plugin/rma.cc), which tries each
+# version it defines, newest first.
 set -euo pipefail
+shopt -s nullglob
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck disable=SC1091
 . "$ROOT/versions.env"
 src="${1:?usage: $0 NCCL_SRC}"
-found=0
+out=()
 for h in "$src"/src/include/plugin/rma/rma_v*.h; do
-    n=$(basename "$h" .h); n=${n#rma_v}
-    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 14 ] || continue
-    found=1
+    n=${h##*/rma_v}; n=${n%.h}
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge "$RMA_TABLE_MIN" ] || continue
     case " $RMA_TABLES_NOT_EXPORTED " in
-        *" $n "*) echo "!ncclRmaPlugin_v$n" ;;
-        *) echo "ncclRmaPlugin_v$n" ;;
+        *" $n "*) out+=("!ncclRmaPlugin_v$n") ;;
+        *) out+=("ncclRmaPlugin_v$n") ;;
     esac
-done | sort -t v -k2 -n
-[ -n "$(ls "$src"/src/include/plugin/rma/rma_v*.h 2>/dev/null)" ] || { echo "no RMA table headers under $src" >&2; exit 1; }
+done
+(( ${#out[@]} )) || { echo "no rma_vN.h with N >= $RMA_TABLE_MIN under $src/src/include/plugin/rma" >&2; exit 1; }
+printf '%s\n' "${out[@]}" | sort -t v -k2 -n

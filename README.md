@@ -41,20 +41,20 @@ The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specifica
 | To | Needs |
 |---|---|
 | Run the host tests | A C++17 compiler and CMake 3.20 or later |
-| Build the plugin | The plugin headers of NCCL 2.31.2 to 2.32.6 (from an NCCL source checkout, see below) and the CUDA toolkit, whose headers `nccl.h` includes; NVRTC for delivery into device memory; optionally GDRCopy. Built in CI against CUDA 12.8 and 13.0 |
-| Run the plugin | An NVIDIA GPU, NCCL 2.31.2 or later, and the CUDA driver. A build with the CUDA delivery path also loads the NVRTC runtime of the CUDA version it was built with, and a GDRCopy build loads `libgdrapi.so`; if either cannot be found, the plugin does not load |
+| Build the plugin | The plugin headers of NCCL 2.31.2 to 2.32.6 (from an NCCL source checkout, see below) and the CUDA toolkit, whose headers `nccl.h` includes; NVRTC for delivery into device memory; optionally GDRCopy. Built in CI against the CUDA toolkits in `versions.env` |
+| Run the plugin | An NVIDIA GPU, an NCCL release from the table in [NCCL versions](#nccl-versions), and the CUDA driver. A build with the CUDA delivery path also loads the NVRTC runtime of the CUDA version it was built with, and a GDRCopy build loads `libgdrapi.so`; if either cannot be found, the plugin does not load |
 
 ## NCCL versions
 
-NCCL looks up the newest op-table version it knows (`ncclRmaPlugin_vN`) and uses only that one, so one build serves several NCCL releases. Built against the newest supported headers, the plugin exports `ncclRmaPlugin_v14`, `ncclRmaPlugin_v15` and `ncclRmaPlugin_v16`:
+NCCL tries `ncclRmaPlugin_vN` from the newest version it knows downwards and uses the first the plugin exports, so one build serves several NCCL releases. Built against the newest supported headers, the plugin exports `ncclRmaPlugin_v14`, `ncclRmaPlugin_v15` and `ncclRmaPlugin_v16`:
 
-| NCCL release | Table it loads from this plugin |
+| NCCL release | Table it looks up first and finds in this plugin |
 |---|---|
 | 2.31.2 | v15 |
 | 2.32.3 | v16 |
 | 2.32.6 | v16 (2.32.6 also defines v17, which the plugin does not export yet: [#13](https://github.com/littlemex/nccl-srdsim/issues/13)) |
 
-Every upstream version the repository builds and tests against (NCCL releases and their commits, CUDA toolkits, GDRCopy, the reference aws-ofi-nccl commit) is pinned in [`versions.env`](versions.env); CI reads it and fails when a document or workflow names any other.
+Every upstream version the repository builds and tests against (NCCL releases and their commits, CUDA toolkits, GDRCopy, the reference aws-ofi-nccl commit) is pinned in [`versions.env`](versions.env), which CI and the GPU recipe read. CI fails when a document, workflow or script names a full commit hash, an NCCL release tag, an NCCL version written as `NCCL x.y.z`, or an NCCL wheel version that `versions.env` does not pin.
 
 ## Build
 

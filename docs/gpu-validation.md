@@ -111,23 +111,13 @@ The test program's exit status, which the verdict is built from:
 
 ## Run
 
-The commands below install the NCCL 2.32.6 library from its Python wheel, fetch the NCCL source for the plugin's build headers, build the plugin, compile the test against the wheel's NCCL, and run every mode with 3 ranks and 5 seeds. The last step takes about 75 seconds.
+`tests/gpu/recipe.sh` takes every version from `versions.env`. It installs the pinned NCCL wheel (2.32.6), fetches the pinned NCCL source for the plugin's build headers and checks its commit, builds the plugin, compiles the test against the wheel's NCCL, and runs every mode with 3 ranks and 5 seeds; any failing step stops it. The run takes about 75 seconds after the build.
 
 ```bash
 export PATH=/usr/local/cuda/bin:$PATH
 git clone https://github.com/littlemex/nccl-srdsim.git
 cd nccl-srdsim
-. ./versions.env
-python3 -m venv .venv
-.venv/bin/pip install -q "nvidia-nccl-cu13==$NCCL_WHEEL"
-export NCCL_ROOT=$(.venv/bin/python -c 'import nvidia.nccl as m; print(list(m.__path__)[0])')
-git clone --quiet --depth 1 --branch "$NCCL_DEFAULT" https://github.com/NVIDIA/nccl.git .nccl-src
-test "$(git -C .nccl-src rev-parse HEAD)" = "$NCCL_DEFAULT_COMMIT"
-NCCL_SRC=$PWD/.nccl-src ./scripts/prepare_nccl_headers.sh "$PWD/.inc"
-cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DNCCL_PLUGIN_INCLUDE_DIRS="$PWD/.inc/nccl"
-cmake --build build -j
-nvcc -std=c++17 -arch=native -I "$NCCL_ROOT/include" tests/gpu/gin_signal_order.cu -o build/gin_signal_order -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
-./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" 3 5
+./tests/gpu/recipe.sh 3 5
 ```
 
 The last command prints, for each mode, a line ending in `PASS` or `FAIL` followed by rank 0's count of mismatched elements for each seed, and exits 0 when every mode produced its required outcome.

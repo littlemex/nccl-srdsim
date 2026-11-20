@@ -109,23 +109,13 @@ I1 が破れたことを見つけられるのは、この確かめ方のおか�
 
 ## 実行
 
-次のコマンドは、NCCL 2.32.6 のライブラリを Python の wheel から入れ、プラグインのビルドに要るヘッダのために NCCL のソースを取得し、プラグインをビルド、テストを wheel の NCCL に対してコンパイルし、3 ランク、5 シードで全モードを動かす。最後の手順は約 75 秒かかる。
+`tests/gpu/recipe.sh` は、バージョンをすべて `versions.env` から読む。固定した NCCL の wheel (2.32.6) を入れ、プラグインのビルドに要るヘッダのために固定した NCCL のソースを取得してコミットを確かめ、プラグインをビルドし、テストを wheel の NCCL に対してコンパイルし、3 ランク、5 シードで全モードを動かす。どの手順が失敗しても、そこで止まる。ビルドの後の実行は約 75 秒かかる。
 
 ```bash
 export PATH=/usr/local/cuda/bin:$PATH
 git clone https://github.com/littlemex/nccl-srdsim.git
 cd nccl-srdsim
-. ./versions.env
-python3 -m venv .venv
-.venv/bin/pip install -q "nvidia-nccl-cu13==$NCCL_WHEEL"
-export NCCL_ROOT=$(.venv/bin/python -c 'import nvidia.nccl as m; print(list(m.__path__)[0])')
-git clone --quiet --depth 1 --branch "$NCCL_DEFAULT" https://github.com/NVIDIA/nccl.git .nccl-src
-test "$(git -C .nccl-src rev-parse HEAD)" = "$NCCL_DEFAULT_COMMIT"
-NCCL_SRC=$PWD/.nccl-src ./scripts/prepare_nccl_headers.sh "$PWD/.inc"
-cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DNCCL_PLUGIN_INCLUDE_DIRS="$PWD/.inc/nccl"
-cmake --build build -j
-nvcc -std=c++17 -arch=native -I "$NCCL_ROOT/include" tests/gpu/gin_signal_order.cu -o build/gin_signal_order -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
-./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" 3 5
+./tests/gpu/recipe.sh 3 5
 ```
 
 最後のコマンドは、モードごとに `PASS` か `FAIL` で終わる行と、シードごとのランク 0 の値の違う要素の数を出し、すべてのモードが求める結果を出したときに 0 で終わる。

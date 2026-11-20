@@ -16,13 +16,23 @@ jobs:
       nccl_default_tag: ${{ steps.read.outputs.nccl_default_tag }}
       nccl_default_commit: ${{ steps.read.outputs.nccl_default_commit }}
       cuda_default: ${{ steps.read.outputs.cuda_default }}
+      cuda_keyring_deb: ${{ steps.read.outputs.cuda_keyring_deb }}
       cuda_keyring_sha256: ${{ steps.read.outputs.cuda_keyring_sha256 }}
       gdrcopy_tag: ${{ steps.read.outputs.gdrcopy_tag }}
       gdrcopy_commit: ${{ steps.read.outputs.gdrcopy_commit }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - id: read
-        run: ./ci/versions_matrix.sh | tee -a "$GITHUB_OUTPUT"
+        run: |
+          ./ci/versions_matrix.sh > "$RUNNER_TEMP/versions"
+          tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/versions"
+
+  # Its own job, so that a stray version in a document does not stop the builds from reporting.
+  pinned-versions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Documents, workflows and scripts name only pinned versions
         run: ./ci/check_versions.sh
 
@@ -76,6 +86,7 @@ jobs:
   # configuration, with declaration-only CUDA stand-ins. Checks the generated NCCL version, the op
   # tables exported, and that each configuration really compiled its delivery path in.
   plugin-abi:
+    name: plugin-abi (${{ matrix.delivery }}, ${{ matrix.nccl.tag }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: versions
@@ -113,7 +124,8 @@ jobs:
             -isystem "$RUNNER_TEMP/inc/nccl" -isystem "$RUNNER_TEMP/inc/cuda-stub" -I src \
             src/nccl_rma_srdsim.cc -o "$SO" $LINK -pthread
           ./ci/check_exports.sh "$SO" "$RUNNER_TEMP/nccl-src"
-          EXPORTS=$(./ci/expected_exports.sh "$RUNNER_TEMP/nccl-src" | grep -v '^!')
+          EXPORTS=$(./ci/expected_exports.sh "$RUNNER_TEMP/nccl-src")
+          EXPORTS=$(grep -v '^!' <<<"$EXPORTS")
           nm -D --undefined-only "$SO" > "$RUNNER_TEMP/undefined"
           has() { grep -Eq " U $1" "$RUNNER_TEMP/undefined"; }
           case "$DELIVERY" in
@@ -143,11 +155,12 @@ jobs:
       - name: Install CUDA development packages
         env:
           CUDA_PKG: ${{ matrix.cuda }}
+          KEYRING_DEB: ${{ needs.versions.outputs.cuda_keyring_deb }}
           KEYRING_SHA256: ${{ needs.versions.outputs.cuda_keyring_sha256 }}
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          echo "$KEYRING_SHA256  cuda-keyring_1.1-1_all.deb" | sha256sum -c
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/$KEYRING_DEB"
+          echo "$KEYRING_SHA256  $KEYRING_DEB" | sha256sum -c
+          sudo dpkg -i "$KEYRING_DEB"
           sudo apt-get update -q
           sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-driver-dev-$CUDA_PKG" "cuda-nvrtc-dev-$CUDA_PKG"
       - name: Build GDRCopy's user library
@@ -197,12 +210,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install the CUDA runtime headers
         env:
+          KEYRING_DEB: ${{ needs.versions.outputs.cuda_keyring_deb }}
           KEYRING_SHA256: ${{ needs.versions.outputs.cuda_keyring_sha256 }}
           CUDA_PKG: ${{ needs.versions.outputs.cuda_default }}
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          echo "$KEYRING_SHA256  cuda-keyring_1.1-1_all.deb" | sha256sum -c
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/$KEYRING_DEB"
+          echo "$KEYRING_SHA256  $KEYRING_DEB" | sha256sum -c
+          sudo dpkg -i "$KEYRING_DEB"
           sudo apt-get update -q
           sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG"
       - name: Build
@@ -223,7 +237,16 @@ jobs:
           fi
           cc ci/dlopen_check.c -o dlopen_check -ldl
           ./ci/check_exports.sh build/libnccl-rma-srdsim.so "$RUNNER_TEMP/nccl-src"
-          ./dlopen_check "$PWD/build/libnccl-rma-srdsim.so" $(./ci/expected_exports.sh "$RUNNER_TEMP/nccl-src" | grep -v '^!')
+          EXPORTS=$(./ci/expected_exports.sh "$RUNNER_TEMP/nccl-src")
+          ./dlopen_check "$PWD/build/libnccl-rma-srdsim.so" $(grep -v '^!' <<<"$EXPORTS")
+      - name: The same build serves every pinned release
+        run: ./ci/check_serves_all.sh build/libnccl-rma-srdsim.so
+      - name: The export check fails without a release to check against
+        run: |
+          mkdir -p "$RUNNER_TEMP/empty"
+          if ./ci/check_exports.sh build/libnccl-rma-srdsim.so "$RUNNER_TEMP/empty"; then
+            echo "check_exports.sh passed with no NCCL source"; exit 1
+          fi
 
   # The GPU test compiles against NCCL's device API headers. It runs on a GPU host (tests/gpu/run.sh).
   gpu-test-compile:
@@ -234,12 +257,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install the CUDA compiler and runtime headers
         env:
+          KEYRING_DEB: ${{ needs.versions.outputs.cuda_keyring_deb }}
           KEYRING_SHA256: ${{ needs.versions.outputs.cuda_keyring_sha256 }}
           CUDA_PKG: ${{ needs.versions.outputs.cuda_default }}
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          echo "$KEYRING_SHA256  cuda-keyring_1.1-1_all.deb" | sha256sum -c
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/$KEYRING_DEB"
+          echo "$KEYRING_SHA256  $KEYRING_DEB" | sha256sum -c
+          sudo dpkg -i "$KEYRING_DEB"
           sudo apt-get update -q
           sudo apt-get install -y -q "cuda-nvcc-$CUDA_PKG" "cuda-cudart-dev-$CUDA_PKG" "cuda-cccl-$CUDA_PKG"
       - name: Compile
