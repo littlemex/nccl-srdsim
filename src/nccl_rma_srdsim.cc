@@ -402,6 +402,9 @@ struct Request {
     // which `complete` refuses as never issued, and the caller would wait forever. The distinction
     // belongs in the request.
     bool     is_flush = false;
+    // Complete when it was handed back: a dry-run operation, or one the scheduler refused. It names no
+    // operation, so `test` must not ask the scheduler about it.
+    bool     done_at_issue = false;
 };
 
 // Requests are handed back to NCCL as opaque pointers and tested until done, so the address of a
@@ -440,6 +443,7 @@ struct RequestSlab {
         r->op_id = 0;
         r->ctx = nullptr;
         r->is_flush = false;
+        r->done_at_issue = false;
         return r;
     }
 
@@ -2544,7 +2548,7 @@ ncclResult_t submit(RmaCtx* ctx, const srdsim::Op& op, void** request) {
         // Hand back a request that is already complete. Nothing is moved, so results are wrong by
         // construction; this exists only to observe the call sequence.
         Request* r = g_requests.acquire();
-        r->op_id = 0;             // op id 0 is never pending, so `test` reports done immediately
+        r->done_at_issue = true;
         r->ctx = ctx;
         *request = r;
         return ncclSuccess;
@@ -2594,7 +2598,7 @@ ncclResult_t submit(RmaCtx* ctx, const srdsim::Op& op, void** request) {
             if (ctx->coll->last_error.empty()) ctx->coll->last_error = "refused an operation: " + why;
         }
         Request* r = g_requests.acquire();
-        r->op_id = 0;          // id 0 is never pending, so `test` reports it done immediately
+        r->done_at_issue = true;  // the operation will not happen; a request that never completes would freeze NCCL
         r->ctx = ctx;
         *request = r;
         return ncclSuccess;
@@ -3323,8 +3327,14 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
              static_cast<const void*>(r));
         return ncclInternalError;
     }
-    bool complete;
-    {
+    if (r->op_id == 0 and not r->is_flush and not r->done_at_issue) {
+        // Every other request names an operation, and id 0 is never one: answering from the scheduler would
+        // report "not done" forever, which is how this stalled before.
+        logf("test() called with a request that names no operation (%p); refusing", static_cast<const void*>(r));
+        return ncclInternalError;
+    }
+    bool complete = r->done_at_issue;
+    if (not complete) {
         std::lock_guard<std::mutex> g(r->ctx->mu);
         // A flush fences both directions on this context: the scheduler being idle is the put side
         // (everything this rank sent has been released), `pending_gets` is the get side (every reply
@@ -3337,7 +3347,7 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
 #ifdef SRDSIM_WITH_CUDA
     // Released is not finished while a unit still waits for its source to be staged: reporting it done
     // would let NCCL reuse a source that has not been read yet.
-    if (complete and delivery_async()) {
+    if (complete and not r->done_at_issue and delivery_async()) {
         drain_sends();
         complete = r->is_flush
                  ? not send_holds_any_of(r->ctx) and r->ctx->pending_gets.load(std::memory_order_relaxed) == 0

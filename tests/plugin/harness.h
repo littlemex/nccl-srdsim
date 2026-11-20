@@ -211,6 +211,7 @@ struct Op {
     size_t word = 0;                   // signal word
     uint64_t value = 1;
     bool strong = false;
+    bool refused = false;              // the case expects the plugin to refuse it; it may name memory outside the window
 };
 
 // What the rank's main thread sees of one operation: `done` when `test` reported it, `retired` when it
@@ -242,6 +243,12 @@ struct Rank {
         t->op = op;
         queue_[op.context][op.peer].push_back(t);
         return t;
+    }
+
+    bool last_error() {
+        bool has = false;
+        check(rma.queryLastError(rmaCtx, &has), "queryLastError");
+        return has;
     }
 
     const Ticket* last_ticket() {
@@ -479,8 +486,12 @@ private:
             if (f.t->done.load(std::memory_order_relaxed) != 0 and f.index == frontier_[c][peer]) {
                 ++ frontier_[c][peer];
                 const Op& o = f.t->op;
-                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0)
+                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0 and not o.refused) {
+                    if (o.srcOff > data.size() or o.size > data.size() - o.srcOff)
+                        fail("harness", "source-outside-window", "offset %llu size %zu",
+                             static_cast<unsigned long long>(o.srcOff), o.size);
                     std::memset(at(o.srcOff), kScribble, o.size);
+                }
                 f.t->retired.store(1, std::memory_order_release);
                 continue;
             }

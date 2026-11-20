@@ -14,6 +14,7 @@
 // listed case passes (remove its entry with the fix) or fails differently. A FAIL line carries the
 // arguments that replay that one case.
 #include "harness.h"
+#include "srdsim_schedule.h"
 
 #include <signal.h>
 #include <sys/mman.h>
@@ -324,6 +325,28 @@ void register_during_traffic(Rank& R) {
     }
 }
 
+// An operation the plugin refuses is reported through queryLastError and its request completes, and the
+// slot that request used serves the next, real operation, which must complete only once delivered and
+// with its data. The refused put is larger than the largest single write the simulator models.
+void refused_then_real(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, src = 4099, dst = (512 << 10) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 13);
+        // One byte over the largest single write the scheduler models.
+        Op big = put(0, 1, src, srdsim::Scheduler::Options{}.max_op_bytes + 1, dst);
+        big.refused = true;
+        const Ticket* bad = R.issue(big);
+        R.wait_retired(bad, "refused");
+        if (not R.last_error()) fail("assert", "refusal-reported", "%s", "queryLastError reports nothing");
+        R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 5, false)), "put-with-signal");
+    } else {
+        R.wait_peer([&] { return R.signal_word(5) >= 1; }, "signal-word");
+        if (size_t bad = mismatches(R.at(dst), n, 0, 13)) fail("assert", "data", "%zu bytes", bad);
+        expect_guards(R, dst, n);
+        expect_signals(R, {{5, 1}});
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -348,6 +371,7 @@ const std::vector<Scenario>& scenarios() {
         {"get_one_chunk_early_flush", get_one_chunk_early_flush, 2, {"srd"}, {1}, nullptr},
         {"flush_without_get", flush_without_get, 2, {"srd"}, {1}, nullptr},
         {"register_during_traffic", register_during_traffic, 2, {"srd"}, {1, 2, 3}, nullptr},
+        {"refused_then_real", refused_then_real, 2, {"srd"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
@@ -360,7 +384,6 @@ const Expected kExpected[] = {
     {"get_completes_with_data", "*", 0, "assert:data-at-early-completion", "#26: a get completes when its request is sent"},
     {"get_owner_idle", "*", 0, "stall:get", "#26: a get is answered by the owner's proxy"},
     {"get_multichunk_flush", "*", 0, "stall:flush", "#26: pending_gets is decremented once per chunk of a get"},
-    {"dry_run", "*", 0, "stall:put-second", "#26: every dry-run request is numbered 0, which never completes"},
 };
 
 const Expected* expected_for(const Scenario& sc, const char* mode, int table) {
