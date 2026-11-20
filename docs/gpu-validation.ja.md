@@ -109,33 +109,26 @@ I1 が破れたことを見つけられるのは、この確かめ方のおか�
 
 ## 実行
 
-次のコマンドは、NCCL 2.32.6 のライブラリを Python の wheel から入れ、プラグインのビルドに要るヘッダのために NCCL のソースを取得し、プラグインをビルド、テストを wheel の NCCL に対してコンパイルし、3 ランク、5 シードで全モードを動かす。最後の手順は約 75 秒かかる。
+`tests/gpu/recipe.sh` は、バージョンをすべて `versions.env` から読む。固定した NCCL の wheel を入れ、プラグインのビルドに要るヘッダのために固定した NCCL のソースを取得してコミットを確かめ、プラグインをビルドし、テストを wheel の NCCL に対してコンパイルし、3 ランク、5 シードで全モードを動かす。どの手順が失敗しても、そこで止まる。ビルドの後の実行は約 75 秒かかる。
 
 ```bash
-export NCCL_VERSION=2.32.6
 export PATH=/usr/local/cuda/bin:$PATH
 git clone https://github.com/littlemex/nccl-srdsim.git
 cd nccl-srdsim
-python3 -m venv .venv
-.venv/bin/pip install -q "nvidia-nccl-cu13==$NCCL_VERSION"
-export NCCL_ROOT=$(.venv/bin/python -c 'import nvidia.nccl as m; print(list(m.__path__)[0])')
-git clone --quiet --depth 1 --branch "v$NCCL_VERSION-1" https://github.com/NVIDIA/nccl.git .nccl-src
-NCCL_SRC=$PWD/.nccl-src ./scripts/prepare_nccl_headers.sh "$PWD/.inc"
-cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DNCCL_PLUGIN_INCLUDE_DIRS="$PWD/.inc/nccl"
-cmake --build build -j
-nvcc -std=c++17 -arch=native -I "$NCCL_ROOT/include" tests/gpu/gin_signal_order.cu -o build/gin_signal_order -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
-./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" 3 5
+./tests/gpu/recipe.sh 3 5
 ```
 
 最後のコマンドは、モードごとに `PASS` か `FAIL` で終わる行と、シードごとのランク 0 の値の違う要素の数を出し、すべてのモードが求める結果を出したときに 0 で終わる。
 
 ## 記録した結果
 
+今の形の手順 (`versions.env` を読む `tests/gpu/recipe.sh`) は、同じ `g7.2xlarge` で書いたとおりに 1 回流し、どのモードも求める結果を出した。下の数値は、同じコマンドの前の形で流した 4 回のものである。
+
 `run.sh` の 4 回の実行のどれでも、7 つのモードすべてが求める結果を出した。
 
 ![7 つのモードそれぞれについて、5 つのシードの終了ステータス。どの回でも同じだった。I1 を守る 6 つのモードは全シードが 0 で、値の違う要素は無い。violate-i1 は全シードが 1 で、値の違う要素が見つかった。どのモードも求める結果を出した。下は、violate-i1 でランク 0 がシードごとに見つけた値の違う要素の範囲で、1 シードで確かめる 13,107,200 個のうち 3,157,632 個 (24%) から 11,900,672 個 (91%) だった。](images/gpu-result.ja.svg)
 
-実行したのは、コミット `650d96e` の時点のプラグインとテストである (測ったのはコミット `ff11cc9` で、その後に変わったのは `src/` のコメントとホストのテストだけで、`tests/gpu/` は変わっていない)。マシンは `g7.2xlarge` (NVIDIA RTX PRO 4500 Blackwell Server Edition が 1 枚、compute capability 12.0、ドライバ 595.112.07) で、Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117 の上で、上の wheel の NCCL 2.32.6 と、イメージに入っている CUDA 13 のツールキットを使った。「実行」の節のコマンドは 4 回実行した。1 回は上に書いたとおりそのまま、残りの 3 回は同じビルドで同じ `tests/gpu/run.sh PLUGIN TEST 3 5` のコマンドを使った。1 回の実行は、3 ランク、モードごとに 5 シード、ブロックごとに 65,536 要素を 16 チャンクで送る 50 ラウンドで、約 75 秒かかった。
+測ったのは、コミット `ff11cc9` のプラグインとテストである。その後に変わったのは `src/` のコメントとホストのテストだけで、`tests/gpu/` は変わっていない。マシンは `g7.2xlarge` (NVIDIA RTX PRO 4500 Blackwell Server Edition が 1 枚、compute capability 12.0、ドライバ 595.112.07) で、Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117 の上で、上の wheel の NCCL 2.32.6 と、イメージに入っている CUDA 13 のツールキットを使った。今の `tests/gpu/recipe.sh` が行う各手順を 1 つずつ書いていた前の形のコマンドを、4 回実行した。1 回は当時書いてあったとおりそのまま、残りの 3 回は同じビルドで同じ `tests/gpu/run.sh PLUGIN TEST 3 5` のコマンドを使った。1 回の実行は、3 ランク、モードごとに 5 シード、ブロックごとに 65,536 要素を 16 チャンクで送る 50 ラウンドで、約 75 秒かかった。
 
 | モード | シードごとの終了ステータス (全回) | ランク 0 が報告した値の違う要素 |
 |---|---|---|

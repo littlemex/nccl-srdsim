@@ -111,33 +111,26 @@ The test program's exit status, which the verdict is built from:
 
 ## Run
 
-The commands below install the NCCL 2.32.6 library from its Python wheel, fetch the NCCL source for the plugin's build headers, build the plugin, compile the test against the wheel's NCCL, and run every mode with 3 ranks and 5 seeds. The last step takes about 75 seconds.
+`tests/gpu/recipe.sh` takes every version from `versions.env`. It installs the pinned NCCL wheel, fetches the pinned NCCL source for the plugin's build headers and checks its commit, builds the plugin, compiles the test against the wheel's NCCL, and runs every mode with 3 ranks and 5 seeds; any failing step stops it. The run takes about 75 seconds after the build.
 
 ```bash
-export NCCL_VERSION=2.32.6
 export PATH=/usr/local/cuda/bin:$PATH
 git clone https://github.com/littlemex/nccl-srdsim.git
 cd nccl-srdsim
-python3 -m venv .venv
-.venv/bin/pip install -q "nvidia-nccl-cu13==$NCCL_VERSION"
-export NCCL_ROOT=$(.venv/bin/python -c 'import nvidia.nccl as m; print(list(m.__path__)[0])')
-git clone --quiet --depth 1 --branch "v$NCCL_VERSION-1" https://github.com/NVIDIA/nccl.git .nccl-src
-NCCL_SRC=$PWD/.nccl-src ./scripts/prepare_nccl_headers.sh "$PWD/.inc"
-cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DNCCL_PLUGIN_INCLUDE_DIRS="$PWD/.inc/nccl"
-cmake --build build -j
-nvcc -std=c++17 -arch=native -I "$NCCL_ROOT/include" tests/gpu/gin_signal_order.cu -o build/gin_signal_order -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
-./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" 3 5
+./tests/gpu/recipe.sh 3 5
 ```
 
 The last command prints, for each mode, a line ending in `PASS` or `FAIL` followed by rank 0's count of mismatched elements for each seed, and exits 0 when every mode produced its required outcome.
 
 ## Result on record
 
+The recipe in its current form (`tests/gpu/recipe.sh`, reading `versions.env`) was run as written once on the same `g7.2xlarge`; every mode produced its required outcome. The numbers below come from the four runs of the earlier form of the same commands.
+
 All seven modes produced their required outcome in each of four runs of `run.sh`.
 
 ![For each of the seven modes, the exit status of each of the five seeds, the same in every run: 0 in every seed of the six modes that keep I1, which means no mismatched element, and 1 in every seed of violate-i1, which means mismatched elements were found; every mode met its required outcome. Below, the range of mismatched elements rank 0 found per seed under violate-i1: from 3,157,632 (24%) to 11,900,672 (91%) of the 13,107,200 elements it checks per seed.](images/gpu-result.svg)
 
-The runs used the plugin and the test as they are at commit `650d96e` (measured at commit `ff11cc9`; since then only comments in `src/` and the host tests have changed, and `tests/gpu/` not at all), on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The commands under Run were executed four times: once exactly as written above, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run used three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and took about 75 seconds.
+The runs measured the plugin and the test at commit `ff11cc9`; since then only comments in `src/` and the host tests have changed, and `tests/gpu/` not at all. They ran on a `g7.2xlarge` (one NVIDIA RTX PRO 4500 Blackwell Server Edition, compute capability 12.0, driver 595.112.07) running the Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261117, with NCCL 2.32.6 from the wheel above and the CUDA 13 toolkit on the image. The earlier form of the commands, which wrote out each step that `tests/gpu/recipe.sh` now runs, was executed four times: once as then written, and three more times with the same build and the same `tests/gpu/run.sh PLUGIN TEST 3 5` command. Each run used three ranks, five seeds per mode, and 50 rounds of 65,536 elements in 16 chunks per block, and took about 75 seconds.
 
 | Mode | Exit status per seed, in every run | Mismatched elements reported by rank 0 |
 |---|---|---|
