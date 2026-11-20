@@ -5,12 +5,12 @@ NAME = "testing-map"
 
 
 def draw(L):
-    cols = [L.t("scheduler", "スケジューラ"), L.t("transport", "転送"), L.t("send queue", "送信キュー"),
+    cols = [L.t("scheduler", "スケジューラ"), L.t("transport", "トランスポート"), L.t("send queue", "送信キュー"),
             L.t("mapping", "マッピング"), L.t("plugin + NCCL", "プラグイン + NCCL")]
     rows = [("test_srdsim_schedule", [0]), ("model_srdsim_schedule_exhaustive", [0]),
             ("test_srdsim_transport", [1]), ("model_srdsim_framing", [1]), ("test_srdsim_adversarial", [0, 1]),
             ("test_srdsim_async", [2]), ("test_srdsim_get", [1]), ("test_srdsim_mapping", [3]),
-            ("test_srdsim_liveness", [0, 1]), (L.t("CI: plugin builds and exports", "CI: プラグインの組み立てと公開"), [4]),
+            ("test_srdsim_liveness", [0, 1]), (L.t("CI: plugin builds and exports", "CI: プラグインのビルドと公開"), [4]),
             (L.t("tests/gpu (on a GPU, by hand)", "tests/gpu (GPU で、手で走らせる)"), [4])]
     f = Fig(1100, 120 + 38 * len(rows), L, L.t("What each test exercises", "どのテストが何を確かめるか"))
     x0, cw, y0 = 420, 130, 70

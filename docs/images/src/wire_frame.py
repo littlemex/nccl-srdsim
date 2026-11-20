@@ -6,7 +6,7 @@ NAME = "wire-frame"
 
 def draw(L):
     f = Fig(1100, 350, L, L.t("One frame on the wire: a 56-byte header, then the payload",
-                               "転送の 1 フレーム: 56 バイトのヘッダと、その後のペイロード"))
+                               "トランスポートの 1 フレーム: 56 バイトのヘッダと、その後のペイロード"))
     fields = [("kind", 4, "wire"), ("window", 4, "target"), ("dest_window", 4, "neutral"), ("requester", 4, "neutral"),
               ("offset", 8, "target"), ("length", 8, "wire"), ("value", 8, "sig"), ("op_id", 8, "nccl"),
               ("dest_offset", 8, "neutral")]
@@ -19,13 +19,13 @@ def draw(L):
     rows = [
         ("Placement", L.t("window + offset, length bytes of payload", "window + offset に、length バイトを書く")),
         ("Signal", L.t("add value to the 8 bytes at window + offset", "window + offset の 8 バイトに value を足す")),
-        ("GetRequest", L.t("read value bytes; reply to requester at dest_window", "value バイトを読み、requester の dest_window に返す")),
-        ("GetResponse", L.t("a placement, counted toward the get that op_id names", "配置として書き、op_id が指す get の分として数える")),
+        ("GetRequest", L.t("read value bytes (length is 0); reply to requester at dest_window", "value バイトを読み (length は 0)、requester の dest_window に返す")),
+        ("GetResponse", L.t("a placement, counted for the requester's RMA context in op_id", "配置として書き、op_id が指す要求側の RMA コンテキストの分として数える")),
         ("Shutdown", L.t("the sender is closing the stream", "送り手が接続を閉じる")),
     ]
     yy = 180
     f.text(30, yy, L.t("kind", "kind"), size=13, weight="bold", anchor="start")
-    f.text(220, yy, L.t("what the receiving agent does", "受け取るエージェントがすること"), size=13, weight="bold", anchor="start")
+    f.text(220, yy, L.t("what the receiving agent does", "受信エージェントがすること"), size=13, weight="bold", anchor="start")
     for i, (k, what) in enumerate(rows):
         f.text(30, yy + 28 + i * 26, k, size=13, anchor="start", mono=True)
         f.text(220, yy + 28 + i * 26, what, size=13, anchor="start")

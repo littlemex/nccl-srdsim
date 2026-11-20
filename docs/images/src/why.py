@@ -8,9 +8,9 @@ def draw(L):
     f = Fig(1100, 470, L, L.t("Code that relies on more order than the contract passes in-order tests and fails on SRD",
                                "契約より強い順番に頼るコードは、順番どおりのテストを通り、SRD で壊れる"))
     f.text(550, 58, L.t("Rank 0 puts A (no signal), then B with a signal. Rank 1 waits for the signal, then reads A and B.",
-                        "ランク 0 が A (合図なし)、次に合図付きの B を put する。ランク 1 は合図を待ち、A と B を読む。"),
+                        "ランク 0 が A (シグナルなし)、次にシグナル付きの B を put する。ランク 1 はシグナルを待ち、A と B を読む。"),
            size=13, color="#555555")
-    cols = [(40, L.t("An in-order transport (a test setup)", "順番どおりに届く転送 (テストの環境)"),
+    cols = [(40, L.t("An in-order transport (a test setup)", "順番どおりに届くトランスポート (テストの環境)"),
              ["A", "B", "S"], L.t("A has landed: right value, bug hidden",
                                   "A は届いている。読む値は正しく、不具合は隠れたまま"), True),
             (580, L.t("SRD, or this simulator", "SRD、またはこのシミュレータ"),
