@@ -790,6 +790,82 @@ void test_release_fingerprints() {
     }
 }
 
+// S13: `pick` chooses exactly what the list-building `pick_reference` would, unit by unit, in every mode and over
+// random workloads: operations of 0 to 300 chunks to three peers on two contexts, weak and strong signals, gets,
+// progress budgets from 1 to 17, and links that are full for some peers on some calls.
+void test_pick_matches_reference() {
+    struct Room final : srdsim::Scheduler::Room {
+        int call = 0;
+        bool fits(int peer, size_t) override { return (call + peer) % 4 != 0; }
+        void take(int, size_t) override {}
+    };
+    const srdsim::Mode modes[] = {srdsim::Mode::Srd, srdsim::Mode::InOrder, srdsim::Mode::PeerSeq, srdsim::Mode::ReverseOps,
+                                  srdsim::Mode::SignalLast, srdsim::Mode::DeferOne, srdsim::Mode::ViolateI1};
+    for (srdsim::Mode m : modes) {
+        for (uint64_t seed = 1; seed <= 6; ++ seed) {
+            Fabric f(4 << 20, 64);
+            srdsim::Scheduler::Options o;
+            o.mode = m;
+            o.seed = seed;
+            o.chunk_bytes = 1024;
+            srdsim::Scheduler fast(o);
+            o.reference_pick = true;
+            srdsim::Scheduler ref(o);
+            srdsim::Rng script(seed * 7919 + static_cast<uint64_t>(m));
+            Room rf, rr;
+            std::vector<srdsim::Unit> bf, br;
+            uint64_t id = 0;
+            size_t units = 0;
+            bool same = true;
+            for (int round = 0; round < 40 and same; ++ round) {
+                const int submits = static_cast<int>(script.below(4));
+                for (int k = 0; k < submits; ++ k) {
+                    ++ id;
+                    const size_t chunks = script.below(4) == 0 ? script.below(300) : script.below(6);
+                    srdsim::Op op = make_op(id, f, 0, chunks * 1024 - (chunks ? script.below(1000) : 0),
+                                            script.below(2) ? static_cast<int>(id % 60) : -1);
+                    op.peer = static_cast<int>(script.below(3));
+                    op.context = static_cast<int>(script.below(2));
+                    op.signal_is_strong = script.below(3) == 0;
+                    if (script.below(10) == 0) {
+                        op = srdsim::Op{};
+                        op.id = id;
+                        op.peer = static_cast<int>(script.below(3));
+                        op.is_get_request = true;
+                        op.bytes = 5000;
+                    }
+                    std::string w1, w2;
+                    const bool a1 = fast.submit(op, &w1), a2 = ref.submit(op, &w2);
+                    same = same and a1 == a2;
+                }
+                const size_t budget = 1 + script.below(17);
+                rf.call = rr.call = round;
+                bf.clear();
+                br.clear();
+                fast.progress(budget, &bf, &rf);
+                ref.progress(budget, &br, &rr);
+                same = same and bf.size() == br.size();
+                for (size_t i = 0; same and i < bf.size(); ++ i)
+                    same = bf[i].op_id == br[i].op_id and bf[i].chunk_index == br[i].chunk_index and bf[i].kind == br[i].kind;
+                units += bf.size();
+            }
+            for (int i = 0; same and i < 100'000 and not (fast.idle() and ref.idle()); ++ i) {
+                bf.clear();
+                br.clear();
+                fast.progress(8, &bf);
+                ref.progress(8, &br);
+                same = bf.size() == br.size();
+                for (size_t j = 0; same and j < bf.size(); ++ j)
+                    same = bf[j].op_id == br[j].op_id and bf[j].chunk_index == br[j].chunk_index and bf[j].kind == br[j].kind;
+                units += bf.size();
+            }
+            expect(same and fast.idle() and ref.idle(),
+                   ctx("S13 pick matches the reference: mode=%s seed=%llu after %zu units", srdsim::mode_name(m),
+                       static_cast<unsigned long long>(seed), units));
+        }
+    }
+}
+
 int main() {
     test_overlapping_writes_are_named();
     test_overlap_detection_is_opt_in();
@@ -805,6 +881,7 @@ int main() {
     test_strong_signal_is_scoped_to_its_context();
     test_peer_seq_is_per_context();
     test_release_fingerprints();
+    test_pick_matches_reference();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

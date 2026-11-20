@@ -39,6 +39,7 @@
 #ifndef SRDSIM_SCHEDULE_H_
 #define SRDSIM_SCHEDULE_H_
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -224,6 +225,8 @@ public:
         // simulator does not model the split, so it detects the case instead of pretending.
         size_t   max_op_bytes = size_t{1} << 30;
         bool     trace = false;
+        // Tests only: choose with `pick_reference`, the list-building pick, instead of `pick`.
+        bool     reference_pick = false;
         // Which operation `defer-one` holds: the oldest of any kind, or the oldest of one kind. The
         // kinds are what separates "a receiver that needs an earlier unsignalled put" from "one that
         // needs an earlier signal" when `defer-one` fails and `signal-last` passes.
@@ -315,7 +318,7 @@ public:
         struct Clear { Room** r; ~Clear() { *r = nullptr; } } clear{&room_};
         size_t released = 0;
         while (released < budget) {
-            const Choice c = pick();
+            const Choice c = opt_.reference_pick ? pick_reference() : pick();
             if (c.pending_index < 0)
                 break;
             Pending& p = pending_[static_cast<size_t>(c.pending_index)];
@@ -467,9 +470,10 @@ private:
         }
         // The chunk index of the k-th (from 0) chunk not yet placed, in index order.
         int kth_unplaced(int k) const {
+            assert(k >= 0 and k < remaining);
             int pos = 0;
             int step = 1;
-            while (step * 2 <= chunk_count) step *= 2;
+            while (step <= chunk_count / 2) step *= 2;
             for (; step > 0; step /= 2) {
                 const int next = pos + step;
                 if (next <= chunk_count and unplaced[static_cast<size_t>(next)] <= k) {
@@ -555,8 +559,8 @@ private:
         // then its signal if releasable. The choice below is over that sequence of options, without building it,
         // so a pick costs O(operations + log chunks) rather than O(chunks pending); the options and the random
         // draws are the same as when the sequence was built (`test_srdsim_schedule` S12 pins the order).
-        struct Avail { size_t i; int chunks; bool signal; };
-        std::vector<Avail> avail;
+        std::vector<Avail>& avail = avail_scratch_;
+        avail.clear();
         size_t total = 0;
         for (size_t i = 0; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
@@ -628,6 +632,105 @@ private:
         return {};   // not reached: k < total
     }
 
+    // The list-building pick this scheduler used before `pick` counted its options instead: kept only as the
+    // oracle `test_srdsim_schedule` S13 checks `pick` against, choice by choice (`Options::reference_pick`).
+    Choice pick_reference() {
+        std::vector<Choice> options;
+        // `pending_` is in submission order, so "the oldest operation for this context and peer" is the first
+        // one found for them. `peer-seq` needs that per context and peer rather than globally.
+        std::map<std::pair<int, int>, size_t> oldest_for_peer;
+        if (opt_.mode == Mode::PeerSeq)
+            for (size_t i = 0; i < pending_.size(); ++ i)
+                oldest_for_peer.emplace(std::make_pair(pending_[i].op.context, pending_[i].op.peer), i);
+
+        // `defer-one` holds the oldest operation back. Which one is held has to be decided once and
+        // stay decided: choosing afresh each call would hold whichever happens to be oldest now, which
+        // is a different schedule and not the one being tested.
+        if (opt_.mode == Mode::DeferOne and not have_deferred_) {
+            for (const Pending& p : pending_) {
+                if (not defer_kind_matches(p.op)) continue;
+                deferred_id_ = p.op.id;
+                have_deferred_ = true;
+                break;
+            }
+        }
+
+        // `signal-last` may release no signal while any placement anywhere is still unreleased. Placements held for
+        // room on another peer's link do not count, or one full link would hold every other peer's signals.
+        bool any_placement_left = false;
+        if (opt_.mode == Mode::SignalLast)
+            for (const Pending& p : pending_)
+                if (p.remaining != 0 and has_room(p)) { any_placement_left = true; break; }
+        bool skipped_for_room = false;
+
+        for (size_t i = 0; i < pending_.size(); ++ i) {
+            const Pending& p = pending_[i];
+            if (opt_.mode == Mode::PeerSeq and oldest_for_peer[std::make_pair(p.op.context, p.op.peer)] != i)
+                continue;                // this context and peer have older work outstanding
+            if (not has_room(p)) {
+                skipped_for_room = true;
+                continue;                // the link to this peer is full: nothing for it is released now
+            }
+            if (opt_.mode == Mode::DeferOne and have_deferred_ and p.op.id == deferred_id_ and
+                pending_.size() > 1)
+                continue;                // held until it is the only one left
+            for (int c = 0; c < p.chunk_count; ++ c)
+                if (not p.placed[static_cast<size_t>(c)])
+                    options.push_back({static_cast<int>(i), c});
+            if (signal_releasable(p) and
+                not (opt_.mode == Mode::SignalLast and any_placement_left))
+                options.push_back({static_cast<int>(i), -1});
+            if (opt_.mode == Mode::InOrder and not options.empty())
+                break;                   // never look past the oldest operation that can be released now
+        }
+        if (options.empty()) {
+            // The deferred operation is the only thing left: stop deferring it and look once more, in a
+            // loop rather than by recursion, so the scheduler never reports itself idle with work
+            // outstanding and no sequence of ids can make it re-choose the same operation without bound.
+            // Not while something else is only waiting for room: the deferred operation is then not the only one
+            // left, and releasing it would change which operation the mode holds.
+            if (opt_.mode == Mode::DeferOne and have_deferred_ and not skipped_for_room) {
+                have_deferred_ = false;
+                deferred_id_ = 0;
+                for (size_t i = 0; i < pending_.size(); ++ i) {
+                    const Pending& p = pending_[i];
+                    if (not has_room(p)) continue;
+                    for (int c = 0; c < p.chunk_count; ++ c)
+                        if (not p.placed[static_cast<size_t>(c)])
+                            return {static_cast<int>(i), c};
+                    if (signal_releasable(p))
+                        return {static_cast<int>(i), -1};
+                }
+            }
+            return {};
+        }
+        if (opt_.mode == Mode::InOrder)
+            return options.front();
+        if (opt_.mode == Mode::ReverseOps) {
+            // The newest pending operation, and within it the lowest-numbered thing available, so the
+            // schedule is a function of the queue and not of the seed.
+            Choice best = options.front();
+            for (const Choice& c : options)
+                if (c.pending_index > best.pending_index or
+                    (c.pending_index == best.pending_index and c.chunk_index < best.chunk_index))
+                    best = c;
+            return best;
+        }
+        // `violate-i1` prefers the signal, deterministically, and that is the difference between a
+        // negative test and a coin toss. Making the signal merely *releasable* left the choice to the
+        // generator, so on most steps the payload went first and the violation never reached the wire:
+        // every ordering mode passed with no corruption, including this one, which is what a negative
+        // test that does not fire looks like from outside. A mode named for breaking a guarantee has to
+        // break it whenever it can.
+        if (opt_.mode == Mode::ViolateI1)
+            for (const Choice& c : options)
+                if (c.chunk_index < 0) return c;
+        if (opt_.mode == Mode::SignalLast or opt_.mode == Mode::DeferOne or
+            opt_.mode == Mode::PeerSeq)
+            return options[rng_.below(options.size())];   // free choice inside the constraint
+        return options[rng_.below(options.size())];
+    }
+
     void reap() {
         size_t w = 0;
         for (size_t i = 0; i < pending_.size(); ++ i) {
@@ -645,6 +748,8 @@ private:
     Options opt_;
     Rng rng_;
     Room* room_ = nullptr;   // set for the duration of one `progress` call
+    struct Avail { size_t i; int chunks; bool signal; };
+    std::vector<Avail> avail_scratch_;   // reused by `pick`, so a pick does not allocate
 
     bool has_room(const Pending& p) {
         if (room_ == nullptr) return true;
