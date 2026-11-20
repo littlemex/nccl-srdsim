@@ -1413,13 +1413,7 @@ bool wire_unit(CollComm* cc, const srdsim::Unit& u, const void* src) {
 }
 
 void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u);
-
-// A released unit holds room in its peer's outbox until its frame is appended (see `LinkRoom` in
-// `srdsim_progress`). One that will not be sent gives the room back.
-void release_reservation(CollComm* cc, const srdsim::Unit& u) {
-    if (cc == nullptr) return;
-    cc->links.unreserve(u.peer, sizeof(srdsim::WireHeader) + (u.kind == srdsim::Unit::Kind::Placement ? u.bytes : 0));
-}
+void release_reservation(CollComm* cc, const srdsim::Unit& u);
 
 
 // Assigns free slots to unstaged units, in each connection's order. Called with `g_send.mu` held and the
@@ -3611,6 +3605,13 @@ void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u) {
         if (ctx->coll->last_error.empty()) ctx->coll->last_error = detail;
     }
     logf("%s", detail);
+}
+
+// A released unit holds room in its peer's outbox until its frame is appended (see `LinkRoom` in
+// `srdsim_progress`). One that will not be sent gives the room back.
+void release_reservation(CollComm* cc, const srdsim::Unit& u) {
+    if (cc == nullptr) return;
+    cc->links.unreserve(u.peer, sizeof(srdsim::WireHeader) + (u.kind == srdsim::Unit::Kind::Placement ? u.bytes : 0));
 }
 
 ncclResult_t srdsim_progress(void* rmaCtx) {

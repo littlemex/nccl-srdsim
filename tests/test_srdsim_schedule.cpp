@@ -629,8 +629,10 @@ void test_overlap_detection_is_opt_in() {
     expect(s.overlaps() == 0, "S12 overlap detection is off unless requested");
 }
 
-// S9: a peer whose link has no room gets nothing released, in every mode, and the other peer is not held up.
-// Once the room returns, everything drains and every byte arrives.
+// S9: a peer whose link has no room gets nothing released, in every mode, and the other peer is not held up --
+// except that `defer-one` keeps holding its deferred operation (op 1, to the open peer) while another
+// operation is only waiting for room, as its schedule requires. Once the room returns, everything drains and
+// every byte arrives.
 void test_room_holds_a_full_peer() {
     struct Blocked final : srdsim::Scheduler::Room {
         bool open = false;
@@ -657,7 +659,8 @@ void test_room_holds_a_full_peer() {
         bool peer1 = false;
         for (const auto& u : batch) peer1 = peer1 or u.peer == 1;
         expect(not peer1, ctx("S9 nothing is released to a peer without room: mode=%s", srdsim::mode_name(m)));
-        expect(room.taken0 == 20'000, ctx("S9 the other peer drains: mode=%s took %zu", srdsim::mode_name(m), room.taken0));
+        const size_t want0 = m == srdsim::Mode::DeferOne ? 10'000 : 20'000;
+        expect(room.taken0 == want0, ctx("S9 the other peer drains: mode=%s took %zu", srdsim::mode_name(m), room.taken0));
         room.open = true;
         for (int i = 0; i < 200 and not s.idle(); ++ i) s.progress(8, &batch, &room);
         expect(s.idle(), ctx("S9 everything drains once there is room: mode=%s", srdsim::mode_name(m)));
