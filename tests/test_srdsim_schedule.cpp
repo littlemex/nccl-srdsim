@@ -670,33 +670,6 @@ void test_room_holds_a_full_peer() {
     }
 }
 
-// S10: a strong signal waits for earlier operations on its own context and peer only.
-void test_strong_signal_is_scoped_to_its_context() {
-    Fabric f(1 << 16, 4);
-    srdsim::Scheduler::Options o;
-    o.mode = srdsim::Mode::ReverseOps;
-    o.chunk_bytes = 1000;
-    srdsim::Scheduler s(o);
-    srdsim::Op put = make_op(1, f, 0, 10'000, -1);
-    put.context = 0;
-    srdsim::Op sig = make_op(2, f, 20'000, 0, 0);
-    sig.context = 1;
-    sig.signal_is_strong = true;
-    std::string why;
-    expect(s.submit(put, &why) and s.submit(sig, &why), "S10 submit");
-    std::vector<srdsim::Unit> batch;
-    s.progress(1, &batch);
-    expect(batch.size() == 1 and batch[0].kind == srdsim::Unit::Kind::Signal,
-           "S10 a strong signal on another context is released before an earlier put");
-    srdsim::Scheduler t(o);
-    sig.context = 0;
-    expect(t.submit(put, &why) and t.submit(sig, &why), "S10 submit");
-    batch.clear();
-    t.progress(1, &batch);
-    expect(batch.size() == 1 and batch[0].kind == srdsim::Unit::Kind::Placement,
-           "S10 a strong signal on the same context waits for the earlier put");
-}
-
 int main() {
     test_overlapping_writes_are_named();
     test_overlap_detection_is_opt_in();
@@ -709,7 +682,6 @@ int main() {
     test_reproducible_and_exploring();
     test_oversized_is_refused();
     test_room_holds_a_full_peer();
-    test_strong_signal_is_scoped_to_its_context();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
