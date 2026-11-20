@@ -47,7 +47,7 @@ constexpr int kContexts = 2;
 constexpr int kPollBatch = 32;        // NCCL_GIN_PROXY_POLL_BATCH's default
 constexpr int kStallMs = 3000;        // nothing observable changed for this long while waiting: a stall
 constexpr int kRankWallMs = 10000;    // a rank gives up any single wait after this long
-constexpr size_t kDataBytes = 2u << 20;
+constexpr size_t kDataBytes = 8u << 20;   // room for one put larger than the transport's default frame limit
 constexpr size_t kSignalWords = 64;
 
 // Shared between the ranks of one case and the driver, in an anonymous shared mapping.
