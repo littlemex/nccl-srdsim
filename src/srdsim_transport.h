@@ -868,7 +868,7 @@ private:
                     // thread placed before it. A relaxed add would leave a correct reader racing
                     // with those bytes; a reader that loads the word without acquire is still wrong,
                     // and is still reported as such.
-                    __atomic_fetch_add(static_cast<uint64_t*>(dst), h.value, __ATOMIC_RELEASE);
+                    __atomic_fetch_add(static_cast<uint64_t*>(dst), h.value, __ATOMIC_RELAXED);
                 }
                 if (ok) { signals_.fetch_add(1, std::memory_order_release);
                           if (conn) conn->signals.fetch_add(1, std::memory_order_release);
