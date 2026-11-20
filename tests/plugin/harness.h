@@ -165,7 +165,8 @@ inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int,
     va_end(ap);
     std::lock_guard<std::mutex> g(g_log_mu);
     if (std::strncmp(buf, "SRD simulator: ", 15) == 0) g_init_line = buf;
-    if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped")))
+    if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped") or
+                                   std::strstr(buf, "outbox room still reserved")))
         g_poison_line = buf;
     if (g_verbose or level == NCCL_LOG_WARN) std::fprintf(stderr, "[rank %d] %s\n", g_rank, buf);
 }
@@ -215,6 +216,7 @@ struct Op {
     uint64_t value = 1;
     bool strong = false;
     bool refused = false;              // the case expects the plugin to refuse it; it may name memory outside the window
+    bool keep_source = false;          // the source is shared with later operations, so it is not overwritten on retirement
 };
 
 // What the rank's main thread sees of one operation: `done` when `test` reported it, `retired` when it
@@ -504,7 +506,7 @@ private:
             if (f.t->done.load(std::memory_order_relaxed) != 0 and f.index == frontier_[c][peer]) {
                 ++ frontier_[c][peer];
                 const Op& o = f.t->op;
-                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0 and not o.refused) {
+                if ((o.kind == Op::Put or o.kind == Op::PutSignal) and o.size > 0 and not o.refused and not o.keep_source) {
                     if (o.srcOff > data.size() or o.size > data.size() - o.srcOff)
                         fail("harness", "source-outside-window", "offset %llu size %zu",
                              static_cast<unsigned long long>(o.srcOff), o.size);

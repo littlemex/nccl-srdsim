@@ -1397,8 +1397,9 @@ bool wire_unit(CollComm* cc, const srdsim::Unit& u, const void* src) {
         // chose at `iget()` time goes out instead.
         if (u.is_get_response)
             return cc->links.send_placement(u.peer, u.window, u.window_offset, src, u.bytes,
-                                             u.get_response_token, srdsim::WireKind::GetResponse);
-        return cc->links.send_placement(u.peer, u.window, u.window_offset, src, u.bytes, u.op_id);
+                                             u.get_response_token, srdsim::WireKind::GetResponse, /*reserved=*/true);
+        return cc->links.send_placement(u.peer, u.window, u.window_offset, src, u.bytes, u.op_id,
+                                        srdsim::WireKind::Placement, /*reserved=*/true);
     }
     if (u.kind == srdsim::Unit::Kind::GetRequest)
         // Same reasoning as the response two lines up: the peer only ever echoes this value back, so
@@ -1406,11 +1407,13 @@ bool wire_unit(CollComm* cc, const srdsim::Unit& u, const void* src) {
         // id scoped to this rank's own scheduler and meaningless, and collision-prone, on the other end.
         return cc->links.send_get_request(u.peer, u.window, u.window_offset, u.bytes,
                                           u.get_dst_window, u.get_dst_off, u.get_requester_rank,
-                                          u.get_response_token);
-    return cc->links.send_signal(u.peer, u.window, u.window_offset, u.signal_is_add ? u.signal_val : 1, u.op_id);
+                                          u.get_response_token, /*reserved=*/true);
+    return cc->links.send_signal(u.peer, u.window, u.window_offset, u.signal_is_add ? u.signal_val : 1, u.op_id,
+                                 /*reserved=*/true);
 }
 
 void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u);
+void release_reservation(CollComm* cc, const srdsim::Unit& u);
 
 
 // Assigns free slots to unstaged units, in each connection's order. Called with `g_send.mu` held and the
@@ -1511,6 +1514,7 @@ bool finish_sends(const void* owner, bool send) {
     }
     const auto drop = [](const SendEntry& e) {
         g_send.broken.insert({e.owner, e.op_id});
+        release_reservation(static_cast<CollComm*>(const_cast<void*>(e.lane)), e.unit);
         note_send_failure(static_cast<RmaCtx*>(const_cast<void*>(e.owner)), e.unit);
     };
     size_t dropped = 0;
@@ -1822,19 +1826,21 @@ bool send_unit(CollComm* cc, const srdsim::Unit& u, [[maybe_unused]] RmaCtx* own
         probe_records(static_cast<const char*>(src), u.bytes, "sender, on the wire", u.peer, u.op_id);
         if (u.is_get_response)
             return cc->links.send_placement(u.peer, u.window, u.window_offset, src, u.bytes,
-                                             u.get_response_token, srdsim::WireKind::GetResponse);
-        return cc->links.send_placement(u.peer, u.window, u.window_offset, src, u.bytes, u.op_id);
+                                             u.get_response_token, srdsim::WireKind::GetResponse, /*reserved=*/true);
+        return cc->links.send_placement(u.peer, u.window, u.window_offset, src, u.bytes, u.op_id,
+                                        srdsim::WireKind::Placement, /*reserved=*/true);
     }
     if (u.kind == srdsim::Unit::Kind::GetRequest) {
         Mark get_mark("send_unit: writing a get request to the wire");
         // Same reasoning as the response case above: the token is this rank's own `RmaCtx*`, not `u.op_id`.
         return cc->links.send_get_request(u.peer, u.window, u.window_offset, u.bytes,
                                           u.get_dst_window, u.get_dst_off, u.get_requester_rank,
-                                          u.get_response_token);
+                                          u.get_response_token, /*reserved=*/true);
     }
     Mark signal_mark("send_unit: writing a signal to the wire");
     return cc->links.send_signal(u.peer, u.window, u.window_offset,
-                                 u.signal_is_add ? u.signal_val : 1, u.op_id);
+                                 u.signal_is_add ? u.signal_val : 1, u.op_id,
+                                 /*reserved=*/true);
 }
 
 // The receiving side's writers. Host windows are handled inside the agent; these are installed for
@@ -3248,6 +3254,8 @@ ncclResult_t srdsim_close_coll(void* collComm) {
         if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
 #endif
         cc->responder.stop();          // before the links it sends on go
+        if (const size_t r = cc->links.reserved_total())
+            logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
         cc->links.shutdown_all();      // tells every peer's agent to finish
         if (cc->agent) cc->agent->stop();
         delete cc;
@@ -3601,6 +3609,13 @@ void note_send_failure(RmaCtx* ctx, const srdsim::Unit& u) {
     logf("%s", detail);
 }
 
+// A released unit holds room in its peer's outbox until its frame is appended (see `LinkRoom` in
+// `srdsim_progress`). One that will not be sent gives the room back.
+void release_reservation(CollComm* cc, const srdsim::Unit& u) {
+    if (cc == nullptr) return;
+    cc->links.unreserve(u.peer, sizeof(srdsim::WireHeader) + (u.kind == srdsim::Unit::Kind::Placement ? u.bytes : 0));
+}
+
 ncclResult_t srdsim_progress(void* rmaCtx) {
     Mark mark("rmaProgress");
     auto* ctx = static_cast<RmaCtx*>(rmaCtx);
@@ -3647,12 +3662,40 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     // path keyed its per-operation failure record by the wrong context.
     std::vector<srdsim::Unit> batch;
     std::vector<RmaCtx*> owners;
+    // A unit is released only with room reserved for it in its peer's outbox (`SendLinks::reserve`), which
+    // `send_unit` then consumes, so a released unit is never refused for budget, whoever else is sending on
+    // the link. A peer that refuses once is full for the rest of this call. What is reserved and not released
+    // is returned at the end.
+    struct LinkRoom final : srdsim::Scheduler::Room {
+        srdsim::SendLinks* links = nullptr;
+        std::map<int, size_t> granted;   // reserved and not yet taken
+        std::set<int> full;
+        bool fits(int peer, size_t bytes) override {
+            if (links == nullptr) return true;
+            if (full.count(peer)) return false;
+            const size_t need = sizeof(srdsim::WireHeader) + bytes;
+            size_t& have = granted[peer];
+            if (have >= need) return true;
+            if (not links->reserve(peer, need - have)) { full.insert(peer); return false; }
+            have = need;
+            return true;
+        }
+        void take(int peer, size_t bytes) override {
+            size_t& have = granted[peer];
+            have -= std::min(have, sizeof(srdsim::WireHeader) + bytes);
+        }
+        ~LinkRoom() override {
+            if (links) for (const auto& g : granted) if (g.second) links->unreserve(g.first, g.second);
+        }
+    };
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
         const size_t before = batch.size();
         {
             std::lock_guard<std::mutex> g(c->mu);
-            c->sched->progress(/*budget=*/8, &batch);
+            LinkRoom room;
+            room.links = c->coll ? &c->coll->links : nullptr;
+            c->sched->progress(/*budget=*/8, &batch, &room);
         }
         owners.resize(batch.size(), c);
         c->progress_calls.fetch_add(1, std::memory_order_relaxed);
@@ -3676,8 +3719,9 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     size_t failed = 0;
     for (size_t i = 0; i < batch.size(); ++ i) {
         const auto& u = batch[i];
-        if (send_unit(ctx->coll, u, owners[i]))
+        if (send_unit(owners[i]->coll, u, owners[i]))
             continue;
+        release_reservation(owners[i]->coll, u);
         ++ failed;
         note_send_failure(owners[i], u);
     }

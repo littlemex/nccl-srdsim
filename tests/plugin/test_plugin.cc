@@ -416,6 +416,40 @@ void get_across_context_rebuild(Rank& R) {
     }
 }
 
+// More than the transport's 64 MiB outbox budget, put to a target whose process is stopped: nothing is lost.
+// Units the link cannot take must stay with the plugin until it can, so while the target is stopped no
+// error is reported, and once it continues every put lands and its signal counts once.
+void backpressure_target_stopped(Rank& R) {
+    constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
+    constexpr int puts = 80;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 18);
+        stop_peer(1);
+        std::vector<const Ticket*> t;
+        for (int i = 0; i < puts; ++ i) {
+            Op o = put_signal(0, 1, src, n, dst, 6, false);
+            o.keep_source = true;
+            t.push_back(R.issue(o));
+        }
+        set_where("target-stopped");
+        const auto start = Clock::now();
+        const uint64_t first = R.steps.load();
+        while (Clock::now() - start < std::chrono::milliseconds(2000) or R.steps.load() - first < 1000)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool lost = R.last_error();
+        continue_peer(1);
+        if (lost) fail("assert", "backpressure-lost", "%s", "queryLastError reported a failed send");
+        for (const Ticket* x : t) R.wait_retired(x, "put-with-signal");
+        set_flag(0);
+    } else {
+        R.wait_peer([&] { return R.signal_word(6) >= uint64_t(puts); }, "signal-word");
+        if (size_t bad = mismatches(R.at(dst), n, 0, 18)) fail("assert", "data", "%zu bytes", bad);
+        wait_flag(0, "sender-done");
+        expect_guards(R, dst, n);
+        expect_signals(R, {{6, uint64_t(puts)}});
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -446,6 +480,7 @@ const std::vector<Scenario>& scenarios() {
         {"register_during_traffic", register_during_traffic, 2, {"srd"}, {1, 2, 3}, nullptr},
         {"refused_then_real", refused_then_real, 2, {"srd"}, {1}, nullptr},
         {"get_across_context_rebuild", get_across_context_rebuild, 2, {"srd"}, {1}, nullptr},
+        {"backpressure_target_stopped", backpressure_target_stopped, 2, {"srd", "inorder"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
