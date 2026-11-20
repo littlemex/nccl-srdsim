@@ -18,10 +18,10 @@ def draw(L):
     # Right: GPU run.
     f.group(600, 60, 470, 380, L.t("GPU test (one GPU, real NCCL)", "GPU のテスト (GPU 1 枚、本物の NCCL)"), "nccl")
     rows = [
-        ("nccl", L.t("GPU kernel", "GPU のカーネル"), L.t("GIN puts with weak signals", "弱い合図付きの GIN の put")),
+        ("nccl", L.t("GPU kernel", "GPU のカーネル"), L.t("GIN puts with weak signals", "弱いシグナル付きの GIN の put")),
         ("nccl", L.t("NCCL GIN proxy backend", "NCCL の GIN プロキシバックエンド"), "NCCL_GIN_TYPE=2"),
         ("sim", L.t("This plugin", "このプラグイン"), L.t("loaded through NCCL_RMA_PLUGIN", "NCCL_RMA_PLUGIN で読み込む")),
-        ("target", L.t("Device memory", "デバイスのメモリ"), L.t("data and signal counters", "データと合図のカウンタ")),
+        ("target", L.t("Device memory", "デバイスのメモリ"), L.t("data and signal counters", "データとシグナルのカウンタ")),
     ]
     for i, (role, name, sub) in enumerate(rows):
         y = 100 + i * 82

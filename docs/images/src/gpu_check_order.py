@@ -6,9 +6,9 @@ NAME = "gpu-check-order"
 
 def draw(L):
     f = Fig(1100, 655, L, L.t("One round at the receiver: each chunk is checked once its own signal is visible",
-                               "受け手の 1 ラウンド: 各チャンクは、自分の合図が見えたときに確かめる"))
+                               "受け手の 1 ラウンド: 各チャンクは、自分のシグナルが見えたときに確かめる"))
     X0, DX, CW = 230, 95, 80          # time slot positions
-    rows = [L.t("data lands", "データが届く"), L.t("signal visible", "合図が見える"), L.t("block checks", "ブロックが確かめる")]
+    rows = [L.t("data lands", "データが届く"), L.t("signal visible", "シグナルが見える"), L.t("block checks", "ブロックが確かめる")]
 
     def lane(top, title, events):
         f.group(30, top, 1040, 235, title, "neutral")
@@ -26,14 +26,14 @@ def draw(L):
             (0, 1, "C0", None), (1, 3, "s0", None), (2, 4, "C0", True),
             (0, 4, "C1", None), (1, 5, "s1", None), (2, 6, "C1", True)]
     lane(55, L.t("A mode that keeps I1 (srd, inorder, ...): every signal after its own data",
-                 "I1 を守るモード (srd、inorder など): 合図はいつも自分のデータの後"), keep)
+                 "I1 を守るモード (srd、inorder など): シグナルはいつも自分のデータの後"), keep)
     bad = [(0, 0, "C2", None), (1, 1, "s2", None), (2, 2, "C2", True),
            (1, 3, "s1", None), (2, 4, "C1", False), (0, 6, "C1", None),
            (0, 2, "C0", None), (1, 5, "s0", None), (2, 7, "C0", True)]
     lane(310, L.t("violate-i1: a signal may become visible before its own data",
-                  "violate-i1: 合図が自分のデータより先に見えることがある"), bad)
+                  "violate-i1: シグナルが自分のデータより先に見えることがある"), bad)
     f.text(550, 645, L.t("Three of the 16 chunks are shown. Chunks may land in any order; only a signal ahead of its own data is forbidden.",
-                         "16 個のうち 3 個のチャンクを示す。チャンクはどの順に届いてもよく、禁じられるのは自分のデータより先の合図だけ。"),
+                         "16 個のうち 3 個のチャンクを示す。チャンクはどの順に届いてもよく、禁じられるのは自分のデータより先のシグナルだけ。"),
            size=12, color="#555555")
     f.text(X0 + 4 * DX + CW / 2, 615, L.t("C1 is read before its data lands: its elements count as mismatched",
                                          "C1 はデータが届く前に読まれ、その要素は値の違うものとして数えられる"), size=13,

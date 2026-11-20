@@ -29,13 +29,13 @@ def draw(L):
         f.cell(400 + c * 75, 402, 62, 26, f"s{c}" if c < 3 else "s15", "sig", size=12)
     f.arrow(338, 400, 396, 400)
     f.arrow(700, 400, 762, 400)
-    f.text(550, 452, L.t("16 chunks of 4,096 elements, each with a weak signal of its own id", "4,096 要素のチャンク 16 個。それぞれに別の ID の弱い合図が付く"),
+    f.text(550, 452, L.t("16 chunks of 4,096 elements, each with a weak signal of its own id", "4,096 要素のチャンク 16 個。それぞれに別の ID の弱いシグナルが付く"),
            size=13)
     f.step(380, 345, 1)
     f.box(765, 490, 280, 60, L.t("check each chunk", "チャンクを確かめる"), "target",
-          L.t("once its signal is visible", "合図が見えたら"))
+          L.t("once its signal is visible", "シグナルが見えたら"))
     f.step(745, 520, 2)
-    f.arrow(765, 570, 340, 570, L.t("weak signal: the slot is free again", "弱い合図: スロットが空いた"), dash=True,
+    f.arrow(765, 570, 340, 570, L.t("weak signal: the slot is free again", "弱いシグナル: スロットが空いた"), dash=True,
             width=2.5, ly=562)
     f.step(560, 595, 3)
     f.box(55, 490, 280, 60, L.t("flush; next round: wait, refill", "flush。次のラウンドで待って詰め直す"), "nccl", L.t("then puts again", "それから再び put"))
