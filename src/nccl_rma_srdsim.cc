@@ -3286,17 +3286,18 @@ srdsim::Op build_op(MrHandle* src, uint64_t srcOff, MrHandle* dst, uint64_t dstO
     return op;
 }
 
-ncclResult_t srdsim_iput(void* rmaCtx, int /*context*/, uint64_t srcOff, void* srcMhandle,
+ncclResult_t srdsim_iput(void* rmaCtx, int context, uint64_t srcOff, void* srcMhandle,
                          size_t size, uint64_t dstOff, void* dstMhandle, uint32_t rank,
                          void** request) {
     Mark mark("iput");
     auto* ctx = static_cast<RmaCtx*>(rmaCtx);
     auto op = build_op(static_cast<MrHandle*>(srcMhandle), srcOff,
                        static_cast<MrHandle*>(dstMhandle), dstOff, size, rank);
+    op.context = context;
     return submit(ctx, op, request);
 }
 
-ncclResult_t srdsim_iput_signal(void* rmaCtx, int /*context*/, uint64_t srcOff, void* srcMhandle,
+ncclResult_t srdsim_iput_signal(void* rmaCtx, int context, uint64_t srcOff, void* srcMhandle,
                                 size_t size, uint64_t dstOff, void* dstMhandle, uint32_t rank,
                                 uint64_t signalOff, void* signalMhandle, uint64_t signalValue,
                                 uint32_t signalOp, bool isStrongSignal, void** request) {
@@ -3304,6 +3305,7 @@ ncclResult_t srdsim_iput_signal(void* rmaCtx, int /*context*/, uint64_t srcOff, 
     auto* ctx = static_cast<RmaCtx*>(rmaCtx);
     auto op = build_op(static_cast<MrHandle*>(srcMhandle), srcOff,
                        static_cast<MrHandle*>(dstMhandle), dstOff, size, rank);
+    op.context = context;
     auto* sig = static_cast<MrHandle*>(signalMhandle);
     op.has_signal = true;
     op.signal_window = sig ? sig->window_id : 0;
@@ -3336,7 +3338,7 @@ ncclResult_t srdsim_iput_signal(void* rmaCtx, int /*context*/, uint64_t srcOff, 
 // it widens this simulator's surface past EFA-GDA on purpose, so that engram can be exercised at all; it
 // is not claimed to reproduce EFA-GDA's SRD reordering of a get the way the rest of this file does for
 // puts, because EFA-GDA does not have one to reproduce.
-ncclResult_t srdsim_iget(void* rmaCtx, int /*context*/, uint64_t remoteOff, void* remoteMhandle,
+ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* remoteMhandle,
                          size_t size, uint64_t localOff, void* localMhandle, uint32_t rank,
                          void** request) {
     Mark mark("iget");
@@ -3344,6 +3346,7 @@ ncclResult_t srdsim_iget(void* rmaCtx, int /*context*/, uint64_t remoteOff, void
     auto* remote = static_cast<MrHandle*>(remoteMhandle);
     auto* local = static_cast<MrHandle*>(localMhandle);
     srdsim::Op op;
+    op.context = context;
     op.peer = static_cast<int>(rank);
     op.is_get_request = true;
     op.get_src_window = remote ? remote->window_id : 0;
