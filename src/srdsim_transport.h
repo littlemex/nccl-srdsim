@@ -926,6 +926,12 @@ private:
 // One stream per peer. Writes are serialised per peer so that the order the scheduler chose is the
 // order that reaches the peer; that serialisation is the whole reason the simulator's control over
 // ordering survives the wire.
+class SendLinks;
+// Set on a thread that appends several frames and then pushes each outbox it appended to once (`DeferDrain`):
+// the flag, and the (links, peer) pairs whose outbox holds a deferred frame.
+inline thread_local bool t_defer_drain = false;
+inline thread_local std::vector<std::pair<SendLinks*, int>>* t_deferred = nullptr;
+
 class SendLinks {
 public:
     // Optional breadcrumb sink. The transport can block in exactly two places -- waiting for a peer's
@@ -1279,11 +1285,16 @@ private:
             if (length > 0)
                 out.append(static_cast<const char*>(payload), static_cast<size_t>(length));
         }
+        if (t_defer_drain) {   // the caller pushes this outbox once it has appended its frames
+            if (t_deferred) t_deferred->emplace_back(this, peer);
+            return true;
+        }
         note("transport: pushing bytes to the socket");
         const bool ok = drain_locked(peer);
         note("transport: done");
         return ok;
     }
+
 
     // Called with the peer's send lock held. Pushes bytes until the socket refuses them.
     bool drain_locked(int peer) {
@@ -1378,6 +1389,44 @@ private:
     std::vector<size_t> reserved_;                  // per peer: room held for frames not yet appended (`reserve`)
     std::atomic<uint64_t> refused_for_budget_{0};
     std::deque<std::mutex> locks_;   // deque: a mutex is not movable, so the vector cannot grow it
+};
+
+// While one is alive, frames this thread sends are appended to their outbox and not pushed; `finish` then pushes
+// each outbox that received one, once, and returns those whose push failed (a broken link). The bytes on each
+// stream are the same; only the number of system calls changes, from at least one per frame to at least one per
+// peer. Nests: an inner guard restores the outer one's state.
+class DeferDrain {
+public:
+    DeferDrain() : prev_flag_(t_defer_drain), prev_list_(t_deferred) {
+        t_defer_drain = true;
+        t_deferred = &list_;
+    }
+    ~DeferDrain() { restore(); }
+    DeferDrain(const DeferDrain&) = delete;
+    DeferDrain& operator=(const DeferDrain&) = delete;
+
+    std::vector<std::pair<SendLinks*, int>> finish() {
+        restore();
+        std::sort(list_.begin(), list_.end());
+        list_.erase(std::unique(list_.begin(), list_.end()), list_.end());
+        std::vector<std::pair<SendLinks*, int>> failed;
+        for (const auto& d : list_)
+            if (not d.first->flush(d.second)) failed.push_back(d);
+        list_.clear();
+        return failed;
+    }
+
+private:
+    void restore() {
+        if (restored_) return;
+        restored_ = true;
+        t_defer_drain = prev_flag_;
+        t_deferred = prev_list_;
+    }
+    bool prev_flag_;
+    std::vector<std::pair<SendLinks*, int>>* prev_list_;
+    std::vector<std::pair<SendLinks*, int>> list_;
+    bool restored_ = false;
 };
 
 }   // namespace srdsim
