@@ -21,7 +21,8 @@ if(SRDSIM_SANITIZER)
   if(NOT SRDSIM_SANITIZER MATCHES "^(address|undefined|thread)$")
     message(FATAL_ERROR "SRDSIM_SANITIZER must be address, undefined or thread, not '${SRDSIM_SANITIZER}'")
   endif()
-  # A finding stops the program, so a test that triggers one fails rather than printing and passing.
+  # UBSan stops at a finding only when built not to recover; ASan always stops; ThreadSanitizer stops only
+  # through TSAN_OPTIONS, which the tests below are given.
   add_compile_options(-fsanitize=${SRDSIM_SANITIZER} -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=${SRDSIM_SANITIZER})
 endif()
@@ -42,6 +43,11 @@ if(SRDSIM_BUILD_TESTS)
     target_link_libraries(${t} PRIVATE srdsim_core Threads::Threads)
     target_compile_options(${t} PRIVATE ${SRDSIM_WARNINGS})
     add_test(NAME ${t} COMMAND ${t})
+    if(SRDSIM_SANITIZER)
+      # The same options locally as in CI, so that a finding fails the test wherever it is run.
+      set_tests_properties(${t} PROPERTIES ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=1:abort_on_error=1;UBSAN_OPTIONS=print_stacktrace=1;TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+    endif()
   endforeach()
 endif()
 
