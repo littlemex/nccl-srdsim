@@ -482,6 +482,9 @@ struct CollComm {
     uint64_t last_reported_placements = ~0ull;
     uint64_t last_reported_signals = ~0ull;
     std::vector<std::unique_ptr<MrHandle>> mrs;
+    // Progress calls in which a peer's outbox had no room, so its operations stayed pending, counted once per call
+    // and peer: backpressure at work.
+    std::atomic<uint64_t> held_for_room{0};
     // Every context created on this communicator, so a report can ask each scheduler what it is still
     // holding. Raw pointers: NCCL owns the lifetime through `createContext` / `destroyContext`, and a
     // destroyed context removes itself.
@@ -605,6 +608,7 @@ RequestSlab& g_requests = *new RequestSlab;
 // here, which is the point.
 #ifdef SRDSIM_WITH_CUDA
 void prebuild_signal_kernel();   // defined below, next to the signal kernel it builds
+void report_device_delivery_once();   // defined below, once every mechanism it names is
 // The plugin's private non-blocking stream, shared by every device access it makes. Declared here
 // because the sending path needs it before the class that owns it is defined.
 CUstream device_stream();
@@ -2350,6 +2354,26 @@ private:
 // Never destroyed; see `g_where`.
 DeviceAtomicAdd& g_device_atomic_add = *new DeviceAtomicAdd;
 
+// Which mechanism writes device windows in this process, on stderr whatever NCCL_DEBUG says, once, when the first
+// device window is registered: the delivery's speed and its deadlock exposure both follow from it, and a run
+// cannot be compared with another without knowing it.
+void report_device_delivery_once() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+#ifdef SRDSIM_WITH_GDRCOPY
+        const bool gdr = g_gdr.ready();
+#else
+        const bool gdr = false;
+#endif
+        const char* context = delivery_uses_primary() ? "primary" : delivery_uses_green() ? "green" : "own";
+        lifecycle("device delivery: %s; CUDA context for copies: %s; signals into windows registered with "
+                  "SIGNAL_NEVER_RESET: %s, into other device windows: an atomic add kernel",
+                  gdr ? "GDRCopy (CPU stores through the BAR mapping)"
+                      : delivery_async() ? "CUDA copies, queued (asynchronous)" : "CUDA copies, each waited for",
+                  context, env_size("SRDSIM_SIGNAL_KERNEL", 0) != 0 ? "an atomic add kernel" : "stored totals");
+    });
+}
+
 // Compiles and loads the signal kernel now, reporting the outcome. Called when the first device window
 // is registered, which is before any of DeepEP's kernels have run.
 void prebuild_signal_kernel() {
@@ -3171,6 +3195,8 @@ ncclResult_t srdsim_reg_mr_sym(void* collComm, void* data, size_t size, int type
         // operation back into the hot path this whole change exists to empty.
         g_gdr.add(data, size);
 #endif
+        // Once everything that decides the mechanism has run for the first device window.
+        report_device_delivery_once();
     }
     }
 #endif
@@ -3297,6 +3323,10 @@ ncclResult_t srdsim_close_coll(void* collComm) {
         if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
 #endif
         cc->responder.stop();          // before the links it sends on go
+        lifecycle("communicator %p closing: progress calls that held a peer for outbox room %llu, "
+                  "frames refused for the outbox budget %llu", collComm,
+                  static_cast<unsigned long long>(cc->held_for_room.load()),
+                  static_cast<unsigned long long>(cc->links.refused_for_budget()));
         if (const size_t r = cc->links.reserved_total())
             logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
         cc->links.shutdown_all();      // tells every peer's agent to finish
@@ -3738,6 +3768,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     // is returned at the end.
     struct LinkRoom final : srdsim::Scheduler::Room {
         srdsim::SendLinks* links = nullptr;
+        CollComm* cc = nullptr;
+        std::set<std::pair<CollComm*, int>>* held = nullptr;   // peers already counted as held in this call
         std::map<int, size_t> granted;   // reserved and not yet taken
         std::set<int> full;
         bool fits(int peer, size_t bytes) override {
@@ -3746,7 +3778,11 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             const size_t need = sizeof(srdsim::WireHeader) + bytes;
             size_t& have = granted[peer];
             if (have >= need) return true;
-            if (not links->reserve(peer, need - have)) { full.insert(peer); return false; }
+            if (not links->reserve(peer, need - have)) {
+                full.insert(peer);
+                if (held->insert({cc, peer}).second) cc->held_for_room.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             have = need;
             return true;
         }
@@ -3758,6 +3794,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             if (links) for (const auto& g : granted) if (g.second) links->unreserve(g.first, g.second);
         }
     };
+    std::set<std::pair<CollComm*, int>> held;
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
         const size_t before = batch.size();
@@ -3765,6 +3802,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             std::lock_guard<std::mutex> g(c->mu);
             LinkRoom room;
             room.links = c->coll ? &c->coll->links : nullptr;
+            room.cc = c->coll;
+            room.held = &held;
             c->sched->progress(/*budget=*/8, &batch, &room);
         }
         owners.resize(batch.size(), c);
