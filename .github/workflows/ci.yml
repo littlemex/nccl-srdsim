@@ -16,6 +16,8 @@ jobs:
           cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Configuration reference lists every variable the source reads
+        run: ./scripts/check_configuration_reference.sh
 
   # The plugin against NCCL's plugin ABI for each supported NCCL release, in each delivery
   # configuration, with declaration-only CUDA stand-ins. Checks the generated NCCL version, the op

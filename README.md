@@ -85,7 +85,7 @@ export NCCL_GIN_TYPE=2
 export SRDSIM_MODE=srd SRDSIM_SEED=1
 ```
 
-The plugin reads further `SRDSIM_*` settings for impairments and diagnostics; a reference is in progress ([#3](https://github.com/littlemex/nccl-srdsim/issues/3)). CI builds the plugin in every configuration and loads the build without the CUDA delivery path with `dlopen`, looking up its op tables as NCCL does; it does not run NCCL. A run under NCCL on a GPU is being validated in [#8](https://github.com/littlemex/nccl-srdsim/issues/8).
+Every `SRDSIM_*` setting, with its default, is listed in [docs/configuration.md](docs/configuration.md). CI builds the plugin in every configuration and loads the build without the CUDA delivery path with `dlopen`, looking up its op tables as NCCL does; it does not run NCCL. A run under NCCL on a GPU is being validated in [#8](https://github.com/littlemex/nccl-srdsim/issues/8).
 
 ## Security
 
