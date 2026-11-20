@@ -31,7 +31,7 @@ Read each time NCCL creates an RMA context.
 |---|---|---|---|
 | `SRDSIM_MODE` | name | `srd` | The delivery schedule: `srd`, `inorder`, `peer-seq`, `reverse-ops`, `signal-last`, `defer-one` or `violate-i1` (see the [README](../README.md#delivery-modes)). An unknown name is logged and `srd` is used |
 | `SRDSIM_SEED` | count | `1` | Seed of the schedule's random choices. `0` gives the default, so seed 0 cannot be chosen |
-| `SRDSIM_CHUNK_BYTES` | count | `8192` | Size of the chunks an operation is split into, and also, read once, the size of every pinned staging slot, which bounds `SRDSIM_STAGING_RING`. Use the same value on every rank: a frame larger than the receiver's slot is copied through pageable memory, and above 4 MiB a receiver accepts frames up to its own value only |
+| `SRDSIM_CHUNK_BYTES` | count | `8192` | Size of the chunks an operation is split into, and also, read once, the size of every pinned staging slot, which bounds `SRDSIM_STAGING_RING`. Use the same value on every rank: a frame larger than the receiver's slot is copied through pageable memory, and above 4 MiB a receiver accepts frames up to its own value only: a larger frame from a rank with a larger value closes the link, and the operations still to travel on it are lost. At most 64 MiB; a larger value is reduced to that |
 | `SRDSIM_DEFER_KIND` | name | `any` | Which operation `defer-one` holds back: the oldest of `any` kind, or the oldest `unsignaled` put, `signaled` put or `signal-only` operation. An unknown name is logged and `any` is used |
 
 ## Delivery
