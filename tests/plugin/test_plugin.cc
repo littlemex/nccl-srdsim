@@ -159,6 +159,16 @@ struct Rank {
         wait_until([&] { step(); return outstanding[index].done; }, what, false);
     }
 
+    // Waits for a peer to set flag[i], without running the proxy loop. Bounded by the wall clock only:
+    // the peer that is doing the work reports its own stall first.
+    void wait_flag(int i, const char* what) const {
+        const auto start = Clock::now();
+        while (g_shared->flag[i].load(std::memory_order_acquire) == 0) {
+            if (Clock::now() - start > std::chrono::milliseconds(kWallMs)) fail("stall", what);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+
     uint64_t signal_word(size_t i) const {
         return __atomic_load_n(&signals[i], __ATOMIC_ACQUIRE);
     }
@@ -266,9 +276,12 @@ void put_then_strong_signal(Rank& R) {
 
 // I1 over many rounds: when a weak signal's word reaches its value, the put it was bundled with has landed.
 void i1_holds(Rank& R) {
-    constexpr size_t n = 64 << 10, src = 0, dst = 1 << 20;
+    // A fresh destination each round: the barrier that orders one round's reads before the next round's
+    // writes runs between processes, where ThreadSanitizer cannot see it.
+    constexpr size_t n = 64 << 10, src = 0, base = 1 << 20;
     constexpr int rounds = 12;
     for (int r = 0; r < rounds; ++ r) {
+        const size_t dst = base + size_t(r) * n;
         if (g_rank == 0) {
             fill(R.data, src, n, 0, r);
             const size_t i = R.put_signal(0, src, n, dst, 1, 1, 1, false);
@@ -291,13 +304,12 @@ void violate_control(Rank& R) {
         fill(R.data, src, n, 0, 3);
         const size_t i = R.put_signal(0, src, n, dst, 1, 2, 1, false);
         R.step();                                             // one rmaProgress: one batch released
-        R.wait_until([&] { return g_shared->flag[0].load() != 0; }, "target-looked", false,
-                     [&] { return uint64_t(g_shared->flag[0].load()); });
+        R.wait_flag(0, "target-looked");
         R.wait_done(i, "put-with-signal");
     } else if (g_rank == 1) {
         R.wait_until([&] { return R.signal_word(2) >= 1; }, "signal-word");
         const size_t bad = mismatches(R.data, dst, n, 0, 3);
-        g_shared->flag[0].store(1);
+        g_shared->flag[0].store(1, std::memory_order_release);
         if (bad == 0) fail("assert", "control-missed", "the signal arrived with its whole put");
     }
 }
@@ -312,10 +324,9 @@ void get_owner_idle(Rank& R) {
         const size_t g = R.get(0, off, n, off, 1);
         R.wait_done(g, "get");
         if (const size_t bad = mismatches(R.data, off, n, 1, 5)) fail("assert", "data-after-complete", "%zu bytes", bad);
-        g_shared->flag[0].store(1);
+        g_shared->flag[0].store(1, std::memory_order_release);
     } else if (g_rank == 1) {
-        R.wait_until([&] { return g_shared->flag[0].load() != 0; }, "requester-done", false,
-                     [&] { return uint64_t(g_shared->flag[0].load()); });
+        R.wait_flag(0, "requester-done");
     }
 }
 
@@ -331,10 +342,11 @@ void get_multichunk_flush(Rank& R) {
                      true, [&] { return uint64_t(n - mismatches(R.data, off, n, 1, 6)); });
         const size_t f = R.flush(0);
         R.wait_done(f, "flush");
-        g_shared->flag[0].store(1);
+        g_shared->flag[0].store(1, std::memory_order_release);
     } else if (g_rank == 1) {
-        R.wait_until([&] { return g_shared->flag[0].load() != 0; }, "requester-done", true,
-                     [&] { return uint64_t(g_shared->flag[0].load()); });
+        // The owner keeps its proxy loop running, so that the reply is released under today's design.
+        R.wait_until([&] { return g_shared->flag[0].load(std::memory_order_acquire) != 0; }, "requester-done", true,
+                     [&] { return uint64_t(Clock::now().time_since_epoch().count()); });
     }
 }
 
