@@ -2489,6 +2489,26 @@ void forget_signal_totals(void* base, size_t bytes) {
     g_signal_shadow.forget_range(base, bytes);
 }
 
+// Device windows registered with NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET. Only in these is the plugin the only
+// writer of a signal word, so only here may a signal be stored as a running total. A signal into any other
+// device window is an atomic add on the device, because the application may reset the word itself (aws-ofi-nccl
+// likewise keeps its signal shadow only for windows with this flag).
+struct NeverResetWindows {
+    std::mutex mu;
+    std::map<char*, size_t> ranges;   // base -> bytes
+    void add(void* base, size_t bytes) { std::lock_guard<std::mutex> g(mu); ranges[static_cast<char*>(base)] = bytes; }
+    void forget(void* base) { std::lock_guard<std::mutex> g(mu); ranges.erase(static_cast<char*>(base)); }
+    bool covers(void* p) {
+        auto* c = static_cast<char*>(p);
+        std::lock_guard<std::mutex> g(mu);
+        auto it = ranges.upper_bound(c);
+        if (it == ranges.begin()) return false;
+        -- it;
+        return c + sizeof(uint64_t) <= it->first + it->second;
+    }
+};
+NeverResetWindows& g_never_reset = *new NeverResetWindows;
+
 bool device_add(void* dst_u64, uint64_t value, void* /*user*/) {
     Mark mark("device_add: applying a signal into a device window");
     DeliveryContext in_delivery_context;
@@ -2496,7 +2516,7 @@ bool device_add(void* dst_u64, uint64_t value, void* /*user*/) {
     // The kernel path is kept because it is the only way to check the two against each other, and
     // because a deployment where the plugin is not the only writer would need it.
     static const bool signal_kernel = env_size("SRDSIM_SIGNAL_KERNEL", 0) != 0;   // read once; see `env_size`
-    if (signal_kernel)
+    if (signal_kernel or not g_never_reset.covers(dst_u64))
         return g_device_atomic_add.add(dst_u64, value);
     return g_signal_shadow.add(dst_u64, value);
 }
@@ -3119,6 +3139,7 @@ ncclResult_t srdsim_reg_mr_sym(void* collComm, void* data, size_t size, int type
         return ncclSystemError;
     }
     {
+        if (mrFlags & NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET) g_never_reset.add(data, size);
         prebuild_signal_kernel();
         // The pinned staging pool, for the same reason and one step stronger. Page-locked allocation
         // implicitly synchronizes the context, so it has to happen while the context is still quiet.
@@ -3197,6 +3218,7 @@ ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
 #ifdef SRDSIM_WITH_CUDA
     if (auto* mr = static_cast<MrHandle*>(mhandle)) {
         forget_signal_totals(mr->local_base, mr->bytes);
+        g_never_reset.forget(mr->local_base);
 #ifdef SRDSIM_WITH_GDRCOPY
         // The mapping cannot outlive the window for the same reason the signal totals cannot: the address
         // can come back attached to something else.
