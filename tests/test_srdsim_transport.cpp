@@ -782,7 +782,8 @@ void test_deregistration_waits_for_a_write_under_way() {
 
 // T12. A reader that waits on the signal word with an acquire load, as a GIN receiver does, and then reads the
 // bytes the signal guards, without asking the agent anything. The agent must release the word after the
-// bytes it placed before it, or that reader races with them; ThreadSanitizer reports the race.
+// bytes it placed before it, or that reader races with them. Only ThreadSanitizer detects the race: built
+// without it, a relaxed add passes on x86, where the locked add is a full barrier, and almost always elsewhere.
 void test_a_signal_word_orders_the_bytes_before_it() {
     std::vector<char> data(4096, 0);
     alignas(8) uint64_t signal_word = 0;
@@ -808,9 +809,12 @@ void test_a_signal_word_orders_the_bytes_before_it() {
         if (seen == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     expect(seen == 1, "T12 the signal arrived");
-    size_t wrong = 0;
-    for (char c : data) wrong += c != 's';
-    expect(wrong == 0, ctx("T12 every byte placed before the signal is visible once it is (%zu wrong)", wrong));
+    // Without the signal nothing orders the agent's write before this read, so the bytes are not read then.
+    if (seen == 1) {
+        size_t wrong = 0;
+        for (char c : data) wrong += c != 's';
+        expect(wrong == 0, ctx("T12 every byte placed before the signal is visible once it is (%zu wrong)", wrong));
+    }
     links.shutdown_all();
     agent.stop();
 }
