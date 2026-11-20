@@ -17,7 +17,7 @@ Unless a row says otherwise, a number is a decimal integer, and an empty value, 
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SRDSIM_DELIVERY_CONTEXT` | the plugin's own CUDA context | `primary` copies into device memory from the device's primary context, which accepts any allocation; `green` copies from a green context (CUDA 12.4 or later). Any other value keeps the default, which needs windows allocated with `ncclMemAlloc`. See [Device delivery](architecture.md#device-delivery) |
+| `SRDSIM_DELIVERY_CONTEXT` | the plugin's own CUDA context | `primary` copies into device memory from the device's primary context, which accepts any allocation; `green` copies from a green context (CUDA 12.4 or later). Any other value keeps the default, which needs windows allocated with `ncclMemAlloc` |
 | `SRDSIM_NO_GDRCOPY` | off | In a build with GDRCopy, pins and maps no window and delivers with CUDA copies instead |
 | `SRDSIM_ASYNC_DELIVERY` | `1` | `0` waits for every CUDA copy as it is issued instead of queueing it. Any other value keeps the default. The queue is used only with CUDA copies and pinned staging |
 | `SRDSIM_STAGING_RING` | `128` | Number of pinned staging slots a thread may have outstanding when copies are queued; at least 2, and bounded by the plugin's limit on pinned memory |
