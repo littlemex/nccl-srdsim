@@ -1191,6 +1191,10 @@ public:
     DeliveryContext(const DeliveryContext&) = delete;
     DeliveryContext& operator=(const DeliveryContext&) = delete;
     bool ok() const { return ok_; }
+    // Whether a delivery context exists at all. It is created when the first device window is registered;
+    // without it nothing has been put on the delivery stream, so "not ok" means there is nothing to wait for
+    // rather than a failure.
+    bool exists() const { return d_.ctx != nullptr; }
     CUstream stream() const { return d_.stream; }
 
 private:
@@ -3044,20 +3048,25 @@ ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
     // delivery stream after its write returned. NCCL frees the memory once this returns, so it waits.
     // A queued send may point into it too. The result is reported after the cleanup below, which has to
     // happen either way: NCCL frees the memory regardless of what this returns.
-    // Without a delivery context no device window was ever registered, so nothing is on the delivery stream
-    // and nothing can be queued to send (`send_unit_async` needs the context): there is nothing to wait for.
     bool drained = true;
-    if (delivery_async() and delivery().ctx != nullptr) {
+    if (delivery_async()) {
         auto* mr = static_cast<MrHandle*>(mhandle);
         if (mr != nullptr) {
             drained = finish_sends(nullptr, /*send=*/true);
             DeliveryContext in_delivery_context;
-            const CUresult rc = in_delivery_context.ok() ? cuStreamSynchronize(in_delivery_context.stream())
-                                                         : CUDA_ERROR_INVALID_CONTEXT;
-            if (rc != CUDA_SUCCESS) {
-                poison_delivery("waiting for copies before a deregistration", rc);
+            if (in_delivery_context.ok()) {
+                const CUresult rc = cuStreamSynchronize(in_delivery_context.stream());
+                if (rc != CUDA_SUCCESS) {
+                    poison_delivery("waiting for copies before a deregistration", rc);
+                    drained = false;
+                }
+            } else if (in_delivery_context.exists()) {
+                // The context exists but this thread cannot enter it (the process is exiting, or the push
+                // failed, already logged): the copies cannot be confirmed. That is not a fault of the stream,
+                // so delivery is not stopped for it.
                 drained = false;
             }
+            // Without a context no device window was ever registered and nothing is on the stream.
             if (not drained)
                 logf("window %u was deregistered with copies or sends that could not be confirmed", mr->window_id);
         }
