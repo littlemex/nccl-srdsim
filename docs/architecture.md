@@ -167,7 +167,7 @@ A get is one-sided, as an RDMA read is: the owner's plugin answers it without th
 - **Reply.** On the owner, the receive thread that reads the request copies the bytes from the window and hands them to the communicator's responder thread. The responder sends them in frames of `SRDSIM_CHUNK_BYTES`, but at most 4 MiB, the frame every receiver accepts whatever its own chunk size, in the order the requests arrived from each requester, retries a frame its outbox refuses, and serves requesters in turn, so one that stops reading holds up only its own replies. The reply does not go through the owner's scheduler, so the delivery modes do not reorder its chunks.
 - **Completion.** Each reply frame names the get by its id. The requester subtracts the frame's length from the get, and from the total its plugin context's `iflush` waits on; `test` reports the get done when no byte is left. A reply for an id with no record is dropped. When a plugin context is destroyed, its outstanding gets are aborted: a late reply is dropped, and `test` finishes the get without reporting its data as landed.
 
-EFA-GDA, the device-side GIN backend for SRD, has no get; this path exists for code written against GIN backends that have one, such as aws-ofi-nccl's host-proxy backend, whose `iget` is an `fi_read`.
+EFA-GDA, the device-side GIN backend for SRD, has no get; this path exists for code written against GIN backends that have one, such as aws-ofi-nccl's host-proxy backend, whose `iget` is an [`fi_read`](https://github.com/aws/aws-ofi-nccl/blob/2475c4c736907e68ebeadb3848f31231ee4a44d0/include/rdma/gin/nccl_ofi_gin_reqs.h#L414).
 
 ## Impairments and diagnostics
 
