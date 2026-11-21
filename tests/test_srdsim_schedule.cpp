@@ -793,7 +793,7 @@ void test_release_fingerprints() {
 // S13: `pick` (and `srd`'s release tree) chooses exactly what the list-building `pick_reference` would, unit by unit,
 // in every mode and over random workloads: operations of 0 to 300 chunks to three peers on two contexts, weak and
 // strong signals, gets, progress budgets from 1 to 17, and links that are full for some peers on some calls. On even
-// seeds the ids are not in submission order, so an operation can arrive older than one already pending. The release
+// seeds the ids are not in submission order: earlier means submitted earlier, whatever the ids. The release
 // tree's indices are recounted after every call, and the workloads are long enough to compact its slots.
 void test_pick_matches_reference() {
     struct Room final : srdsim::Scheduler::Room {

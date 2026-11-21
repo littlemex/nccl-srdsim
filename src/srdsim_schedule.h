@@ -305,11 +305,7 @@ public:
         pending_ids_.insert(op.id);
         ++ live_count_;
         peer_slots_[op.peer].insert(slot);
-        auto& key = key_slots_[std::make_pair(op.context, op.peer)];
-        key.insert({op.id, slot});
-        // Ids need not grow with submission: an operation older by id than the one that was oldest on its context and
-        // peer holds that one's strong signal back again.
-        if (key.size() > 1 and key.begin()->second == slot) refresh(std::next(key.begin())->second);
+        key_slots_[std::make_pair(op.context, op.peer)].insert(slot);
         refresh(slot);
         return true;
     }
@@ -414,7 +410,7 @@ public:
         std::map<int, int64_t> peer_w;
         std::map<int, std::multiset<size_t>> units;
         std::map<int, std::set<size_t>> peers;
-        std::map<std::pair<int, int>, std::set<std::pair<uint64_t, size_t>>> keys;
+        std::map<std::pair<int, int>, std::set<size_t>> keys;
         int64_t total = 0;
         for (size_t i = 0; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
@@ -424,12 +420,13 @@ public:
                 if ((p.remaining == 0 and not p.signal_pending) or pending_ids_.count(p.op.id) == 0) return false;
                 bool sig = p.signal_pending and p.remaining == 0;
                 if (sig and p.op.signal_is_strong)
-                    for (const Pending& q : pending_)
-                        if (q.live and q.op.id < p.op.id and q.op.peer == p.op.peer and q.op.context == p.op.context)
-                            sig = false;
+                    for (size_t j = 0; j < i; ++ j) {
+                        const Pending& q = pending_[j];
+                        if (q.live and q.op.peer == p.op.peer and q.op.context == p.op.context) sig = false;
+                    }
                 w = p.remaining + (sig ? 1 : 0);
                 peers[p.op.peer].insert(i);
-                keys[std::make_pair(p.op.context, p.op.peer)].insert({p.op.id, i});
+                keys[std::make_pair(p.op.context, p.op.peer)].insert(i);
                 if (const size_t u = unit_of(p)) units[p.op.peer].insert(u);
                 if (w) peer_w[p.op.peer] += w;
             } else {
@@ -584,12 +581,13 @@ private:
             return false;                // I1: every byte of its own operation placed first
         if (not p.op.signal_is_strong)
             return true;
-        // A strong signal additionally waits for every earlier operation to this peer to be fully
-        // released. That is the difference between the two forms, and it is enforced here rather than
-        // refused at the door.
+        // A strong signal additionally waits for every operation submitted before it on its context and peer to be
+        // fully released. That is the difference between the two forms, and it is enforced here rather than refused
+        // at the door. Earlier is by submission, the order `pending_` keeps, not by id: ids are the caller's, and an
+        // order by id would disagree with `peer-seq`, which keeps submission order, and hold both operations forever.
         for (const Pending& q : pending_) {
-            if (not q.live or q.op.id >= p.op.id) continue;
-            if (q.op.peer != p.op.peer or q.op.context != p.op.context) continue;
+            if (&q == &p) break;
+            if (not q.live or q.op.peer != p.op.peer or q.op.context != p.op.context) continue;
             if (q.remaining != 0 or q.signal_pending) return false;
         }
         return true;
@@ -818,15 +816,15 @@ private:
         remove_slot(peer_slots_, p.op.peer, i);
         const auto key = std::make_pair(p.op.context, p.op.peer);
         auto ks = key_slots_.find(key);
-        const bool was_oldest = ks != key_slots_.end() and not ks->second.empty() and ks->second.begin()->second == i;
+        const bool was_oldest = ks != key_slots_.end() and *ks->second.begin() == i;
         if (ks != key_slots_.end()) {
-            ks->second.erase({p.op.id, i});
+            ks->second.erase(i);
             if (ks->second.empty()) key_slots_.erase(ks);
         }
         // A strong signal waits for every earlier operation on its context and peer: the next oldest may now go.
         if (was_oldest) {
             ks = key_slots_.find(key);
-            if (ks != key_slots_.end()) refresh(ks->second.begin()->second);
+            if (ks != key_slots_.end()) refresh(*ks->second.begin());
         }
         p.placed = {};
         p.unplaced = {};
@@ -857,9 +855,9 @@ private:
         if (not p.live) return 0;
         bool sig = p.signal_pending and p.remaining == 0;
         if (sig and p.op.signal_is_strong) {
-            // Earlier means a smaller id, as in `signal_releasable`.
+            // The oldest live operation on its context and peer, as in `signal_releasable`.
             const auto ks = key_slots_.find(std::make_pair(p.op.context, p.op.peer));
-            sig = ks != key_slots_.end() and ks->second.begin()->second == i;
+            sig = ks != key_slots_.end() and *ks->second.begin() == i;
         }
         return p.remaining + (sig ? 1 : 0);
     }
@@ -941,7 +939,7 @@ private:
             Pending& p = pending_[i];
             p.in_units = false;
             peer_slots_[p.op.peer].insert(i);
-            key_slots_[std::make_pair(p.op.context, p.op.peer)].insert({p.op.id, i});
+            key_slots_[std::make_pair(p.op.context, p.op.peer)].insert(i);
         }
         weight_.assign(pending_.size(), 0);
         fw_.assign(pending_.size() + 1, 0);
@@ -1006,8 +1004,7 @@ private:
     std::map<int, std::set<size_t>> peer_slots_;                    // live slots per peer
     std::map<int, int64_t> peer_weight_;                            // per peer with any: the sum of its slots' weights
     std::map<int, std::multiset<size_t>> peer_units_;               // per peer: `unit_of` each live slot, where not 0
-    // Live (id, slot) per (context, peer), smallest id first.
-    std::map<std::pair<int, int>, std::set<std::pair<uint64_t, size_t>>> key_slots_;
+    std::map<std::pair<int, int>, std::set<size_t>> key_slots_;     // live slots per (context, peer), oldest first
     std::vector<int> weight_;                    // per slot: what `weight` was when last refreshed
     std::vector<int64_t> fw_, ex_;               // Fenwick trees over `weight_`, and over the excluded peers' part
     int64_t fw_total_ = 0;
