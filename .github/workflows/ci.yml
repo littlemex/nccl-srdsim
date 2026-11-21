@@ -244,6 +244,11 @@ jobs:
           test "$want" = "$have" || { echo "the harness runs tables '$have' but the plugin exports '$want'"; exit 1; }
       - name: The plugin harness, once per op-table version
         run: ctest --test-dir build -R plugin_harness --output-on-failure --verbose
+      - name: Benchmark through the newest op table (numbers only, no thresholds)
+        run: |
+          table=$(ctest --test-dir build -N -R plugin_harness | sed -n 's/.*plugin_harness_v\([0-9]*\)$/\1/p' | sort -n | tail -1)
+          ./build/bench_plugin "$PWD/build/libnccl-rma-srdsim.so" "$table" | tee "$RUNNER_TEMP/bench.txt"
+          { echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: The same build serves every pinned release
         run: ./ci/check_serves_all.sh build/libnccl-rma-srdsim.so
       - name: The export check fails without a release to check against
