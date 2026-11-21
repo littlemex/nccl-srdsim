@@ -739,6 +739,37 @@ void get_owner_dies(Rank& R) {
     }
 }
 
+// The owner of a get dies (SIGKILL) part way through sending its reply. The owner's send buffer is small
+// (SRDSIM_SEND_BUFFER_BYTES) and the requester applies a frame at most every 2 ms (SRDSIM_APPLY_INTERVAL_US), so a
+// reply of 6 MiB takes over a second to land and most of it is still in the owner's outbox when the owner is killed,
+// as soon as the first bytes have landed. The get then fails rather than waiting for ever or completing: it retires,
+// queryLastError reports it, and the bytes from where the landed frames end are not written.
+void get_owner_dies_mid_reply(Rank& R) {
+    constexpr size_t n = 6u << 20, remote = 7, local = kGuard;
+    if (g_rank == 1) fill(R.at(remote), n, 1, 29);
+    barrier("ready");
+    if (g_rank == 0) {
+        const Ticket* g = R.issue(get(0, 1, remote, n, local));
+        R.wait_peer([&] { return mismatches(R.at(local), 8192, 1, 29) == 0; }, "first-frame");
+        g_shared->expected_dead[1].store(1);
+        kill(g_shared->pid[1], SIGKILL);
+        R.wait_retired(g, "get-from-dead-owner");
+        if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
+        // The reply's frames land in order, so what landed is a prefix: find where it ends, and require it short of the
+        // whole reply (the owner died with part of it unsent) and nothing written past it.
+        size_t landed = 0;
+        while (landed < n and mismatches_from(R.at(local + landed), landed, std::min<size_t>(8192, n - landed), 1, 29) == 0)
+            landed += std::min<size_t>(8192, n - landed);
+        if (landed == n) fail("assert", "partial", "%s", "the whole reply landed before the owner died");
+        if (size_t bad = nonzero(R.at(local + landed), n - landed))
+            fail("assert", "past-the-prefix", "%zu bytes written after the landed frames", bad);
+        R.teardown(/*meet_peers=*/false);
+        R.pass();
+    } else {
+        wait_flag(0, "until-killed");
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -790,6 +821,8 @@ const std::vector<Scenario>& scenarios() {
         {"impaired_apply_interval", impaired_apply_interval, 2, {"srd"}, {1}, "SRDSIM_APPLY_INTERVAL_US=5000 SRDSIM_CHUNK_BYTES=8192"},
         {"impaired_signal_lag", impaired_signal_lag, 2, {"srd"}, {1}, "SRDSIM_SIGNAL_LAG_US=200000 SRDSIM_CHUNK_BYTES=8192"},
         {"get_owner_dies", get_owner_dies, 2, {"srd"}, {1}, nullptr},
+        {"get_owner_dies_mid_reply", get_owner_dies_mid_reply, 2, {"srd"}, {1},
+         "SRDSIM_SEND_BUFFER_BYTES=65536 SRDSIM_APPLY_INTERVAL_US=2000"},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
