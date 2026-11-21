@@ -660,7 +660,10 @@ void negative_count_is_default(Rank& R) {
 
 // The impairments from the environment are applied. Each case puts 16 chunks of 8 KiB with a signal and checks the
 // data, and the time the put takes bounds the impairment from below.
-void impaired_put(Rank& R, long min_ms, bool measure_on_target) {
+// `midway`, when set, runs on the target at `midway_ms` after the sender issued the put, before the signal is
+// awaited, to check what the impairment has let through by then.
+void impaired_put(Rank& R, long min_ms, bool measure_on_target, long midway_ms = 0,
+                  const std::function<void(Rank&, size_t, size_t)>& midway = nullptr) {
     constexpr size_t n = 16 * 8192, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 25);
@@ -672,6 +675,12 @@ void impaired_put(Rank& R, long min_ms, bool measure_on_target) {
         if (not measure_on_target and ms < min_ms) fail("assert", "impairment-not-applied", "the put took %ld ms, want >= %ld", ms, min_ms);
     } else {
         barrier("ready");
+        if (midway) {
+            while (g_shared->t0_ns.load() == 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+            const auto start = Clock::time_point(std::chrono::nanoseconds(g_shared->t0_ns.load()));
+            std::this_thread::sleep_until(start + std::chrono::milliseconds(midway_ms));
+            midway(R, dst, n);
+        }
         R.wait_peer([&] { return R.signal_word(12) == 1; }, "signal-word");
         // From when the sender issued the put, not from this rank's own wake-up.
         const auto t0 = Clock::time_point(std::chrono::nanoseconds(g_shared->t0_ns.load()));
@@ -681,9 +690,25 @@ void impaired_put(Rank& R, long min_ms, bool measure_on_target) {
     }
 }
 void impaired_delay(Rank& R) { impaired_put(R, 45, false); }              // each unit held 50 ms after its release
-void impaired_freeze(Rank& R) { impaired_put(R, 400, false); }            // frozen for 500 ms after 4 units
+// Frozen for 500 ms after 4 units: 250 ms in, at most 4 of the 16 chunks have landed and the signal has not.
+void impaired_freeze(Rank& R) {
+    impaired_put(R, 400, false, 250, [](Rank& T, size_t dst, size_t n) {
+        size_t landed = 0;
+        for (size_t c = 0; c < n / 8192; ++ c) landed += mismatches(T.at(dst + c * 8192), 8192, 0, 25) == 0;
+        if (landed > 4 or T.signal_word(12) != 0)
+            fail("assert", "freeze-leaked", "%zu chunks and signal %llu during the freeze", landed,
+                 static_cast<unsigned long long>(T.signal_word(12)));
+    });
+}
 void impaired_apply_interval(Rank& R) { impaired_put(R, 16 * 5, true); }  // 5 ms before each applied frame
-void impaired_signal_lag(Rank& R) { impaired_put(R, 150, false); }        // 200 ms before the signal
+// The signal held 200 ms longer: 100 ms in, the data has landed and the signal has not.
+void impaired_signal_lag(Rank& R) {
+    impaired_put(R, 150, false, 100, [](Rank& T, size_t dst, size_t n) {
+        if (mismatches(T.at(dst), n, 0, 25) != 0 or T.signal_word(12) != 0)
+            fail("assert", "lag-not-on-signal", "%zu bytes missing, signal %llu at 100 ms", mismatches(T.at(dst), n, 0, 25),
+                 static_cast<unsigned long long>(T.signal_word(12)));
+    });
+}
 
 struct Scenario {
     const char* name;

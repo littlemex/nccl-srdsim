@@ -3150,8 +3150,14 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             return ncclSystemError;
         }
         if (cc->impair.send_buffer_bytes != 0) {
-            const int bytes = static_cast<int>(cc->impair.send_buffer_bytes);
-            ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
+            const int bytes = static_cast<int>(std::min<uint32_t>(cc->impair.send_buffer_bytes, INT32_MAX));
+            int effective = 0;
+            socklen_t len = sizeof(effective);
+            if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) != 0 or
+                ::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &effective, &len) != 0)
+                logf("could not set the send buffer of the link to rank %d (errno %d)", peer, errno);
+            else if (peer == (rank + 1) % nranks)
+                lifecycle("send buffer impairment: asked for %d bytes, the kernel uses %d", bytes, effective);
         }
         cc->links.set(peer, fd);
     }
@@ -3341,10 +3347,14 @@ ncclResult_t srdsim_dereg_mr_sym(void* collComm, void* mhandle) {
 }
 
 void drop_parked(CollComm* cc, const RmaCtx* owner);
+void send_parked_of(CollComm* cc, const RmaCtx* owner);
 
 ncclResult_t srdsim_destroy_context(void* rmaCtx) {
     auto* ctx = static_cast<RmaCtx*>(rmaCtx);
-    if (ctx != nullptr and ctx->coll != nullptr) drop_parked(ctx->coll, ctx);
+    if (ctx != nullptr and ctx->coll != nullptr) {
+        send_parked_of(ctx->coll, ctx);
+        drop_parked(ctx->coll, ctx);
+    }
     if (ctx != nullptr and ctx->coll != nullptr) {
         // Remove it before deleting, or the stall monitor -- which runs on its own thread -- can read a
         // pointer this call is about to free.
@@ -3680,7 +3690,7 @@ TestStats g_test_stats;
 
 bool parked_holds(const RmaCtx* owner, uint64_t op_id) {
     CollComm* cc = owner->coll;
-    if (cc == nullptr or cc->delayer == nullptr) return false;
+    if (cc == nullptr or not parks(cc)) return false;
     std::lock_guard<std::mutex> g(cc->parked_mu);
     if (op_id != 0) return cc->parked_ops.count({owner, op_id}) != 0;
     for (const auto& e : cc->parked_ops) if (e.first.first == owner) return true;
@@ -3836,41 +3846,63 @@ void release_reservation(CollComm* cc, const srdsim::Unit& u) {
 
 bool send_unit(CollComm* cc, const srdsim::Unit& u, RmaCtx* owner);
 
+// Whether this communicator holds units back at all: a delay, a burst, a signal lag or a frozen link is set.
+bool parks(const CollComm* cc) { return cc->delayer != nullptr or (cc->impair.freeze_peer >= 0 and cc->impair.freeze_ms != 0); }
+
 // The frozen-link impairment counts units actually sent to the frozen peer, and starts its clock at the last one.
-void note_sent_for_freeze(CollComm* cc, int peer) {
+// Called with `parked_mu` held.
+void note_sent_for_freeze_locked(CollComm* cc, int peer) {
     if (cc->impair.freeze_peer != peer or cc->impair.freeze_ms == 0 or cc->freeze_done or
         cc->frozen_until != std::chrono::steady_clock::time_point{})
         return;
     if (++ cc->units_to_freeze_peer >= std::max<uint64_t>(cc->impair.freeze_after_units, 1))
         cc->frozen_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(cc->impair.freeze_ms);
 }
-
-// The delay impairment: holds a released unit back for the delay drawn for it, or behind one already held for the
-// same peer, instead of sleeping on the progress thread. Returns false when the unit may go now.
-bool park_if_delayed(CollComm* cc, const srdsim::Unit& u, RmaCtx* owner) {
-    const uint64_t us = cc->delayer->delay_for(u.kind == srdsim::Unit::Kind::Signal);
+void note_sent_for_freeze(CollComm* cc, int peer) {
+    if (cc->impair.freeze_peer != peer) return;
     std::lock_guard<std::mutex> g(cc->parked_mu);
+    note_sent_for_freeze_locked(cc, peer);
+}
+// The end of the freeze on `peer`, or the epoch when it is not frozen now. Called with `parked_mu` held.
+std::chrono::steady_clock::time_point frozen_until_locked(CollComm* cc, int peer) {
+    if (cc->impair.freeze_peer != peer or cc->freeze_done) return {};
+    if (cc->frozen_until == std::chrono::steady_clock::time_point{}) return {};
+    if (std::chrono::steady_clock::now() >= cc->frozen_until) { cc->freeze_done = true; return {}; }
+    return cc->frozen_until;
+}
+
+// The delay and freeze impairments: holds a released unit back for the delay drawn for it, until a freeze on its
+// peer ends, or behind a unit already held for the same peer, instead of sleeping on the progress thread. Returns
+// false when the unit may go now.
+bool park_if_delayed(CollComm* cc, const srdsim::Unit& u, RmaCtx* owner) {
+    std::lock_guard<std::mutex> g(cc->parked_mu);
+    const uint64_t us = cc->delayer ? cc->delayer->delay_for(u.kind == srdsim::Unit::Kind::Signal) : 0;
     auto& q = cc->parked[u.peer];
-    if (us == 0 and q.empty()) return false;
+    const auto frozen = frozen_until_locked(cc, u.peer);
+    if (us == 0 and q.empty() and frozen == std::chrono::steady_clock::time_point{}) return false;
     auto due = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    if (frozen > due) due = frozen;
     if (not q.empty() and q.back().due > due) due = q.back().due;
     q.push_back({u, owner, due});
     ++ cc->parked_ops[{owner, u.op_id}];
     return true;
 }
 
-// Sends every held unit that is due, in order per peer. Returns how many failed to send.
-size_t send_due_parked(CollComm* cc) {
+// Sends every held unit that is due (or every one, with `all`), in order per peer, but nothing to a peer while it
+// is frozen. Returns how many failed to send.
+size_t send_due_parked(CollComm* cc, bool all = false) {
     size_t failed = 0;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> g(cc->parked_mu);
     for (auto& [peer, q] : cc->parked) {
-        while (not q.empty() and q.front().due <= now) {
+        if (not all and frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{}) continue;
+        while (not q.empty() and (all or q.front().due <= now)) {
+            if (not all and frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{}) break;
             const CollComm::Parked p = q.front();
             q.pop_front();
             auto it = cc->parked_ops.find({p.owner, p.u.op_id});
             if (it != cc->parked_ops.end() and -- it->second == 0) cc->parked_ops.erase(it);
-            if (send_unit(cc, p.u, p.owner)) { note_sent_for_freeze(cc, peer); continue; }
+            if (send_unit(cc, p.u, p.owner)) { note_sent_for_freeze_locked(cc, peer); continue; }
             release_reservation(cc, p.u);
             ++ failed;
             note_send_failure(p.owner, p.u);
@@ -3882,14 +3914,35 @@ size_t send_due_parked(CollComm* cc) {
 // Whether a unit of operation `op_id` (or, with op_id 0, of any operation) of `owner` is still held back.
 bool parked_holds(const RmaCtx* owner, uint64_t op_id);
 
-// Units held back for a context that is going away: removed, and their room returned.
+// Units held back for a context that is going away: sent at once, since their operations may already have been
+// reported done, and only what cannot be sent is removed with its room returned.
 void drop_parked(CollComm* cc, const RmaCtx* owner) {
+    if (owner == nullptr) send_due_parked(cc, /*all=*/true);
     std::lock_guard<std::mutex> g(cc->parked_mu);
     for (auto& [peer, q] : cc->parked)
         for (auto it = q.begin(); it != q.end();)
             if (owner == nullptr or it->owner == owner) { release_reservation(cc, it->u); it = q.erase(it); } else ++ it;
     for (auto it = cc->parked_ops.begin(); it != cc->parked_ops.end();)
         it = (owner == nullptr or it->first.first == owner) ? cc->parked_ops.erase(it) : std::next(it);
+}
+
+// Sends, at once and in order, every held unit of `owner`. The units ahead of one of them to the same peer go too,
+// so a link's order is kept.
+void send_parked_of(CollComm* cc, const RmaCtx* owner) {
+    std::lock_guard<std::mutex> g(cc->parked_mu);
+    for (auto& [peer, q] : cc->parked) {
+        size_t last = 0;
+        bool any = false;
+        for (size_t i = 0; i < q.size(); ++ i) if (q[i].owner == owner) { last = i; any = true; }
+        if (not any) continue;
+        for (size_t i = 0; i <= last; ++ i) {
+            const CollComm::Parked p = q.front();
+            q.pop_front();
+            auto it = cc->parked_ops.find({p.owner, p.u.op_id});
+            if (it != cc->parked_ops.end() and -- it->second == 0) cc->parked_ops.erase(it);
+            if (not send_unit(cc, p.u, p.owner)) { release_reservation(cc, p.u); note_send_failure(p.owner, p.u); }
+        }
+    }
 }
 
 ncclResult_t srdsim_progress(void* rmaCtx) {
@@ -3968,11 +4021,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         // The frozen-link impairment: after `freeze_after_units` units to `freeze_peer`, nothing more is released to
         // it for `freeze_ms`, as if the link had stalled.
         bool frozen(int peer) {
-            if (cc->impair.freeze_peer != peer or cc->impair.freeze_ms == 0 or cc->freeze_done) return false;
-            if (cc->frozen_until == std::chrono::steady_clock::time_point{}) return false;
-            if (std::chrono::steady_clock::now() < cc->frozen_until) return true;
-            cc->freeze_done = true;
-            return false;
+            std::lock_guard<std::mutex> g(cc->parked_mu);
+            return frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{};
         }
         void take(int peer, size_t bytes) override {
             size_t& have = granted[peer];
@@ -4025,11 +4075,11 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         {
             std::set<CollComm*> colls;
             for (RmaCtx* c : to_advance) if (c and c->coll) colls.insert(c->coll);
-            for (CollComm* cc : colls) if (cc->delayer) failed += send_due_parked(cc);
+            for (CollComm* cc : colls) if (parks(cc)) failed += send_due_parked(cc);
         }
         for (size_t i = 0; i < batch.size(); ++ i) {
             const auto& u = batch[i];
-            if (CollComm* oc = owners[i]->coll; oc and oc->delayer and park_if_delayed(oc, u, owners[i]))
+            if (CollComm* oc = owners[i]->coll; oc and parks(oc) and park_if_delayed(oc, u, owners[i]))
                 continue;   // sent by a later call, once due
             if (send_unit(owners[i]->coll, u, owners[i])) {
                 if (owners[i]->coll) note_sent_for_freeze(owners[i]->coll, u.peer);
