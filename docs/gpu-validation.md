@@ -2,7 +2,7 @@
 
 **English** | [日本語](gpu-validation.ja.md)
 
-This page describes the one test of nccl-srdsim that needs a GPU. nccl-srdsim is a plugin that NCCL loads to carry the data GPU kernels send each other; it delivers that data in a different order on every seed, the way an unordered but reliable network such as AWS SRD may. The test checks that, under real NCCL, code written against NCCL's ordering guarantee still sees correct data, and that code which relied on more than the guarantee would be caught.
+This page describes the tests of nccl-srdsim that need a GPU. nccl-srdsim is a plugin that NCCL loads to carry the data GPU kernels send each other; it delivers that data in a different order on every seed, the way an unordered but reliable network such as AWS SRD may. The tests check that, under real NCCL, code written against NCCL's guarantees still sees correct data, and that code which relied on more than the guarantees would be caught. The first, described next, is about the order of puts and signals; the second, at the end, about gets.
 
 The vocabulary, once. NCCL's GIN (GPU-Initiated Networking) device API lets a CUDA kernel send data itself. A *put* copies a range of the sender's GPU memory into the receiver's GPU memory. A *signal* is a 64-bit counter in the receiver's memory that a put can increment once its data is written, and that the receiver's kernel polls to learn that the data is there. A *weak* signal promises only that: it becomes visible after the data of its own put has landed, and promises nothing about other puts. That promise is invariant I1 (see the [README](../README.md#delivery-modes)). A *delivery mode* is the rule by which the plugin reorders deliveries, and a *seed* fixes the plugin's random choices within that rule; the GPU's own timing still differs from one execution to the next.
 
@@ -100,7 +100,22 @@ The test program's exit status, which the verdict is built from:
 | `RUN_TIMEOUT` | `180` | Seconds a rank may run before `timeout` stops it. Also ends a put or signal call that never returns |
 | `WAIT_TIMEOUT` | `60` | Seconds the kernel waits for one signal or one flush before the rank gives up with status 3 |
 | `ROUNDS` | `50` | Rounds per seed |
-| `MODES` | all seven | The delivery modes to run, separated by spaces |
+| `MODES` | all seven | The delivery modes to run, separated by spaces; `control:MODE` runs MODE as a negative control, which must find wrong elements in every seed |
+| `CONTROL_ENV` | none | `NAME=VALUE` pairs, separated by spaces, set in the `control:` runs |
+| `REQUIRE_LOG` | none | Text every rank's log must contain, such as the delivery the plugin reports |
+
+## The get test: tests/gpu/gin_get.cu
+
+A *get* reads a range of a peer's GPU memory into the reader's own GPU memory. The reader learns that the data is there from a flush: `flushAsync` to the peer, then `wait`, which NCCL's proxy completes only when the plugin reports every get to that peer landed.
+
+`tests/gpu/gin_get.cu` passes data around the same ring with gets. In every round, block `b` of each rank fills its source slot, raises a weak signal on the next rank to say the slot is ready, and that rank reads the slot with one get per chunk. The reader waits for a flush of its gets, checks every element, and signals back that the source may be refilled. Each element encodes the round, the owning rank, the block and its index, as in the signal test, and a wrong element is reported with the round, rank and block whose value it held. No rank tears down until every rank's kernel has ended, so a last signal is not lost to a peer's teardown.
+
+Gets are not reordered by the delivery modes (a reply is not scheduled), so the recipe runs the test in `srd` and `inorder`, once with the default delivery (copies into device memory queued) and once with `SRDSIM_ASYNC_DELIVERY=0` (each copy waited for). With the default delivery it also runs a control written `control:srd`: `run.sh` then sets `CONTROL_ENV`, here `SRDSIM_GET_LANDED_EARLY=1`, which makes the plugin count a get as landed before its data has been copied into device memory, so the flush can complete early. The control must find wrong elements in every seed, which shows the check catches a flush that completes too early. `REQUIRE_LOG` makes every rank's log name the delivery the run was meant to use, so a run that took another path (GDRCopy, say) fails.
+
+| Run | Required outcome |
+|---|---|
+| `srd`, `inorder`, with either delivery | No wrong element, in every seed |
+| `control:srd` | Wrong elements in every seed, and no crash or timeout in any |
 
 ## Requirements
 

@@ -2066,6 +2066,10 @@ void probe_device_health(bool* idle, bool* busy) {
 struct NegativeControl {
     uint64_t corrupt_every = env_size("SRDSIM_CORRUPT_EVERY", 0);
     uint64_t drop_every = env_size("SRDSIM_DROP_EVERY", 0);
+    // SRDSIM_GET_LANDED_EARLY: count a get's last reply frame as landed without waiting for its copy into a device
+    // window, as this plugin once did, so a test can show it catches a flush that completes too early.
+    bool get_landed_early = env_size("SRDSIM_GET_LANDED_EARLY", 0) != 0;
+    std::atomic<bool> get_early_announced{false};
     std::atomic<uint64_t> placements{0};
     std::atomic<uint64_t> corrupted{0};
     std::atomic<uint64_t> dropped{0};
@@ -2089,14 +2093,20 @@ thread_local bool t_unsettled = false;
 // The agent is about to wait for its next frame. Whatever this thread submitted is waited for now, once per
 // burst rather than once per frame, so no copy into a window is still pending while the link is quiet --
 // which is when an application that skips its teardown frees its windows without deregistering them.
-void delivery_idle(void* /*user*/) {
-    if (not t_unsettled) return;
-    t_unsettled = false;
+// Waits for every copy this thread has queued. False when they could not be waited for, so their data may not be there.
+// A wait that failed before, at idle, poisoned delivery, so later calls return false too rather than true for nothing.
+bool settle_this_thread(const char* why) {
+    if (g_delivery_poisoned.load()) return false;
+    if (not t_unsettled) return true;
     DeliveryContext in_delivery_context;
-    if (not in_delivery_context.ok()) return;
+    if (not in_delivery_context.ok()) return false;
+    t_unsettled = false;
     const CUresult rc = cuStreamSynchronize(in_delivery_context.stream());
-    if (rc != CUDA_SUCCESS) poison_delivery("settling copies before waiting for the next frame", rc);
+    if (rc != CUDA_SUCCESS) { poison_delivery(why, rc); return false; }
+    return true;
 }
+
+void delivery_idle(void* /*user*/) { (void)settle_this_thread("settling copies before waiting for the next frame"); }
 
 bool device_copy_async(void* dst, const void* src, size_t bytes, CUstream stream) {
     static thread_local ReceiveRing ring;
@@ -3691,7 +3701,31 @@ bool from_owner(const GetRecord& rec, int peer_rank, const void* cc) {
     return peer_rank == rec.peer and cc == rec.coll;
 }
 
+void fail_get_locked(GetRecord& rec, uint64_t bytes);   // below
+
+// With asynchronous delivery a frame's copy into a device window has only been queued when the frame is counted, so
+// the frame that completes a get waits for this thread's copies before it is counted: otherwise a flush could complete,
+// and the kernel read the window, before the bytes are there. Every frame of a get's reply arrives on the one link from
+// its owner, so this receiving thread queued all of their copies, and the one wait covers them; the earlier frames need
+// none, since nothing completes before the last. A wait that fails fails the get rather than counting it. Every frame is
+// then counted by the one path below.
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user) {
+    bool settled = true;
+#ifdef SRDSIM_WITH_CUDA
+    bool last = false;   // whether this frame completes its get, so the copies must be waited for first
+    {
+        std::lock_guard<std::mutex> g(g_gets.mu);
+        auto it = g_gets.gets.find(owner_token);
+        last = it != g_gets.gets.end() and bytes >= static_cast<uint64_t>(std::max<int64_t>(it->second.remaining, 0));
+    }
+    if (not last) {
+    } else if (g_negative.get_landed_early) {
+        if (not g_negative.get_early_announced.exchange(true))
+            lifecycle("NEGATIVE CONTROL ACTIVE: SRDSIM_GET_LANDED_EARLY counts a get as landed before its data is copied");
+    } else {
+        settled = settle_this_thread("waiting for a get's reply to land before counting it");
+    }
+#endif
     std::lock_guard<std::mutex> g(g_gets.mu);
     auto it = g_gets.gets.find(owner_token);
     if (it == g_gets.gets.end()) {
@@ -3710,11 +3744,17 @@ void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int
              static_cast<unsigned long long>(owner_token));
         return;
     }
-    if (static_cast<int64_t>(bytes) > rec.remaining) {
+    if (bytes > static_cast<uint64_t>(std::max<int64_t>(rec.remaining, 0))) {
         logf("get %llu received %llu byte(s) with only %lld outstanding; counting what was outstanding",
              static_cast<unsigned long long>(owner_token), static_cast<unsigned long long>(bytes),
              static_cast<long long>(rec.remaining));
-        bytes = static_cast<uint64_t>(rec.remaining);
+        bytes = static_cast<uint64_t>(std::max<int64_t>(rec.remaining, 0));
+    }
+    if (not settled) {
+        logf("get %llu: its last frame's copy into device memory could not be waited for; the get fails",
+             static_cast<unsigned long long>(owner_token));
+        fail_get_locked(rec, bytes);
+        return;
     }
     rec.remaining -= static_cast<int64_t>(bytes);
     rec.ctx->pending_get_bytes.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
