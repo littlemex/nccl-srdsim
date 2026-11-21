@@ -46,6 +46,7 @@ Read once, the first time the plugin needs each, except `SRDSIM_LOCAL_IP`, which
 | `SRDSIM_STAGING_RING` | count | `128` | Pinned staging slots a thread may have outstanding when copies are queued. At least 2; capped so that the pinned memory stays under the plugin's limit, which depends on `SRDSIM_CHUNK_BYTES` |
 | `SRDSIM_PAGEABLE_STAGING` | flag | off | Stages through pageable instead of pinned host memory, and waits for every copy. A reproduction mode |
 | `SRDSIM_SIGNAL_KERNEL` | flag | off | Applies signals to device memory with a kernel launch instead of a store of the running total the plugin keeps |
+| `SRDSIM_RELEASE_BYTES_PER_CALL` | count | `4194304` (4 MiB) | The most payload one `rmaProgress` call releases, over every plugin context; the first unit of a call is released whatever its size. A small value spreads an operation over many calls |
 | `SRDSIM_PROGRESS_ONE_CONTEXT` | flag | off | Advances only the context NCCL passes to `rmaProgress`, instead of every context of the communicator |
 | `SRDSIM_LOCAL_IP` | address | the address of the default route | The address this rank publishes for its peers' connections |
 

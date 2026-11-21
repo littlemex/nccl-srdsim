@@ -4091,7 +4091,11 @@ void send_parked_of(CollComm* cc, const RmaCtx* owner) {
 // call that releases less than a pass submits leaves a queue that grows, and every pass then tests all of it. A limit by
 // bytes keeps pace with a pass whatever the operations' sizes; it stops one call from filling a whole outbox before any
 // of it is pushed.
-constexpr size_t kReleaseBytesPerCall = 4u << 20;
+// SRDSIM_RELEASE_BYTES_PER_CALL changes it, for a test that needs an operation to span several calls.
+size_t release_bytes_per_call() {
+    static const size_t v = env_size("SRDSIM_RELEASE_BYTES_PER_CALL", size_t{4} << 20);
+    return v;
+}
 
 ncclResult_t srdsim_progress(void* rmaCtx) {
     Mark mark("rmaProgress");
@@ -4148,7 +4152,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         CollComm* cc = nullptr;
         std::set<std::pair<CollComm*, int>>* held = nullptr;   // peers already counted as held in this call
         std::map<int, size_t> granted;   // reserved and not yet taken
-        size_t* bytes_left = nullptr;    // of `kReleaseBytesPerCall`, shared by the call's contexts
+        size_t* bytes_left = nullptr;    // of `release_bytes_per_call()`, shared by the call's contexts
         bool* released_any = nullptr;    // whether the call released a unit yet
         std::set<int> full;
         std::set<int> held_by_freeze;   // the frozen-link impairment, apart from a full outbox
@@ -4187,7 +4191,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         }
     };
     std::set<std::pair<CollComm*, int>> held;
-    size_t bytes_left = kReleaseBytesPerCall;
+    size_t bytes_left = release_bytes_per_call();
     bool released_any = false;
     // The call's payload is shared by the contexts, so the one advanced first changes from call to call; otherwise the
     // first could take all of it every call while the others wait.

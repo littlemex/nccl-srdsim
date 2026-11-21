@@ -125,13 +125,11 @@ void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 // Contexts are independent: a strong signal on one context is not ordered behind an earlier put on another
 // context to the same peer. Under reverse-ops the newest operation goes first, so the signal arrives while part
 // of the put on the other context is still missing. The sender holds after two proxy iterations (at most eight
-// chunks each, of the put's 128) until the target has looked.
+// chunks each, of the put's 128, with SRDSIM_RELEASE_BYTES_PER_CALL at 64 KiB) until the target has looked.
 // Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
 // can be dropped without a failure.
 void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
-    // Larger than one progress call releases (4 MiB of payload), so the put still has chunks to release when the
-    // signal is submitted.
-    constexpr size_t n = (5 << 20) + 13, src = 4099, dst = (1 << 20) + kGuard;
+    constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 19);
         // The put is submitted in one proxy iteration and the signal in the next, so the put is the earlier
@@ -755,9 +753,10 @@ const std::vector<const char*> kKeepI1 = {"srd", "inorder", "peer-seq", "reverse
 const std::vector<Scenario>& scenarios() {
     static const std::vector<Scenario> s = {
         {"put_then_strong_signal", put_then_strong_signal, 2, kKeepI1, {1, 2, 3}, nullptr},
-        {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, nullptr},
-        {"strong_signal_other_context_01", strong_signal_other_context_01, 2, {"reverse-ops"}, {1}, nullptr},
-        {"strong_signal_other_context_10", strong_signal_other_context_10, 2, {"reverse-ops"}, {1}, nullptr},
+        // A put has to span several progress calls for these to see the order inside one.
+        {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, "SRDSIM_RELEASE_BYTES_PER_CALL=65536"},
+        {"strong_signal_other_context_01", strong_signal_other_context_01, 2, {"reverse-ops"}, {1}, "SRDSIM_RELEASE_BYTES_PER_CALL=65536"},
+        {"strong_signal_other_context_10", strong_signal_other_context_10, 2, {"reverse-ops"}, {1}, "SRDSIM_RELEASE_BYTES_PER_CALL=65536"},
         {"i1_holds", i1_holds, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"violate_control", violate_control, 2, {"violate-i1"}, {1, 2, 3}, nullptr},
         {"get_completes_with_data", get_completes_with_data, 2, {"srd"}, {1}, nullptr},
