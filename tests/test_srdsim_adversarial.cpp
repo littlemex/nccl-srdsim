@@ -347,9 +347,10 @@ void test_peer_fault_and_local_failure_are_separate() {
         expect(false, "A8 the session opened");
         return;
     }
-    expect(send_good_placement(s.fd, 32), "A8 a well-formed placement was sent");
+    // The signal first: once a placement on a link has failed, no later signal on it is applied at all.
     const auto sig = signal_header(1, 0, 1);
     expect(srdsim::write_all(s.fd, &sig, sizeof(sig)), "A8 a well-formed signal was sent");
+    expect(send_good_placement(s.fd, 32), "A8 a well-formed placement was sent");
     // And one frame the peer did get wrong, so both counters have something to hold.
     const auto bad = placement_header(99, 0, 0);
     expect(srdsim::write_all(s.fd, &bad, sizeof(bad)), "A8 an unknown-window frame was sent");
