@@ -197,6 +197,13 @@ __attribute__((no_sanitize("thread"))) inline size_t mismatches(const unsigned c
     for (size_t i = 0; i < n; ++ i) bad += d[i] != pattern(i, sender, salt);
     return bad;
 }
+// The same for bytes [first, first + n) of a put: byte k of the range is compared with pattern(first + k).
+__attribute__((no_sanitize("thread"))) inline size_t mismatches_from(const unsigned char* d, size_t first, size_t n,
+                                                                      int sender, int salt) {
+    size_t bad = 0;
+    for (size_t i = 0; i < n; ++ i) bad += d[i] != pattern(first + i, sender, salt);
+    return bad;
+}
 __attribute__((no_sanitize("thread"))) inline size_t nonzero(const unsigned char* d, size_t n) {
     size_t bad = 0;
     for (size_t i = 0; i < n; ++ i) bad += d[i] != 0;

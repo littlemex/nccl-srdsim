@@ -695,11 +695,7 @@ void impaired_freeze(Rank& R) {
     impaired_put(R, 400, false, 250, [](Rank& T, size_t dst, size_t n) {
         // A chunk has landed when all its bytes match the pattern at their position in the put.
         size_t landed = 0;
-        for (size_t c = 0; c < n / 8192; ++ c) {
-            bool ok = true;
-            for (size_t i = c * 8192; ok and i < (c + 1) * 8192; ++ i) ok = *T.at(dst + i) == pattern(i, 0, 25);
-            landed += ok;
-        }
+        for (size_t c = 0; c < n / 8192; ++ c) landed += mismatches_from(T.at(dst + c * 8192), c * 8192, 8192, 0, 25) == 0;
         if (landed != 4 or T.signal_word(12) != 0)
             fail("assert", "freeze-leaked", "%zu chunks and signal %llu during the freeze", landed,
                  static_cast<unsigned long long>(T.signal_word(12)));
