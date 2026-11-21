@@ -19,15 +19,16 @@ def draw(L):
            color="#555555")
     # Device window.
     f.group(380, 55, 340, 440, L.t("device window", "デバイスのウィンドウ"), "target")
-    f.box(400, 95, 300, 76, L.t("default", "既定"), "sim",
-          [L.t("store the running total", "プラグインが持つ合計値を"), L.t("the plugin keeps", "8 バイトで書く")])
-    f.box(400, 195, 300, 76, "SRDSIM_SIGNAL_KERNEL", "neutral",
+    f.box(400, 95, 300, 76, L.t("window with SIGNAL_NEVER_RESET", "SIGNAL_NEVER_RESET 付きのウィンドウ"), "sim",
+          [L.t("store the running total", "プラグインが持つ合計値を"), L.t("the plugin keeps", "8 バイトで書く")], size=13)
+    f.box(400, 195, 300, 76, L.t("any other window", "それ以外のウィンドウ"), "neutral",
           [L.t("an atomic add in a kernel", "カーネルの atomic な加算"), L.t("compiled with NVRTC", "(NVRTC でコンパイル)")], size=13)
-    f.text(550, 310, L.t("the store needs no SM:", "書き込みは SM を使わない:"), size=13)
-    f.text(550, 330, L.t("resident kernels may hold them all", "居座るカーネルが全 SM を使っていてもよい"), size=13)
-    f.text(550, 370, L.t("valid because NCCL never resets", "NCCL がこの値を消さない"), size=12, color="#555555")
-    f.text(550, 388, L.t("these words: the plugin is the", "ので、書き手はプラグイン"), size=12, color="#555555")
-    f.text(550, 406, L.t("only writer", "だけになる"), size=12, color="#555555")
+    f.text(550, 310, L.t("the store needs no SM, and is", "書き込みは SM を使わず、"), size=13)
+    f.text(550, 330, L.t("valid only where the plugin is", "プラグインだけが書き手のとき"), size=13)
+    f.text(550, 350, L.t("the only writer of the word", "にだけ正しい"), size=13)
+    f.text(550, 390, L.t("NCCL registers its signal windows", "NCCL は自分のシグナルのウィンドウを"), size=12, color="#555555")
+    f.text(550, 408, L.t("with the flag; an application may", "このフラグ付きで登録する。アプリは"), size=12, color="#555555")
+    f.text(550, 426, L.t("reset a word in any other window", "ほかのウィンドウの値を消してよい"), size=12, color="#555555")
     # Strong signal.
     f.group(740, 55, 340, 440, L.t("strong signal", "強いシグナル"), "sig")
     for k, (u, role) in enumerate([("A", "nccl"), ("B", "wire"), ("S!", "sig")]):
