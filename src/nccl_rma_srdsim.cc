@@ -1368,7 +1368,7 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
                                uint64_t owner_token, void* user);
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, void* user);
 void srdsim_handle_get_refused(uint32_t requester_rank, uint64_t owner_token, void* user);
-void srdsim_handle_get_failed(uint64_t owner_token, void* user);
+void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, void* user);
 
 #ifdef SRDSIM_WITH_CUDA
 // Creates `n` events into `out`, or none: a partly built ring would hand out null events later.
@@ -3552,7 +3552,6 @@ void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, voi
         return;
     }
     GetRecord& rec = it->second;
-    if (rec.failed) return;   // already counted out; a late frame of it changes nothing
     if (rec.ctx == nullptr) {
         logf("a get response for get %llu arrived after its context was destroyed; dropping",
              static_cast<unsigned long long>(owner_token));
@@ -3568,28 +3567,42 @@ void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, voi
     rec.ctx->pending_get_bytes.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
 }
 
-// A get will not complete with its data: the owner sent GetError, or a frame of the reply could not be written
-// here. Its outstanding bytes come off the context's total, so a flush is not held by it, and `test` finishes it
-// as failed; `queryLastError` reports it.
-void srdsim_handle_get_failed(uint64_t owner_token, void* /*user*/) {
+// A get will not complete with its data: a frame of its reply could not be written here (`bytes` of it), or the
+// owner sent GetError (every byte still to come). Those bytes are counted as arrived, so the get and a flush wait
+// only for the frames still on their way, which land and are counted as usual; `test` then finishes the get as
+// failed, and `queryLastError` reports it.
+void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, void* /*user*/) {
     std::lock_guard<std::mutex> g(g_gets.mu);
     auto it = g_gets.gets.find(owner_token);
-    if (it == g_gets.gets.end() or it->second.failed) return;
-    GetRecord& rec = it->second;
-    rec.failed = true;
-    if (rec.ctx != nullptr) {
-        rec.ctx->pending_get_bytes.fetch_sub(rec.remaining, std::memory_order_relaxed);
-        rec.ctx->failed_gets.fetch_add(1, std::memory_order_relaxed);
+    if (it == g_gets.gets.end()) {
+        logf("a get failure named get %llu, which is not outstanding; ignoring", static_cast<unsigned long long>(owner_token));
+        return;
     }
-    rec.remaining = 0;
+    GetRecord& rec = it->second;
+    if (rec.remaining <= 0) return;   // already fully accounted for
+    const int64_t gone = bytes == srdsim::kAllBytes ? rec.remaining
+                       : std::min<int64_t>(rec.remaining, static_cast<int64_t>(bytes));
+    if (not rec.failed and rec.ctx != nullptr) rec.ctx->failed_gets.fetch_add(1, std::memory_order_relaxed);
+    rec.failed = true;
+    if (rec.ctx != nullptr) rec.ctx->pending_get_bytes.fetch_sub(gone, std::memory_order_relaxed);
+    rec.remaining -= gone;
 }
 
 // On the owner: a get request could not be served. The requester is told, through the responder so that the error
 // keeps its place among this rank's replies to it.
 void srdsim_handle_get_refused(uint32_t requester_rank, uint64_t owner_token, void* user) {
     auto* cc = static_cast<CollComm*>(user);
-    if (cc == nullptr or requester_rank >= static_cast<uint32_t>(cc->nranks)) return;
-    cc->responder.enqueue_error(static_cast<int>(requester_rank), owner_token);
+    if (cc == nullptr) return;
+    if (requester_rank >= static_cast<uint32_t>(cc->nranks)) {
+        logf("a refused get request names rank %u, outside the communicator's %d; no error can be sent", requester_rank,
+             cc->nranks);
+        return;
+    }
+    if (cc->responder.enqueue_error(static_cast<int>(requester_rank), owner_token)) return;
+    // The responder has stopped (the communicator is closing): send the error directly, once.
+    if (not cc->links.send_get_error(static_cast<int>(requester_rank), owner_token))
+        logf("get %llu from rank %u was refused and the error could not be sent", static_cast<unsigned long long>(owner_token),
+             requester_rank);
 }
 
 ncclResult_t srdsim_iflush(void* rmaCtx, int /*context*/, void* /*mhandle*/, uint32_t /*rank*/,
@@ -3656,9 +3669,10 @@ ncclResult_t srdsim_test(void* /*collComm*/, void* request, int* done) {
             return ncclInternalError;
         }
         if (it->second.failed) {
-            logf("get %llu completed without its data: the owner could not serve it, or its reply could not be "
-                 "written here", static_cast<unsigned long long>(r->get_id));
-            complete = true;
+            complete = it->second.remaining <= 0;
+            if (complete)
+                logf("get %llu completed without its data: the owner could not serve it, or part of its reply could "
+                     "not be written here", static_cast<unsigned long long>(r->get_id));
         } else if (it->second.ctx == nullptr) {
             // Its context is gone, so the reply will never be counted. Reported, and finished, so the request
             // does not stay live forever; its data did not land.

@@ -152,9 +152,10 @@ using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, void*
 // On the owner: a get request it received could not be served (unknown window, out of range, deregistered, or
 // the get-request hook failed). `requester_rank` and `owner_token` are what a GetError back needs.
 using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, void* user);
-// On the requester: a get will not complete with its data: the owner sent GetError, or a frame of the reply could
-// not be written here.
-using GetFailedFn = void (*)(uint64_t owner_token, void* user);
+// On the requester: a get will not complete with its data. `bytes` is the length of a reply frame that could not be
+// written here, or kAllBytes for a GetError, which stands for every byte of the reply still to come.
+constexpr uint64_t kAllBytes = ~uint64_t{0};
+using GetFailedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
 
 class WindowTable {
 public:
@@ -680,7 +681,7 @@ private:
                     refused_.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
-                if (hooks_.get_failed) hooks_.get_failed(h.op_id, conn->user ? conn->user : hooks_.user);
+                if (hooks_.get_failed) hooks_.get_failed(h.op_id, kAllBytes, conn->user ? conn->user : hooks_.user);
                 continue;
             }
             void* const hook_user = conn->user ? conn->user : hooks_.user;
@@ -688,7 +689,7 @@ private:
                 if (h.kind == static_cast<uint32_t>(WireKind::GetRequest) and hooks_.get_refused)
                     hooks_.get_refused(h.requester_rank, h.op_id, hook_user);
                 if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_failed)
-                    hooks_.get_failed(h.op_id, hook_user);
+                    hooks_.get_failed(h.op_id, h.length, hook_user);
             };
 
             Window w{};
@@ -1167,11 +1168,6 @@ public:
         return send_framed(peer, h, nullptr, 0, reserved);
     }
 
-    // No payload: the requester does not have the bytes yet. `src_window_id`/`src_offset`/`fetch_bytes`
-    // name what to read on the peer; `dest_window_id`/`dest_offset` name where, in the requester's own
-    // numbering, the reply belongs; `requester_rank` is this rank's own id, since the peer otherwise has
-    // no way to learn who asked (see the comment on `serve()`); `owner_token` is an opaque value the
-    // requester chose, to be echoed back unchanged in the GetResponse.
     // Tells `peer` that the get request carrying `owner_token` will not be answered.
     bool send_get_error(int peer, uint64_t owner_token) {
         WireHeader h{};
@@ -1180,6 +1176,11 @@ public:
         return send_framed(peer, h, nullptr, 0);
     }
 
+    // No payload: the requester does not have the bytes yet. `src_window_id`/`src_offset`/`fetch_bytes`
+    // name what to read on the peer; `dest_window_id`/`dest_offset` name where, in the requester's own
+    // numbering, the reply belongs; `requester_rank` is this rank's own id, since the peer otherwise has
+    // no way to learn who asked (see the comment on `serve()`); `owner_token` is an opaque value the
+    // requester chose, to be echoed back unchanged in the GetResponse.
     bool send_get_request(int peer, uint32_t src_window_id, uint64_t src_offset, uint64_t fetch_bytes,
                           uint32_t dest_window_id, uint64_t dest_offset, uint32_t requester_rank,
                           uint64_t owner_token, bool reserved = false) {
