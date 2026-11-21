@@ -785,6 +785,8 @@ const std::vector<Scenario>& scenarios() {
         {"connect_peer_absent_of_three", [](Rank&) {}, 3, {"srd"}, {1}, "HARNESS_CONNECT_ABSENT=1 SRDSIM_CONNECT_TIMEOUT_MS=2000"},
         {"connect_peer_not_listening", [](Rank&) {}, 2, {"srd"}, {1},
          "HARNESS_CONNECT_ABSENT=1 HARNESS_CONNECT_ABSENT_CLOSED=1 SRDSIM_CONNECT_TIMEOUT_MS=2000"},
+        {"connect_duplicate_rank_fails_fast", [](Rank&) {}, 2, {"srd"}, {1},
+         "HARNESS_CONNECT_ABSENT=1 HARNESS_CONNECT_ABSENT_DUPLICATE=1 SRDSIM_CONNECT_TIMEOUT_MS=8000"},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},

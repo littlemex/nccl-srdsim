@@ -50,6 +50,7 @@ constexpr int kStallMs = 3000;        // nothing observable changed for this lon
 constexpr int kRankWallMs = 10000;    // a rank gives up any single wait after this long
 constexpr size_t kDataBytes = 8u << 20;   // room for one put larger than the transport's default frame limit
 constexpr size_t kSignalWords = 64;
+constexpr int kConnectFailedFlag = 15;   // Shared::flag counting the ranks whose connect failed (HARNESS_CONNECT_ABSENT)
 
 // Shared between the ranks of one case and the driver, in an anonymous shared mapping.
 struct Shared {
@@ -376,15 +377,28 @@ struct Rank {
         // during setup would; with HARNESS_CONNECT_ABSENT_CLOSED it also closes its listening socket first, so dialling
         // it is refused. Every other rank's connect must then fail at the plugin's deadline (SRDSIM_CONNECT_TIMEOUT_MS,
         // which the case sets): not before it, not much after it, and saying why. The case ends there.
+        // With HARNESS_CONNECT_ABSENT_DUPLICATE, rank r instead connects as rank r of a communicator of three in which
+        // the third rank's handle is rank 0's, so rank 0 receives two links that both say they are rank r. Rank 0's
+        // accepting then fails at once, and its connect must fail well before the deadline: one side's failure stops
+        // the other.
         if (const char* absent = std::getenv("HARNESS_CONNECT_ABSENT")) {
             const int a = std::atoi(absent);
             if (a < 0 or a >= g_nranks) fail("harness", "connect-absent", "rank %d is not a rank of the case", a);
             const char* t = std::getenv("SRDSIM_CONNECT_TIMEOUT_MS");
             const long long timeout = t ? std::atoll(t) : 0;
             if (timeout <= 0 or timeout >= kRankWallMs) fail("harness", "connect-absent", "%s", "set SRDSIM_CONNECT_TIMEOUT_MS below 10 s");
+            const bool duplicate = std::getenv("HARNESS_CONNECT_ABSENT_DUPLICATE") != nullptr;
+            if (duplicate and (g_nranks != 2 or a != 1)) fail("harness", "connect-absent", "%s", "the duplicate case has two ranks, rank 1 absent");
             if (g_rank == a) {
                 g_shared->expected_dead[a].store(1);
                 if (std::getenv("HARNESS_CONNECT_ABSENT_CLOSED")) check(rma.closeListen(listenComm), "closeListen");
+                if (duplicate) {
+                    std::thread([this, listenComm] {
+                        void* three[3] = {g_shared->handles[0], g_shared->handles[1], g_shared->handles[0]};
+                        void* c = nullptr;
+                        (void)rma.connect(ctx, three, 3, 1, listenComm, &c);
+                    }).detach();
+                }
                 barrier("absent-ready");
                 set_where("absent");
                 pause_forever();
@@ -395,25 +409,35 @@ struct Rank {
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
             if (rc == ncclSuccess) fail("assert", "connect-absent", "connected although rank %d never called connect", a);
             // The plugin counts its remaining time in whole milliseconds, so it may give up a millisecond or so early.
-            if (ms < timeout - 50 or ms > timeout + 1500)
-                fail("assert", "connect-absent", "the connect failed after %lld ms, against a deadline of %lld ms",
-                     static_cast<long long>(ms), timeout);
             std::string why;
             {
                 std::lock_guard<std::mutex> g(g_log_mu);
                 why = g_connect_line;
             }
+            if (duplicate) {
+                if (ms > timeout / 2)
+                    fail("assert", "connect-absent", "the connect failed after %lld ms, though its accepting failed at once",
+                         static_cast<long long>(ms));
+                if (why.find("did not introduce itself") == std::string::npos)
+                    fail("assert", "connect-absent", "the failure was not the duplicate link: '%s'", why.c_str());
+                g_shared->flag[kConnectFailedFlag].fetch_add(1);
+                kill(g_shared->pid[a], SIGKILL);
+                finish("ok");
+            }
+            if (ms < timeout - 50 or ms > timeout + 1500)
+                fail("assert", "connect-absent", "the connect failed after %lld ms, against a deadline of %lld ms",
+                     static_cast<long long>(ms), timeout);
             const std::string name = "rank " + std::to_string(a);
             const std::string names = "rank(s) " + std::to_string(a) + " did";
             if (why.find(names) == std::string::npos and why.find(name + " did not acknowledge") == std::string::npos and
                 why.find("could not reach " + name) == std::string::npos)
                 fail("assert", "connect-absent", "the failure did not name rank %d alone: '%s'", a, why.c_str());
             // The other survivors may still be in their own connect; the absent rank goes once they are all done.
-            g_shared->flag[15].fetch_add(1);
+            g_shared->flag[kConnectFailedFlag].fetch_add(1);
             if (g_rank == (a == 0 ? 1 : 0)) {
                 set_where("connects-failed");
                 const auto wait_start = Clock::now();
-                while (g_shared->flag[15].load() < g_nranks - 1 and Clock::now() - wait_start < std::chrono::milliseconds(kRankWallMs))
+                while (g_shared->flag[kConnectFailedFlag].load() < g_nranks - 1 and Clock::now() - wait_start < std::chrono::milliseconds(kRankWallMs))
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 kill(g_shared->pid[a], SIGKILL);
             }

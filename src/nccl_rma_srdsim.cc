@@ -356,28 +356,32 @@ struct MrHandle {
 // Bootstrap and connection state
 // ---------------------------------------------------------------------------
 
-// Reads exactly `bytes`, or gives up when `ms` have passed without them.
-bool read_within(int fd, void* buf, size_t bytes, int ms) {
+// Reads exactly `bytes`, or gives up when `ms` have passed without them, or once `*stop` is set (checked every 100 ms).
+enum class ReadResult { Ok, Closed, Expired, Error };
+ReadResult read_within(int fd, void* buf, size_t bytes, int ms, const std::atomic<bool>* stop = nullptr) {
     char* p = static_cast<char*>(buf);
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     while (bytes > 0) {
+        if (stop and stop->load()) return ReadResult::Expired;
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
-        if (left <= 0) return false;
+        if (left <= 0) return ReadResult::Expired;
         pollfd pfd{fd, POLLIN, 0};
-        const int r = ::poll(&pfd, 1, static_cast<int>(left));
+        const int r = ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left, 100)));
         if (r < 0 and errno == EINTR) continue;
-        if (r <= 0) return false;
+        if (r < 0) return ReadResult::Error;
+        if (r == 0) continue;
         const ssize_t n = ::recv(fd, p, bytes, 0);
         if (n > 0) { p += n; bytes -= static_cast<size_t>(n); continue; }
-        if (n == 0) return false;
-        if (errno != EINTR and errno != EAGAIN) return false;
+        if (n == 0) return ReadResult::Closed;
+        if (errno != EINTR and errno != EAGAIN) return ReadResult::Error;
     }
-    return true;
+    return ReadResult::Ok;
 }
 
 // How long `connect` waits for every peer to dial in.
 size_t connect_timeout_ms() {
-    static const size_t v = env_size("SRDSIM_CONNECT_TIMEOUT_MS", 120000, size_t{24} * 3600 * 1000);   // at most a day
+    // 0, or more than a day, gives the default.
+    static const size_t v = env_size("SRDSIM_CONNECT_TIMEOUT_MS", 120000, size_t{24} * 3600 * 1000);
     return v;
 }
 
@@ -3149,6 +3153,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     };
     std::thread acceptor;
     std::atomic<bool> accept_failed{false};
+    // Set by whichever side fails first, accepting or dialling; both check it and give up.
     std::atomic<bool> abandon{false};
     // Every return below joins the acceptor first, because it holds references to these locals.
     struct JoinAcceptor {
@@ -3178,6 +3183,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                         logf("rank %d could not wait for connections (errno %d, events %#x); the connect fails", rank,
                              r < 0 ? errno : 0, pfd.revents);
                         broken = true;
+                        abandon = true;
                         break;
                     }
                     if (r == 0) continue;
@@ -3185,6 +3191,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                     if (fd < 0 and errno != EAGAIN and errno != EWOULDBLOCK and errno != EINTR and errno != ECONNABORTED) {
                         logf("rank %d could not accept a connection (errno %d); the connect fails", rank, errno);
                         broken = true;
+                        abandon = true;
                         break;
                     }
                 }
@@ -3193,6 +3200,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                         logf("rank(s) %s did not connect to rank %d within %zu ms; the connect fails", missing().c_str(),
                              rank, connect_timeout_ms());
                     accept_failed = true;
+                    abandon = true;
                     break;
                 }
                 // Accepted sockets do not inherit O_NONBLOCK on Linux; the receive loop needs a blocking one.
@@ -3201,14 +3209,24 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                 // The dialler first says which rank it is, so the agent can say where a frame came from. Read
                 // under the deadline, and at most 10 s: a dialler that never writes must not hang the connect.
                 LinkHello hello{};
-                const bool read = read_within(fd, &hello, sizeof(hello), std::min(10000, ms_left()));
-                if (not read or hello.magic != LinkHello::kMagic or hello.version != LinkHello::kVersion or
+                const ReadResult got = read_within(fd, &hello, sizeof(hello), std::min(10000, ms_left()), &abandon);
+                if (got == ReadResult::Expired and (abandon.load() or ms_left() == 0)) {
+                    if (not abandon.load())
+                        logf("rank(s) %s did not connect to rank %d within %zu ms; the connect fails", missing().c_str(),
+                             rank, connect_timeout_ms());
+                    ::close(fd);
+                    accept_failed = true;
+                    abandon = true;
+                    break;
+                }
+                if (got != ReadResult::Ok or hello.magic != LinkHello::kMagic or hello.version != LinkHello::kVersion or
                     hello.rank < 0 or hello.rank >= nranks or hello.rank == rank or served.count(hello.rank)) {
                     logf("an accepted connection did not introduce itself as a new peer of this communicator "
-                         "(read %d, magic %#x, version %u, rank %d); the connect fails", int(read), hello.magic,
+                         "(read %d, magic %#x, version %u, rank %d); the connect fails", int(got), hello.magic,
                          hello.version, hello.rank);
                     ::close(fd);
                     accept_failed = true;
+                    abandon = true;
                     break;
                 }
                 // The acknowledgement the dialler waits for: this link is part of this rank's mesh.
@@ -3217,6 +3235,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                     logf("could not acknowledge the link from rank %d; the connect fails", hello.rank);
                     ::close(fd);
                     accept_failed = true;
+                    abandon = true;
                     break;
                 }
                 served.insert(hello.rank);
@@ -3278,9 +3297,13 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         if (accept_failed.load()) { close_dialled(); return fail_connect(); }
         ConnHandle h{};
         std::memcpy(&h, handles[peer], sizeof(h));
-        const int fd = srdsim::dial_until(h.ip, h.port, deadline, &abandon);
+        int why = 0;
+        const int fd = srdsim::dial_until(h.ip, h.port, deadline, &abandon, &why);
         if (fd < 0) {
-            if (not abandon.load())
+            if (why != 0)
+                logf("could not dial rank %d at %s:%u (errno %d); the connect fails", peer, h.ip,
+                     static_cast<unsigned>(h.port), why);
+            else if (not abandon.load())
                 logf("could not reach rank %d at %s:%u within %zu ms; the connect fails", peer, h.ip,
                      static_cast<unsigned>(h.port), connect_timeout_ms());
             close_dialled();
@@ -3308,10 +3331,16 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     for (size_t i = 0; i < dialled.size(); ++ i) {
         const int peer = dialled[i].first, fd = dialled[i].second;
         char ack = 0;
-        if (not read_within(fd, &ack, 1, ms_left()) or ack != 1) {
-            if (not abandon.load())
+        const ReadResult got = read_within(fd, &ack, 1, ms_left(), &abandon);
+        if (got != ReadResult::Ok or ack != 1) {
+            if (got == ReadResult::Expired and not abandon.load())
                 logf("rank %d did not acknowledge the link from rank %d within %zu ms; the connect fails", peer, rank,
                      connect_timeout_ms());
+            else if (got == ReadResult::Closed)
+                logf("rank %d closed the link from rank %d instead of acknowledging it; the connect fails", peer, rank);
+            else if (got != ReadResult::Expired)
+                logf("rank %d answered the link from rank %d with %d, not an acknowledgement (read %d, errno %d); "
+                     "the connect fails", peer, rank, int(ack), int(got), errno);
             for (size_t j = i; j < dialled.size(); ++ j) ::close(dialled[j].second);
             return fail_connect();
         }
