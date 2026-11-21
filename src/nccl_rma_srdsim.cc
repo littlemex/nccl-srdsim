@@ -3038,7 +3038,14 @@ private:
                  static_cast<unsigned long long>(total),
                  first ? " Where every thread is:" : "");
             if (first) g_where.report(&logf);
-            for (CollComm* cc : comms) report_windows_once(cc);
+            for (CollComm* cc : comms) {
+                report_windows_once(cc);
+                // A waiter for a signal its operation lost a placement for waits forever: name it.
+                if (cc and cc->agent and cc->agent->withheld_signals() != 0)
+                    logf("STALL: communicator %p withheld %llu signal(s) whose operation lost a placement; a wait for "
+                         "one of them will not end", static_cast<void*>(cc),
+                         static_cast<unsigned long long>(cc->agent->withheld_signals()));
+            }
         }
     }
 
@@ -3396,6 +3403,9 @@ ncclResult_t srdsim_close_coll(void* collComm) {
 #endif
         cc->responder.stop();          // before the links it sends on go
         drop_parked(cc, nullptr);
+        if (cc->agent and cc->agent->withheld_signals() != 0)
+            lifecycle("communicator %p withheld %llu signal(s) whose operation lost a placement", collComm,
+                      static_cast<unsigned long long>(cc->agent->withheld_signals()));
         lifecycle("communicator %p closing: progress calls that held a peer for outbox room %llu, "
                   "frames refused for the outbox budget %llu", collComm,
                   static_cast<unsigned long long>(cc->held_for_room.load()),
@@ -3803,11 +3813,12 @@ void report_receive_side(CollComm* cc, uint64_t progress_calls) {
         size_t queued = 0;
         for (size_t i = 0; i < cc->links.peers(); ++ i) queued += cc->links.pending_bytes(int(i));
         logf("receive side (comm %p, %d peer connection(s)): %llu placement(s), %llu signal(s) "
-             "applied, %llu refused, %llu failed write(s), %zu byte(s) queued to send",
+             "applied, %llu refused, %llu failed write(s), %llu signal(s) withheld, %zu byte(s) queued to send",
              static_cast<const void*>(cc), cc->accepted_connections,
              static_cast<unsigned long long>(pl), static_cast<unsigned long long>(sg),
              static_cast<unsigned long long>(cc->agent->refused_frames()),
-             static_cast<unsigned long long>(cc->agent->failed_writes()), queued);
+             static_cast<unsigned long long>(cc->agent->failed_writes()),
+             static_cast<unsigned long long>(cc->agent->withheld_signals()), queued);
     }
 }
 
