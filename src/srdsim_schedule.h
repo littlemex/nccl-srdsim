@@ -299,13 +299,17 @@ public:
             return true;
         compact();
         const size_t slot = pending_.size();
-        peer_slots_[op.peer].insert(slot);
-        key_slots_[std::make_pair(op.context, op.peer)].insert({op.id, slot});
         pending_.push_back(std::move(p));
+        weight_.push_back(0);
+        fw_append();
         pending_ids_.insert(op.id);
         ++ live_count_;
-        weight_.push_back(0);
-        fw_append(0);
+        peer_slots_[op.peer].insert(slot);
+        auto& key = key_slots_[std::make_pair(op.context, op.peer)];
+        key.insert({op.id, slot});
+        // Ids need not grow with submission: an operation older by id than the one that was oldest on its context and
+        // peer holds that one's strong signal back again.
+        if (key.size() > 1 and key.begin()->second == slot) refresh(std::next(key.begin())->second);
         refresh(slot);
         return true;
     }
@@ -318,18 +322,19 @@ public:
     struct Room {
         virtual ~Room() = default;
         // Room for one more unit of up to `bytes` of payload to `peer`. Within one `progress` call the answer for
-        // a peer may go from yes to no but not back, so the schedule does not depend on when a socket drains.
+        // a peer may go from yes to no but not back, so the schedule does not depend on when a socket drains. Room for
+        // `bytes` is room for anything smaller.
         virtual bool fits(int peer, size_t bytes) = 0;
         virtual void take(int peer, size_t bytes) = 0;  // a unit of `bytes` was released to this peer
     };
 
     size_t progress(size_t budget, std::vector<Unit>* out, Room* room = nullptr) {
-        room_ = room;
-        compact();
         struct Clear {
             Scheduler* s;
             ~Clear() { s->room_ = nullptr; s->clear_excluded(); }
         } clear{this};
+        room_ = room;
+        compact();
         size_t released = 0;
         while (released < budget) {
             const Choice c = opt_.reference_pick ? pick_reference()
@@ -400,26 +405,54 @@ public:
         return released;
     }
 
-    // Tests only: no operation that is done is still pending, and `pending_ids_` holds exactly the pending ids.
-    // The release weights and their tree agree with the operations they are kept for.
+    // Tests only: no operation that is done is still pending, and `pending_ids_` holds exactly the pending ids. Every
+    // index the release tree keeps matches a recount from the operations alone: the weights against `pick`'s rule for
+    // what an operation can release now, the trees against the weights, and the per-peer and per-key sets.
     bool consistent() const {
         if (pending_ids_.size() != live_count_) return false;
-        size_t live = 0;
+        size_t live = 0, dead = 0;
+        std::map<int, int64_t> peer_w;
+        std::map<int, std::multiset<size_t>> units;
+        std::map<int, std::set<size_t>> peers;
+        std::map<std::pair<int, int>, std::set<std::pair<uint64_t, size_t>>> keys;
+        int64_t total = 0;
         for (size_t i = 0; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
-            if (weight_[i] != weight(i)) return false;
-            if (not p.live) continue;
-            ++ live;
-            if ((p.remaining == 0 and not p.signal_pending) or pending_ids_.count(p.op.id) == 0) return false;
+            int w = 0;
+            if (p.live) {
+                ++ live;
+                if ((p.remaining == 0 and not p.signal_pending) or pending_ids_.count(p.op.id) == 0) return false;
+                bool sig = p.signal_pending and p.remaining == 0;
+                if (sig and p.op.signal_is_strong)
+                    for (const Pending& q : pending_)
+                        if (q.live and q.op.id < p.op.id and q.op.peer == p.op.peer and q.op.context == p.op.context)
+                            sig = false;
+                w = p.remaining + (sig ? 1 : 0);
+                peers[p.op.peer].insert(i);
+                keys[std::make_pair(p.op.context, p.op.peer)].insert({p.op.id, i});
+                if (const size_t u = unit_of(p)) units[p.op.peer].insert(u);
+                if (w) peer_w[p.op.peer] += w;
+            } else {
+                ++ dead;
+            }
+            if (weight_[i] != w or p.in_units != (p.live and unit_of(p) != 0)) return false;
+            total += w;
         }
-        if (live != live_count_) return false;
+        if (live != live_count_ or dead != dead_count_ or total != fw_total_) return false;
+        if (fw_.size() != pending_.size() + 1 and not (fw_.empty() and pending_.empty())) return false;
         for (size_t j = 1; j < fw_.size(); ++ j) {
             int64_t sum = 0;
             for (size_t i = j - (j & (~j + 1)) + 1; i <= j; ++ i) sum += weight_[i - 1];
             if (fw_[j] != sum) return false;
         }
-        return true;
+        std::map<int, int64_t> kept_w;
+        for (const auto& e : peer_weight_) if (e.second) kept_w.insert(e);
+        return peers == peer_slots_ and keys == key_slots_ and units == peer_units_ and peer_w == kept_w and ex_.empty() and
+               excluded_.empty();
     }
+
+    // Tests only: how many times the slots of finished operations were dropped.
+    uint64_t compactions() const { return compactions_; }
 
     // True once every submitted operation has had all its units released.
     bool idle() const { return live_count_ == 0; }
@@ -481,6 +514,7 @@ private:
     struct Pending {
         Op   op;
         bool live = true;        // false once every unit is released; the slot stays until `compact`
+        bool in_units = false;   // its unit size is in `peer_units_`
         int  chunk_count = 0;
         std::vector<bool> placed;
         int  remaining = 0;
@@ -802,54 +836,77 @@ private:
     // `pick` scans every pending operation, which is what the ordering modes need. `Mode::Srd` draws uniformly among
     // every unit any operation can release now, so it keeps, per slot of `pending_`, how many units that operation
     // can release (its chunks not yet placed, plus one for its signal when that is releasable), and a Fenwick tree
-    // over those weights: a draw is then found in O(log n). The order of the options and the draws are those of
-    // `pick`, so the schedule is the same (`test_srdsim_schedule` S12 and S13).
+    // over those weights: a draw is then found in O(log n). The options are in the order `pick` lists them and are
+    // drawn with the same generator, so without a Room, or with one whose answer does not depend on the unit's size,
+    // the schedule is `pick`'s (`test_srdsim_schedule` S12 and S13).
     //
-    // A peer whose link has no room is excluded for the rest of the `progress` call: its slots' weights are mirrored
-    // in a second tree that the draw subtracts. The Room contract (yes may become no within a call, never back) is
-    // what makes that sound.
+    // Room is asked once per pick per peer with something to release, for the largest unit that peer has pending; a
+    // peer that has none is left out of the draw for the rest of the `progress` call. The Room contract (yes may become
+    // no within a call, never back; room for a unit is room for a smaller one) makes that sound. `pick` asks per
+    // operation, so with a Room whose answer depends on the size, `srd` can hold a peer's small units back while its
+    // largest does not fit, where `pick` would release them; both release only units that fit.
 
+    // The largest unit operation `p` can still release, in bytes of payload: 0 once only its signal is left.
+    size_t unit_of(const Pending& p) const {
+        if (not p.live or p.op.is_get_request or p.op.bytes == 0 or p.remaining == 0) return 0;
+        return std::min(opt_.chunk_bytes, p.op.bytes);
+    }
     // The units operation `i` can release now under `Mode::Srd`'s rules.
     int weight(size_t i) const {
         const Pending& p = pending_[i];
         if (not p.live) return 0;
         bool sig = p.signal_pending and p.remaining == 0;
         if (sig and p.op.signal_is_strong) {
-            const auto ks = key_slots_.find(std::make_pair(p.op.context, p.op.peer));
             // Earlier means a smaller id, as in `signal_releasable`.
-            sig = ks != key_slots_.end() and not ks->second.empty() and ks->second.begin()->second == i;
+            const auto ks = key_slots_.find(std::make_pair(p.op.context, p.op.peer));
+            sig = ks != key_slots_.end() and ks->second.begin()->second == i;
         }
         return p.remaining + (sig ? 1 : 0);
     }
+    // Brings slot `i`'s weight, its peer's total and its peer's unit sizes up to date with the operation.
     void refresh(size_t i) {
+        Pending& p = pending_[i];
+        const size_t u = unit_of(p);
+        if (p.in_units != (u != 0)) {
+            if (u != 0) {
+                peer_units_[p.op.peer].insert(u);
+            } else {
+                auto it = peer_units_.find(p.op.peer);
+                it->second.erase(it->second.find(std::min(opt_.chunk_bytes, p.op.bytes)));
+                if (it->second.empty()) peer_units_.erase(it);
+            }
+            p.in_units = u != 0;
+        }
         const int w = weight(i);
         const int64_t d = int64_t(w) - weight_[i];
         if (d == 0) return;
         weight_[i] = w;
         tree_add(fw_, i, d);
-        if (not excluded_.empty() and excluded_.count(pending_[i].op.peer)) {
-            tree_add(ex_, i, d);
-            ex_total_ += d;
-        }
         fw_total_ += d;
+        auto pw = peer_weight_.find(p.op.peer);
+        if (pw == peer_weight_.end()) pw = peer_weight_.emplace(p.op.peer, 0).first;
+        pw->second += d;
+        if (pw->second == 0) peer_weight_.erase(pw);
+        if (ex_built_ and excluded_.count(p.op.peer)) tree_add(ex_, i, d);
     }
     static void tree_add(std::vector<int64_t>& t, size_t i, int64_t d) {
         for (size_t j = i + 1; j < t.size(); j += j & (~j + 1)) t[j] += d;
     }
-    // Appends a slot of weight `w` to `fw_`: the new node covers the `lowbit` slots that end at it.
-    void fw_append(int w) {
+    // Appends a slot of weight 0 to `fw_`: the new node covers the `lowbit` slots that end at it. Only between
+    // `progress` calls, when there is no excluded tree to extend.
+    void fw_append() {
+        assert(ex_.empty());
         if (fw_.empty()) fw_.push_back(0);
         const size_t n = fw_.size();   // the new node's 1-based index
-        int64_t sum = w;
+        int64_t sum = 0;
         for (size_t j = n - 1, stop = n - (n & (~n + 1)); j > stop; j -= j & (~j + 1)) sum += fw_[j];
         fw_.push_back(sum);
-        if (not ex_.empty()) ex_.push_back(0);
-        fw_total_ += w;
     }
-    static void tree_build(std::vector<int64_t>& t, const std::vector<int>& w) {
+    // A tree over `w`, keeping only the slots `keep` accepts.
+    template <class Keep> static void tree_build(std::vector<int64_t>& t, const std::vector<int>& w, Keep keep) {
         t.assign(w.size() + 1, 0);
         for (size_t i = 1; i <= w.size(); ++ i) {
-            t[i] += w[i - 1];
+            if (keep(i - 1)) t[i] += w[i - 1];
             const size_t j = i + (i & (~i + 1));
             if (j <= w.size()) t[j] += t[i];
         }
@@ -860,23 +917,17 @@ private:
         it->second.erase(i);
         if (it->second.empty()) m.erase(it);
     }
-    void exclude(int peer) {
-        if (not excluded_.insert(peer).second) return;
-        if (ex_.size() != fw_.size()) ex_.assign(fw_.size(), 0);
-        const auto ps = peer_slots_.find(peer);
-        if (ps == peer_slots_.end()) return;
-        for (size_t i : ps->second) { tree_add(ex_, i, weight_[i]); ex_total_ += weight_[i]; }
-    }
     void clear_excluded() {
-        if (excluded_.empty()) return;
         excluded_.clear();
         ex_.clear();
-        ex_total_ = 0;
+        ex_built_ = false;
     }
-    // Drops the slots of operations no longer live once they are as many as the live ones, so the cost is amortised
-    // over the reaps that made them. Never called while a `progress` call is choosing.
+    // Drops the slots of operations no longer live once they are as many as the live ones, so the cost of rebuilding
+    // the indices, O(n log n), is spread over the reaps that made them. Never called while a `progress` call is
+    // choosing.
     void compact() {
         if (dead_count_ == 0 or dead_count_ < live_count_ + 32) return;
+        ++ compactions_;
         std::vector<Pending> kept;
         kept.reserve(live_count_);
         for (Pending& p : pending_) if (p.live) kept.push_back(std::move(p));
@@ -884,47 +935,56 @@ private:
         dead_count_ = 0;
         peer_slots_.clear();
         key_slots_.clear();
+        peer_units_.clear();
+        peer_weight_.clear();
         for (size_t i = 0; i < pending_.size(); ++ i) {
-            peer_slots_[pending_[i].op.peer].insert(i);
-            key_slots_[std::make_pair(pending_[i].op.context, pending_[i].op.peer)].insert({pending_[i].op.id, i});
+            Pending& p = pending_[i];
+            p.in_units = false;
+            peer_slots_[p.op.peer].insert(i);
+            key_slots_[std::make_pair(p.op.context, p.op.peer)].insert({p.op.id, i});
         }
         weight_.assign(pending_.size(), 0);
-        for (size_t i = 0; i < pending_.size(); ++ i) weight_[i] = weight(i);
-        tree_build(fw_, weight_);
+        fw_.assign(pending_.size() + 1, 0);
         fw_total_ = 0;
-        for (int w : weight_) fw_total_ += w;
-        clear_excluded();
+        for (size_t i = 0; i < pending_.size(); ++ i) refresh(i);
     }
 
-    // `pick` for `Mode::Srd`, from the release tree. Chooses what `pick` would.
+    // `pick` for `Mode::Srd`, from the release tree.
     Choice pick_srd() {
         if (room_ != nullptr) {
-            // What `pick` asks per operation, asked per peer, of that peer's oldest operation: the same answer for a
-            // link whose room does not depend on the unit's size, and checked again below for the one drawn.
-            for (const auto& ps : peer_slots_)
-                if (not excluded_.count(ps.first) and not has_room(pending_[*ps.second.begin()])) exclude(ps.first);
-        }
-        for (;;) {
-            const int64_t total = fw_total_ - ex_total_;
-            if (total <= 0) return {};
-            size_t k = rng_.below(static_cast<size_t>(total));
-            // The slot whose units hold draw `k`, descending the tree of weights less the excluded ones.
-            size_t pos = 0;
-            size_t step = 1;
-            while (step * 2 < fw_.size()) step *= 2;
-            const bool ex = not ex_.empty();
-            for (; step > 0; step /= 2) {
-                const size_t next = pos + step;
-                if (next >= fw_.size()) continue;
-                const int64_t v = fw_[next] - (ex ? ex_[next] : 0);
-                if (v <= static_cast<int64_t>(k)) { pos = next; k -= static_cast<size_t>(v); }
+            for (const auto& pw : peer_weight_) {
+                if (excluded_.count(pw.first)) continue;
+                const auto pu = peer_units_.find(pw.first);
+                const size_t unit = pu == peer_units_.end() ? 0 : *pu->second.rbegin();
+                if (not room_->fits(pw.first, unit)) { excluded_.insert(pw.first); ex_built_ = false; }
             }
-            const size_t i = pos;   // 0-based slot
-            Pending& p = pending_[i];
-            if (room_ != nullptr and not has_room(p)) { exclude(p.op.peer); continue; }
-            if (k < static_cast<size_t>(p.remaining)) return {static_cast<int>(i), p.kth_unplaced(static_cast<int>(k))};
-            return {static_cast<int>(i), -1};
         }
+        int64_t excluded_weight = 0;
+        for (int peer : excluded_) {
+            const auto pw = peer_weight_.find(peer);
+            if (pw != peer_weight_.end()) excluded_weight += pw->second;
+        }
+        const int64_t total = fw_total_ - excluded_weight;
+        if (total <= 0) return {};
+        const bool ex = not excluded_.empty();
+        if (ex and not ex_built_) {
+            tree_build(ex_, weight_, [&](size_t i) { return excluded_.count(pending_[i].op.peer) != 0; });
+            ex_built_ = true;
+        }
+        size_t k = rng_.below(static_cast<size_t>(total));
+        // The slot whose units hold draw `k`, descending the tree of weights less the excluded ones.
+        size_t pos = 0;
+        size_t step = 1;
+        while (step * 2 < fw_.size()) step *= 2;
+        for (; step > 0; step /= 2) {
+            const size_t next = pos + step;
+            if (next >= fw_.size()) continue;
+            const int64_t v = fw_[next] - (ex ? ex_[next] : 0);
+            if (v <= static_cast<int64_t>(k)) { pos = next; k -= static_cast<size_t>(v); }
+        }
+        const Pending& p = pending_[pos];   // 0-based slot
+        if (k < static_cast<size_t>(p.remaining)) return {static_cast<int>(pos), p.kth_unplaced(static_cast<int>(k))};
+        return {static_cast<int>(pos), -1};
     }
 
     Options opt_;
@@ -944,12 +1004,16 @@ private:
     std::unordered_set<uint64_t> pending_ids_;   // the ids of the live operations, for `complete` and the duplicate check
     size_t live_count_ = 0, dead_count_ = 0;
     std::map<int, std::set<size_t>> peer_slots_;                    // live slots per peer
+    std::map<int, int64_t> peer_weight_;                            // per peer with any: the sum of its slots' weights
+    std::map<int, std::multiset<size_t>> peer_units_;               // per peer: `unit_of` each live slot, where not 0
     // Live (id, slot) per (context, peer), smallest id first.
     std::map<std::pair<int, int>, std::set<std::pair<uint64_t, size_t>>> key_slots_;
     std::vector<int> weight_;                    // per slot: what `weight` was when last refreshed
     std::vector<int64_t> fw_, ex_;               // Fenwick trees over `weight_`, and over the excluded peers' part
-    int64_t fw_total_ = 0, ex_total_ = 0;
+    int64_t fw_total_ = 0;
     std::set<int> excluded_;                     // peers without room for the rest of this `progress` call
+    bool ex_built_ = false;                      // `ex_` is over `excluded_` as it is now
+    uint64_t compactions_ = 0;
     uint64_t units_released_ = 0;
     uint64_t largest_issued_id_ = 0;
     uint64_t overlaps_ = 0;
