@@ -844,6 +844,7 @@ void test_pick_matches_reference() {
                 br.clear();
                 fast.progress(budget, &bf, &rf);
                 ref.progress(budget, &br, &rr);
+                same = same and fast.consistent();
                 same = same and bf.size() == br.size();
                 for (size_t i = 0; same and i < bf.size(); ++ i)
                     same = bf[i].op_id == br[i].op_id and bf[i].chunk_index == br[i].chunk_index and bf[i].kind == br[i].kind;

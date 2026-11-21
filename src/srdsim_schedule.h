@@ -296,8 +296,8 @@ public:
         // is genuinely nothing to do -- and it keeps `idle()` meaning what it says.
         if (p.chunk_count == 0 and not p.signal_pending)
             return true;
-        pending_ids_.insert(op.id);
         pending_.push_back(std::move(p));
+        pending_ids_.insert(op.id);
         return true;
     }
 
@@ -383,6 +383,14 @@ public:
             reap(static_cast<size_t>(c.pending_index));
         }
         return released;
+    }
+
+    // Tests only: no operation that is done is still pending, and `pending_ids_` holds exactly the pending ids.
+    bool consistent() const {
+        if (pending_ids_.size() != pending_.size()) return false;
+        for (const Pending& p : pending_)
+            if ((p.remaining == 0 and not p.signal_pending) or pending_ids_.count(p.op.id) == 0) return false;
+        return true;
     }
 
     // True once every submitted operation has had all its units released.
@@ -730,8 +738,10 @@ private:
     }
 
     // Only the operation a unit was just released from can have become done, so only it is checked; the others
-    // keep their order.
+    // keep their order. `submit` and this are the only writers of `pending_` and `pending_ids_`, and a unit's
+    // release (`progress`) is the only change to an operation's `remaining` and `signal_pending`.
     void reap(size_t i) {
+        assert(i < pending_.size());
         const Pending& p = pending_[i];
         if (p.remaining != 0 or p.signal_pending) return;
         pending_ids_.erase(p.op.id);
