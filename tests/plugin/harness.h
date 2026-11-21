@@ -377,8 +377,8 @@ struct Rank {
         // during setup would; with HARNESS_CONNECT_ABSENT_CLOSED it also closes its listening socket first, so dialling
         // it is refused. Every other rank's connect must then fail at the plugin's deadline (SRDSIM_CONNECT_TIMEOUT_MS,
         // which the case sets): not before it, not much after it, and saying why. The case ends there.
-        // With HARNESS_CONNECT_ABSENT_DUPLICATE, rank r instead connects as rank r of a communicator of three in which
-        // the third rank's handle is rank 0's, so rank 0 receives two links that both say they are rank r. Rank 0's
+        // With HARNESS_CONNECT_ABSENT_DUPLICATE, rank r instead connects as rank 0 of a communicator of three whose
+        // other handles are its own and rank 0's, so rank 0 receives a link that says it comes from rank 0. Rank 0's
         // accepting then fails at once, and its connect must fail well before the deadline: one side's failure stops
         // the other.
         if (const char* absent = std::getenv("HARNESS_CONNECT_ABSENT")) {
@@ -396,7 +396,7 @@ struct Rank {
                     std::thread([this, listenComm] {
                         void* three[3] = {g_shared->handles[0], g_shared->handles[1], g_shared->handles[0]};
                         void* c = nullptr;
-                        (void)rma.connect(ctx, three, 3, 1, listenComm, &c);
+                        (void)rma.connect(ctx, three, 3, /*rank=*/0, listenComm, &c);
                     }).detach();
                 }
                 barrier("absent-ready");
