@@ -104,7 +104,7 @@ Each rank runs three kinds of thread for a communicator: NCCL's GIN proxy thread
 
 The plugin is one source file and four headers it includes; a fifth header is used only by a test. The headers hold the logic whose correctness can be decided without a GPU, so they are tested on any Linux host.
 
-![nccl_rma_srdsim.cc includes srdsim_schedule.h (order of release), srdsim_transport.h (frames and the receiving agent), srdsim_async.h (the send queue) and srdsim_mapping.h (BAR arithmetic), and uses NCCL's plugin headers and, optionally, the CUDA driver with NVRTC and GDRCopy. The headers need only the C++ standard library, and POSIX sockets for the transport. srdsim_impair.h is used only by the liveness test, not by the plugin.](images/components.svg)
+![nccl_rma_srdsim.cc includes srdsim_schedule.h (order of release), srdsim_transport.h (frames and the receiving agent), srdsim_async.h (the send queue) and srdsim_mapping.h (BAR arithmetic), and uses NCCL's plugin headers and, optionally, the CUDA driver with NVRTC and GDRCopy. The headers need only the C++ standard library, and POSIX sockets for the transport. The plugin also includes srdsim_impair.h (impairments), which the liveness test uses too.](images/components.svg)
 
 | File | Responsibility |
 |---|---|
@@ -112,7 +112,7 @@ The plugin is one source file and four headers it includes; a fifth header is us
 | `src/srdsim_transport.h` | The transport: the frame format, the streams, the outbox per peer, and the receiving agent |
 | `src/srdsim_async.h` | The send queue for units whose source is device memory still being copied to the host. A template over the unit type |
 | `src/srdsim_mapping.h` | Address arithmetic for GDRCopy BAR mappings and the pinned staging pool |
-| `src/srdsim_impair.h` | Deliberate impairments (delay, bursts, backpressure, a frozen link, a lagging signal), used by the liveness test; the plugin does not apply them yet ([#18](https://github.com/littlemex/nccl-srdsim/issues/18)) |
+| `src/srdsim_impair.h` | Deliberate impairments (delay, bursts, a slow receiver, a small send buffer, a frozen link, a lagging signal), read from the environment by each communicator and used by the liveness test |
 | `src/nccl_rma_srdsim.cc` | The op table, stream setup, window registration, delivery into device memory, completion and diagnostics |
 
 ## The transport and the receive side
@@ -174,7 +174,7 @@ EFA-GDA, the device-side GIN backend for SRD, has no get; this path exists for c
 
 ## Impairments and diagnostics
 
-The plugin does not yet apply impairments ([#18](https://github.com/littlemex/nccl-srdsim/issues/18)): `src/srdsim_impair.h` models a slow, bursty, congested or partly frozen fabric, never a lossy one, and only the liveness test uses it. Such impairments target liveness failures, where something stops making progress, which are often the hardest defects to find on real hardware; ordering failures, where some reachable state is wrong, are what the delivery modes target.
+`src/srdsim_impair.h` models a slow, bursty, congested or partly frozen fabric, never a lossy one. Each communicator reads the impairments from the environment when it connects (see the configuration reference): delays, bursts and a signal lag on the progress thread before each released unit, a wait before each frame the receive agent applies, the socket send buffer, and a link to one peer frozen after a number of units by holding releases to it. The liveness test sets the same impairments directly. Such impairments target liveness failures, where something stops making progress, which are often the hardest defects to find on real hardware; ordering failures, where some reachable state is wrong, are what the delivery modes target.
 
 Besides the lines it prints at registration, deregistration and teardown, the plugin writes two kinds of line to stderr whatever `NCCL_DEBUG` is. In a CUDA build, when the first device window is registered, one line names the mechanism that writes device windows (GDRCopy, queued CUDA copies or waited-for CUDA copies), the CUDA context copies run from, and how signals are applied. Each time a communicator closes, one line reports how many times a progress call held a peer back for want of outbox room (counted once per peer per call), and how many frames its outbox refused for its budget.
 

@@ -142,6 +142,22 @@ public:
     explicit Delayer(const Impairments& imp, uint64_t seed)
         : imp_(imp), state_(seed ? seed : 0x9E3779B97F4A7C15ull) {}
 
+    // How long the next released unit should wait, in microseconds, without sleeping: the caller holds the unit
+    // back that long. Draws from the same sequence as `before_unit`.
+    uint64_t delay_for(bool is_signal) {
+        uint64_t us = 0;
+        if (imp_.burst != 0 and ++ in_burst_ >= imp_.burst) {
+            in_burst_ = 0;
+            us += imp_.burst_pause_us;
+        }
+        if (imp_.delay_us_max != 0) {
+            const uint32_t span = imp_.delay_us_max - imp_.delay_us_min;
+            us += imp_.delay_us_min + (span ? static_cast<uint32_t>(next() % (span + 1)) : 0);
+        }
+        if (is_signal) us += imp_.signal_lag_us;
+        return us;
+    }
+
     // Called once per released unit. Returns immediately when nothing is configured, which is the
     // default, so an unimpaired run pays one comparison.
     void before_unit(bool is_signal) {

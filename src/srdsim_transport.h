@@ -458,6 +458,8 @@ public:
         // that returns before its bytes land settles them here, so nothing it issued is still pending
         // while the link is quiet -- which is when an application tears its memory down.
         void (*idle)(void* user) = nullptr;
+        // An impairment: wait this long before applying each frame, as a slow receiver would.
+        uint32_t apply_interval_us = 0;
     };
 
     ReceiveAgent(WindowTable* windows, Hooks hooks) : windows_(windows), hooks_(hooks) {}
@@ -694,6 +696,11 @@ private:
                 if (hooks_.get_failed) hooks_.get_failed(h.op_id, kAllBytes, conn->user ? conn->user : hooks_.user);
                 continue;
             }
+            // The slow-receiver impairment: a wait before each frame that writes this rank's memory.
+            if (hooks_.apply_interval_us != 0 and
+                (h.kind == static_cast<uint32_t>(WireKind::Placement) or h.kind == static_cast<uint32_t>(WireKind::Signal) or
+                 h.kind == static_cast<uint32_t>(WireKind::GetResponse)) and not stopping_.load())
+                std::this_thread::sleep_for(std::chrono::microseconds(hooks_.apply_interval_us));
             void* const hook_user = conn->user ? conn->user : hooks_.user;
             // Called on every path that drops a frame or fails to write it: a placement's operation loses its signal,
             // and a get request or reply is answered or failed.

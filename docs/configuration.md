@@ -4,7 +4,7 @@
 
 Everything about a run that can be changed without rebuilding the plugin is an `SRDSIM_*` environment variable: which delivery order the simulator produces, how it copies into GPU memory, what it reports, and the switches that deliberately corrupt a run to prove a test would notice. Each group acts at one place on an operation's path from NCCL's call to the target's memory.
 
-![The path of an operation from NCCL's call through the scheduler, the send side and the transport to the receive side. Above it, the settings that act at each stage: the schedule settings at the scheduler, staging and queueing at the send side, the address at the transport, the delivery context at the receive side. Below it, the settings that change the data at submit and on device writes, the diagnostics across the whole path, and the impairment variables that are parsed but not applied.](images/settings-map.svg)
+![The path of an operation from NCCL's call through the scheduler, the send side and the transport to the receive side. Above it, the settings that act at each stage: the schedule settings at the scheduler, staging and queueing at the send side, the address at the transport, the delivery context at the receive side. Below it, the settings that change the data at submit and on device writes, the diagnostics across the whole path, and the impairments, read at connect.](images/settings-map.svg)
 
 The plugin reads each setting at one of four moments, so a value set after that moment has no effect. Set them all before NCCL initialises.
 
@@ -76,16 +76,16 @@ Each can change the bytes a run delivers, on purpose. Read once; the two negativ
 | `SRDSIM_CORRUPT_EVERY` | count | off | Negative control: flips one byte in the middle of every Nth device placement this rank applies. Does nothing on host windows or in a build without CUDA. Announced on stderr when active |
 | `SRDSIM_DROP_EVERY` | count | off | Negative control: reports every Nth device placement as applied without writing it. Same scope and announcement |
 
-## Not applied
+## Impairments
 
-`impairments_from_env()` in `src/srdsim_impair.h` parses these, but the plugin does not call it, so setting them has no effect ([#18](https://github.com/littlemex/nccl-srdsim/issues/18)). The host tests set the same impairments directly. The parser takes a decimal integer, with an empty or unparsable value giving the default; unlike the settings above, `0` means `0`.
+Each makes the fabric slow, bursty or partly stalled on purpose, never lossy, to expose liveness failures. Each communicator reads them when it connects and logs the ones in effect on stderr. The parser takes a decimal integer, with an empty or unparsable value giving the default; unlike the settings above, `0` means `0`.
 
-| Variable | Type | Default | Would set |
+| Variable | Type | Default | Sets |
 |---|---|---|---|
 | `SRDSIM_DELAY_US_MIN`, `SRDSIM_DELAY_US_MAX` | count | `0` | A random delay before each released unit; a maximum below the minimum is raised to it |
 | `SRDSIM_BURST`, `SRDSIM_BURST_PAUSE_US` | count | `0` | Release in bursts of this many units, then a pause |
-| `SRDSIM_APPLY_INTERVAL_US` | count | `0` | At most one applied frame per interval on the receiving side |
-| `SRDSIM_SEND_BUFFER_BYTES` | count | `0` | The socket send buffer size |
+| `SRDSIM_APPLY_INTERVAL_US` | count | `0` | A wait before each frame the receiving side applies |
+| `SRDSIM_SEND_BUFFER_BYTES` | count | `0` | The socket send buffer size (`SO_SNDBUF`) of each link the rank dials |
 | `SRDSIM_FREEZE_PEER` | count | none | The peer whose link is frozen; `0` is a peer |
-| `SRDSIM_FREEZE_AFTER_UNITS`, `SRDSIM_FREEZE_MS` | count | `0` | Freeze after this many applied units, for this long |
+| `SRDSIM_FREEZE_AFTER_UNITS`, `SRDSIM_FREEZE_MS` | count | `0` | After this many units released to the frozen peer, release nothing more to it for this long (on the sending side, through the same room check as backpressure) |
 | `SRDSIM_SIGNAL_LAG_US` | count | `0` | An extra delay before each signal |
