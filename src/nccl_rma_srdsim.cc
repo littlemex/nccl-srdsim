@@ -3688,6 +3688,8 @@ struct TestStats {
 };
 TestStats g_test_stats;
 
+bool parks(const CollComm* cc);
+
 bool parked_holds(const RmaCtx* owner, uint64_t op_id) {
     CollComm* cc = owner->coll;
     if (cc == nullptr or not parks(cc)) return false;
