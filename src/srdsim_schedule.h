@@ -45,6 +45,7 @@
 #include <map>
 #include <cstdio>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace srdsim {
@@ -262,13 +263,12 @@ public:
                        "numbered zero could never be reported finished";
             return false;
         }
-        for (const Pending& q : pending_)
-            if (q.op.id == op.id) {
-                if (why)
-                    *why = "an operation with this id is already pending; ids are the key this "
-                           "scheduler answers completion and deferral by, and they must be unique";
-                return false;
-            }
+        if (pending_ids_.count(op.id)) {
+            if (why)
+                *why = "an operation with this id is already pending; ids are the key this "
+                       "scheduler answers completion and deferral by, and they must be unique";
+            return false;
+        }
         if (op.bytes > opt_.max_op_bytes) {
             if (why)
                 *why = "operation exceeds the single-write size this simulator models; EFA-GDA "
@@ -296,6 +296,7 @@ public:
         // is genuinely nothing to do -- and it keeps `idle()` meaning what it says.
         if (p.chunk_count == 0 and not p.signal_pending)
             return true;
+        pending_ids_.insert(op.id);
         pending_.push_back(std::move(p));
         return true;
     }
@@ -379,7 +380,7 @@ public:
             out->push_back(u);
             ++ released;
             ++ units_released_;
-            reap();
+            reap(static_cast<size_t>(c.pending_index));
         }
         return released;
     }
@@ -423,10 +424,7 @@ public:
     bool complete(uint64_t op_id) const {
         if (op_id == 0 or op_id > largest_issued_id_)
             return false;
-        for (const auto& p : pending_)
-            if (p.op.id == op_id)
-                return false;
-        return true;
+        return pending_ids_.count(op_id) == 0;
     }
 
     // The largest id submitted so far. Ids are chosen by the caller, so this is the only thing the
@@ -731,18 +729,13 @@ private:
         return options[rng_.below(options.size())];
     }
 
-    void reap() {
-        size_t w = 0;
-        for (size_t i = 0; i < pending_.size(); ++ i) {
-            const Pending& p = pending_[i];
-            const bool done = (p.remaining == 0) and (not p.signal_pending);
-            if (not done) {
-                if (w != i)
-                    pending_[w] = std::move(pending_[i]);
-                ++ w;
-            }
-        }
-        pending_.resize(w);
+    // Only the operation a unit was just released from can have become done, so only it is checked; the others
+    // keep their order.
+    void reap(size_t i) {
+        const Pending& p = pending_[i];
+        if (p.remaining != 0 or p.signal_pending) return;
+        pending_ids_.erase(p.op.id);
+        pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(i));
     }
 
     Options opt_;
@@ -759,6 +752,7 @@ private:
         return room_->fits(p.op.peer, unit);
     }
     std::vector<Pending> pending_;
+    std::unordered_set<uint64_t> pending_ids_;   // the ids in `pending_`, for `complete` and the duplicate check
     uint64_t units_released_ = 0;
     uint64_t largest_issued_id_ = 0;
     uint64_t overlaps_ = 0;
