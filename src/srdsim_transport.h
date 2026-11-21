@@ -151,7 +151,7 @@ using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length
 // `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
 using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
 // Called before a frame of a GetResponse is written, with where it would land: whether it belongs to a get this rank
-// has outstanding with `peer_rank` and falls inside the range that get asked for. A frame it refuses is not written
+// has outstanding with `peer_rank` and is the frame that get expects next (`reply_frame_is_next`). A frame it refuses is not written
 // and is handled as any frame that could not be written (`GetFailedFn`). Unset, every in-range frame is written.
 using GetResponseAcceptFn = bool (*)(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
                                      int peer_rank, void* user);
@@ -160,9 +160,10 @@ using GetResponseAcceptFn = bool (*)(uint64_t owner_token, uint32_t window, uint
 // its owner's one link: the next starts at dst_off + (size - remaining) and is no longer than what remains. A frame
 // that could not be written or was refused is accounted for too, so the expected start stays where the next frame
 // will begin.
+// The owner never sends an empty frame: a get of no bytes sends no request.
 inline bool reply_frame_is_next(uint32_t dst_window, uint64_t dst_off, uint64_t size, uint64_t remaining,
                                 uint32_t window, uint64_t offset, uint64_t length) {
-    return window == dst_window and remaining <= size and length <= remaining and
+    return window == dst_window and length != 0 and remaining <= size and length <= remaining and
            offset == dst_off + (size - remaining);
 }
 // On the owner: a get request it received could not be served (unknown window, out of range, deregistered, or
@@ -812,8 +813,8 @@ private:
                 if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_response_accept and
                     not hooks_.get_response_accept(h.op_id, h.window_id, h.offset, h.length, conn->peer_rank, hook_user)) {
                     char m[200];
-                    std::snprintf(m, sizeof(m), "a get reply for get %llu does not match a get outstanding with this "
-                                  "peer (window %u offset %llu length %llu); not writing it",
+                    std::snprintf(m, sizeof(m), "a get reply frame for get %llu is not one an outstanding get from this "
+                                  "peer expects next (window %u offset %llu length %llu); not writing it",
                                   (unsigned long long)h.op_id, h.window_id, (unsigned long long)h.offset,
                                   (unsigned long long)h.length);
                     say(m);

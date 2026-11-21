@@ -413,7 +413,7 @@ public:
                  size_t chunk) {
         std::lock_guard<std::mutex> g(mu_);
         if (stopping_) return false;
-        queues_[peer].push_back({dest_window, dest_off, token, std::move(bytes), chunk, 0, false});
+        queues_[peer].push_back({dest_window, dest_off, token, std::move(bytes), chunk, 0, false, false});
         if (not thread_.joinable()) thread_ = std::thread([this] { loop(); });
         cv_.notify_one();
         return true;
@@ -423,7 +423,7 @@ public:
     bool enqueue_error(int peer, uint64_t token) {
         std::lock_guard<std::mutex> g(mu_);
         if (stopping_) return false;
-        queues_[peer].push_back({0, 0, token, {}, 1, 0, true});
+        queues_[peer].push_back({0, 0, token, {}, 1, 0, true, false});
         if (not thread_.joinable()) thread_ = std::thread([this] { loop(); });
         cv_.notify_one();
         return true;
@@ -456,7 +456,42 @@ private:
         size_t chunk;
         size_t sent;      // bytes appended to the link so far
         bool error;       // a GetError rather than data
+        bool faulted;     // SRDSIM_GET_REPLY_FAULT has been applied to it
     };
+
+    // SRDSIM_GET_REPLY_FAULT: this rank answers gets the way a faulty or hostile owner would, so a requester's checks
+    // on reply frames can be tested through the plugin. `forge` sends, before each reply, one frame of 0x5A bytes under
+    // a token no get has, just past the range the get asked for; `duplicate` sends each reply's first frame twice.
+    enum class Fault { None, Forge, Duplicate };
+    static Fault fault() {
+        static const Fault f = [] {
+            const std::string v = env_str("SRDSIM_GET_REPLY_FAULT", "");
+            if (v == "forge") return Fault::Forge;
+            if (v == "duplicate") return Fault::Duplicate;
+            if (not v.empty()) logf("unknown SRDSIM_GET_REPLY_FAULT '%s'; ignoring it", v.c_str());
+            return Fault::None;
+        }();
+        return f;
+    }
+    // Applies the fault before the reply's first frame (`forge`) or after it (`duplicate`). Returns false when the link
+    // refused the frame, to be tried again on a later turn.
+    bool apply_fault(int peer, Reply& r, bool after_first) {
+        if (r.faulted or r.error or r.bytes.empty()) return true;
+        const size_t n = std::min(r.chunk, r.bytes.size());
+        if (fault() == Fault::Forge and not after_first) {
+            const std::vector<char> junk(n, char(0x5A));
+            if (not links_->send_placement(peer, r.dest_window, r.dest_off + r.bytes.size(), junk.data(), n,
+                                           r.token ^ (uint64_t{1} << 63), srdsim::WireKind::GetResponse))
+                return false;
+            r.faulted = true;
+        } else if (fault() == Fault::Duplicate and after_first) {
+            if (not links_->send_placement(peer, r.dest_window, r.dest_off, r.bytes.data(), n, r.token,
+                                           srdsim::WireKind::GetResponse))
+                return false;
+            r.faulted = true;
+        }
+        return true;
+    }
 
     bool past_deadline() const { return stopping_ and std::chrono::steady_clock::now() >= deadline_; }
 
@@ -474,12 +509,14 @@ private:
                 const int peer = q.first;
                 Reply& r = q.second.front();   // only this thread pops, and a deque keeps references on push
                 g.unlock();
-                while (r.sent < r.bytes.size()) {
+                bool ok = fault() == Fault::None or r.sent != 0 or apply_fault(peer, r, false);
+                while (ok and r.sent < r.bytes.size()) {
                     const size_t n = std::min(r.chunk, r.bytes.size() - r.sent);
                     if (not links_->send_placement(peer, r.dest_window, r.dest_off + r.sent, r.bytes.data() + r.sent,
                                                    n, r.token, srdsim::WireKind::GetResponse)) break;
                     r.sent += n;
                     moved = true;
+                    if (fault() != Fault::None and not apply_fault(peer, r, true)) break;
                 }
                 bool appended = r.sent == r.bytes.size();
                 if (r.error) {
@@ -3617,11 +3654,18 @@ ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* re
     }
     if (dry_run()) return submit(ctx, op, request);   // completes at once and fetches nothing
     // The token the peer echoes back on every frame of the reply: this get's entry in `g_gets`.
-    uint64_t id;
+    uint64_t id = 0;
     bool lost = false;
     {
+        // One lock for the check and the record, so a link lost in between cannot sweep the gets before this one is in.
         std::lock_guard<std::mutex> g(g_gets.mu);
         lost = ctx->coll and ctx->coll->lost_peers.count(static_cast<int>(rank));
+        if (not lost) {
+            id = g_gets.next ++;
+            GetRecord rec{ctx, static_cast<int64_t>(size), false, ctx->coll, static_cast<int>(rank),
+                          op.get_dst_window, localOff, static_cast<uint64_t>(size)};
+            g_gets.gets.emplace(id, rec);
+        }
     }
     if (lost) {
         // The link from that rank has ended: the get cannot be answered, and fails at once.
@@ -3631,13 +3675,6 @@ ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* re
         r->ctx = ctx;
         *request = r;
         return ncclSuccess;
-    }
-    {
-        std::lock_guard<std::mutex> g(g_gets.mu);
-        id = g_gets.next ++;
-        GetRecord rec{ctx, static_cast<int64_t>(size), false, ctx->coll, static_cast<int>(rank),
-                      op.get_dst_window, localOff, static_cast<uint64_t>(size)};
-        g_gets.gets.emplace(id, rec);
     }
     op.get_response_token = id;
     const ncclResult_t rc = submit(ctx, op, request);
@@ -3760,7 +3797,9 @@ void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, int peer_ran
     std::lock_guard<std::mutex> g(g_gets.mu);
     auto it = g_gets.gets.find(owner_token);
     if (it == g_gets.gets.end()) {
-        logf("a get failure named get %llu, which is not outstanding; ignoring", static_cast<unsigned long long>(owner_token));
+        // A reply frame that was not written has been logged by the receive side already.
+        if (bytes == srdsim::kAllBytes)
+            logf("a get error named get %llu, which is not outstanding; ignoring", static_cast<unsigned long long>(owner_token));
         return;
     }
     if (not from_owner(it->second, peer_rank, user)) {

@@ -631,6 +631,44 @@ void get_refused_by_owner(Rank& R) {
     }
 }
 
+// The owner answers with a forged frame before each reply (SRDSIM_GET_REPLY_FAULT=forge): a token no get has, 0x5A
+// bytes, just past the range the get asked for and inside the requester's window, so only the plugin's check on reply
+// frames keeps it out. The get completes with its data, nothing past its range is written, and no failure is reported.
+void get_reply_forged(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, remote = (512 << 10) + 7, local = (1200 << 10) + kGuard;
+    if (g_rank == 1) fill(R.at(remote), n, 1, 26);
+    barrier("owner filled");
+    if (g_rank == 0) {
+        R.wait_retired(R.issue(get(0, 1, remote, n, local)), "get");
+        if (size_t bad = mismatches(R.at(local), n, 1, 26)) fail("assert", "data", "%zu bytes", bad);
+        if (size_t bad = nonzero(R.at(local + n), 8192)) fail("assert", "forged-frame-written", "%zu bytes", bad);
+        if (R.last_error()) fail("assert", "no-failure", "%s", "queryLastError reports a failure");
+        set_flag(0);
+    } else {
+        wait_flag(0, "requester-done");
+    }
+}
+
+// The owner sends each reply's first frame twice (SRDSIM_GET_REPLY_FAULT=duplicate). Accepting the copy would bring
+// the get to zero bytes outstanding with its tail never written; instead the copy is refused and counted against the
+// get, whose later frames then no longer start where it expects, so the get fails: it retires, queryLastError reports
+// it, its first frame is in place and nothing after it is written.
+void get_reply_duplicated(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, remote = (512 << 10) + 7, local = (1200 << 10) + kGuard, frame = 8192;
+    if (g_rank == 1) fill(R.at(remote), n, 1, 27);
+    barrier("owner filled");
+    if (g_rank == 0) {
+        R.wait_retired(R.issue(get(0, 1, remote, n, local)), "get");
+        if (not R.last_error()) fail("assert", "failure-reported", "%s", "queryLastError reports nothing");
+        if (size_t bad = mismatches(R.at(local), frame, 1, 27)) fail("assert", "first-frame", "%zu bytes", bad);
+        if (size_t bad = nonzero(R.at(local + frame), n - frame)) fail("assert", "rest-written", "%zu bytes", bad);
+        expect_guards(R, local, n);
+        set_flag(0);
+    } else {
+        wait_flag(0, "requester-done");
+    }
+}
+
 // A placement the target refuses (it runs past the target's window) does not let its own signal apply: the signal
 // would announce bytes that never landed. A put with a signal after it on the same link applies both, which shows
 // the earlier signal frame was seen and withheld, and that only the operation that lost a placement is affected.
@@ -780,6 +818,8 @@ const std::vector<Scenario>& scenarios() {
 #endif
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
+        {"get_reply_forged", get_reply_forged, 2, {"srd"}, {1}, "SRDSIM_GET_REPLY_FAULT=forge"},
+        {"get_reply_duplicated", get_reply_duplicated, 2, {"srd"}, {1}, "SRDSIM_GET_REPLY_FAULT=duplicate"},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},

@@ -421,7 +421,7 @@ void test_get_reply_not_accepted() {
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { expect(false, "socketpair"); return; }
     srdsim::set_nodelay(sv[0]);
     srdsim::set_nodelay(sv[1]);
-    agent.serve(sv[1]);
+    agent.serve(sv[1], nullptr, /*peer_rank=*/5);
 
     std::vector<char> bad(128, char(0xAA)), good(64, char(0x55));
     srdsim::SendLinks links;
@@ -443,7 +443,7 @@ void test_get_reply_not_accepted() {
                rep.failed_calls, (unsigned long long)rep.failed_token, (unsigned long long)rep.failed_bytes));
     expect(landed == good.size(), "the accepted frame after it landed");
     expect(rep.asked_good == 1, "the accept hook was asked about the accepted frame too");
-    expect(rep.peer_seen == -1, ctx("the accept hook was given the link's peer rank (-1 for a link with none), got %d", rep.peer_seen));
+    expect(rep.peer_seen == 5, ctx("the accept hook was given the link's peer rank (5), got %d", rep.peer_seen));
     expect(rep.landed_calls == 1 and rep.landed.landed_token == 2 and rep.landed.landed_bytes == good.size(),
            ctx("get_response_landed fired once, for the accepted frame (%d call(s))", rep.landed_calls));
     expect(agent.errors() == 1, ctx("the refused frame was counted once (%llu)", (unsigned long long)agent.errors()));
@@ -463,7 +463,8 @@ void test_reply_frame_is_next() {
     expect(not next(60, 3, 1040, 61), "G6 a frame past the end of the range");
     expect(not next(0, 3, 1100, 1), "G6 any frame once every byte is accounted for");
     expect(not next(101, 3, 999, 1), "G6 more remaining than the get's size");
-    expect(next(0, 3, 1100, 0), "G6 an empty frame at the end changes nothing");
+    expect(not next(0, 3, 1100, 0), "G6 an empty frame, even where the get ends");
+    expect(not next(100, 3, 1000, 0), "G6 an empty frame at the start");
 }
 
 }  // namespace

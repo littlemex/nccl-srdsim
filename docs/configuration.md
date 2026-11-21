@@ -75,6 +75,7 @@ Each can change the bytes a run delivers, on purpose. Read once; the two negativ
 | `SRDSIM_SNAPSHOT_SOURCE` | flag | off | Copies the whole device source of each put when it is submitted, sends that copy, and counts every unit whose source changed before release. Does nothing in a build without CUDA. Needs GDRCopy or synchronous delivery (`SRDSIM_ASYNC_DELIVERY=0` or `SRDSIM_PAGEABLE_STAGING`); otherwise it is ignored, with one line on stderr. Slow |
 | `SRDSIM_CORRUPT_EVERY` | count | off | Negative control: flips one byte in the middle of every Nth device placement this rank applies. Does nothing on host windows or in a build without CUDA. Announced on stderr when active |
 | `SRDSIM_DROP_EVERY` | count | off | Negative control: reports every Nth device placement as applied without writing it. Same scope and announcement |
+| `SRDSIM_GET_REPLY_FAULT` | `forge` or `duplicate` | off | Negative control: this rank answers gets as a faulty owner would. `forge` sends, before each reply, one frame of `0x5A` bytes under a token no get has, just past the range the get asked for; `duplicate` sends each reply's first frame twice. The requester writes neither, and fails a get that received a duplicate. Another value is ignored, with one line on stderr |
 
 ## Impairments
 
