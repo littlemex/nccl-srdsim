@@ -612,6 +612,21 @@ void large_chunk(Rank& R) {
     }
 }
 
+// With a payload limit per progress call smaller than any unit (SRDSIM_RELEASE_BYTES_PER_CALL=1), each call still
+// releases its first unit, so a put of several chunks and its signal still arrive, one unit per call, with the data.
+void one_unit_per_call(Rank& R) {
+    constexpr size_t n = (64 << 10) + 13, src = 4099, dst = (1 << 20) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 28);
+        R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 3, false)), "put-with-signal");
+    } else {
+        R.wait_peer([&] { return R.signal_word(3) >= 1; }, "signal-word");
+        if (size_t bad = mismatches(R.at(dst), n, 0, 28)) fail("assert", "data", "%zu bytes", bad);
+        expect_guards(R, dst, n);
+        expect_signals(R, {{3, 1}});
+    }
+}
+
 // A get the owner cannot serve (it reads past the owner's window) fails instead of hanging: the get retires, a
 // flush after it completes, queryLastError reports it, and a valid get after it completes with its data.
 void get_refused_by_owner(Rank& R) {
@@ -781,6 +796,7 @@ const std::vector<Scenario>& scenarios() {
 #endif
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
+        {"one_unit_per_call", one_unit_per_call, 2, {"srd", "inorder"}, {1}, "SRDSIM_RELEASE_BYTES_PER_CALL=1"},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},
