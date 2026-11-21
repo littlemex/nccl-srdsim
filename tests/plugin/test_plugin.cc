@@ -658,13 +658,38 @@ void negative_count_is_default(Rank& R) {
         fail("assert", "negative-count", "SRDSIM_CHUNK_BYTES=-4096 gave '%s'", g_init_line.c_str());
 }
 
+// The impairments from the environment are applied. Each case puts 16 chunks of 8 KiB with a signal and checks the
+// data, and the time the put takes bounds the impairment from below.
+void impaired_put(Rank& R, long min_ms, bool measure_on_target) {
+    constexpr size_t n = 16 * 8192, src = 4099, dst = (1 << 20) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 25);
+        barrier("ready");
+        const auto t0 = Clock::now();
+        R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 12, false)), "put-with-signal");
+        const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count());
+        if (not measure_on_target and ms < min_ms) fail("assert", "impairment-not-applied", "the put took %ld ms, want >= %ld", ms, min_ms);
+    } else {
+        barrier("ready");
+        const auto t0 = Clock::now();
+        R.wait_peer([&] { return R.signal_word(12) == 1; }, "signal-word");
+        const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count());
+        if (size_t bad = mismatches(R.at(dst), n, 0, 25)) fail("assert", "data", "%zu bytes", bad);
+        if (measure_on_target and ms < min_ms) fail("assert", "impairment-not-applied", "the signal took %ld ms, want >= %ld", ms, min_ms);
+    }
+}
+void impaired_delay(Rank& R) { impaired_put(R, 16 * 2, false); }          // 2 ms before each of 17 units
+void impaired_freeze(Rank& R) { impaired_put(R, 400, false); }            // frozen for 500 ms after 4 units
+void impaired_apply_interval(Rank& R) { impaired_put(R, 16 * 5, true); }  // 5 ms before each applied frame
+void impaired_signal_lag(Rank& R) { impaired_put(R, 150, false); }        // 200 ms before the signal
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
     int nranks;
     std::vector<const char*> modes;
     std::vector<int> seeds;
-    const char* extra_env;   // NAME=VALUE set in every rank, or nullptr
+    const char* extra_env;   // NAME=VALUE pairs, separated by spaces, set in every rank; or nullptr
 };
 
 const std::vector<const char*> kKeepI1 = {"srd", "inorder", "peer-seq", "reverse-ops", "signal-last", "defer-one"};
@@ -703,6 +728,11 @@ const std::vector<Scenario>& scenarios() {
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},
         {"overflowing_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=99999999999999999999"},
+        {"impaired_delay", impaired_delay, 2, {"srd"}, {1}, "SRDSIM_DELAY_US_MIN=2000 SRDSIM_DELAY_US_MAX=2000"},
+        {"impaired_freeze", impaired_freeze, 2, {"srd"}, {1},
+         "SRDSIM_FREEZE_PEER=1 SRDSIM_FREEZE_AFTER_UNITS=4 SRDSIM_FREEZE_MS=500"},
+        {"impaired_apply_interval", impaired_apply_interval, 2, {"srd"}, {1}, "SRDSIM_APPLY_INTERVAL_US=5000"},
+        {"impaired_signal_lag", impaired_signal_lag, 2, {"srd"}, {1}, "SRDSIM_SIGNAL_LAG_US=200000"},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
@@ -759,7 +789,17 @@ Result run_case(const std::string& plugin, int table, const Scenario& sc, const 
             shared->pid[r] = getpid();          // published to the peers by the first barrier
             setenv("SRDSIM_MODE", mode, 1);
             setenv("SRDSIM_SEED", std::to_string(seed).c_str(), 1);
-            if (sc.extra_env) putenv(const_cast<char*>(sc.extra_env));
+            if (sc.extra_env) {   // NAME=VALUE pairs separated by spaces
+                std::string all = sc.extra_env;
+                for (size_t a = 0; a < all.size();) {
+                    size_t b = all.find(' ', a);
+                    if (b == std::string::npos) b = all.size();
+                    const std::string kv = all.substr(a, b - a);
+                    const size_t eq = kv.find('=');
+                    if (eq != std::string::npos) setenv(kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str(), 1);
+                    a = b + 1;
+                }
+            }
             Rank R;
             R.setup(plugin, table, mode, seed);
             sc.run(R);
