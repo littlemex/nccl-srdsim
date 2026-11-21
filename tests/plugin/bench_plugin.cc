@@ -2,13 +2,14 @@
 // Measures the plugin through its op table, the way the harness drives it (harness.h), with two ranks in two
 // processes on one host and host windows.
 //
-//   bench_plugin PLUGIN_SO TABLE_VERSION [MODE ...]
+//   bench_plugin PLUGIN_SO TABLE_VERSION [--size BYTES]... [MODE ...]
 //
-// For each mode (default: srd inorder) and each size it prints one line:
+// For each mode (default: srd inorder) and each size (default: 64 B, 8 KiB, 64 KiB, 1 MiB; at most 2 MiB) it prints
+// one line:
 //
-//   BENCH mode=srd size=8192 ops=512 MB/s=... p50_us=... p99_us=...
+//   BENCH mode=srd size=8192 ops=4096 ops/s=... MB/s=... p50_us=... p99_us=...
 //
-// MB/s is bytes put divided by the time from the first issue until the target sees the last signal, with the
+// ops/s and MB/s are puts and bytes put divided by the time from the first issue until the target sees the last signal, with the
 // puts issued back to back. p50_us and p99_us are the time from issuing one put with a signal until the target
 // sees its signal, one at a time. Numbers depend on the host; nothing here asserts on them.
 #include "harness.h"
@@ -31,9 +32,9 @@ using namespace harness;
 
 constexpr size_t kSrc = 4096;                 // sources start here and destinations at kDst, in every rank's window
 constexpr size_t kDst = 4u << 20;
-constexpr size_t kMaxBytes = 2u << 20;        // the largest put fits twice in the window's halves
+constexpr size_t kMaxBytes = 2u << 20;        // destinations cycle through [kDst, kDst + kMaxBytes)
 
-struct Result { double mbps = 0; double p50 = 0, p99 = 0; size_t ops = 0; };
+struct Result { double mbps = 0, ops_per_s = 0; double p50 = 0, p99 = 0; size_t ops = 0; };
 
 // A put of `size` bytes with a signal on word 0 of rank 1, to a destination that cycles through the second half of the window.
 Op put_signal_op(size_t size, size_t i) {
@@ -67,6 +68,7 @@ void run(Rank& R, size_t size, Result* out) {
         R.wait_peer([&] { return R.signal_word(0) == ops; }, "throughput");
         const double s = double(now_ns() - g_shared->t0_ns.load()) / 1e9;
         out->mbps = double(size) * double(ops) / s / 1e6;
+        out->ops_per_s = double(ops) / s;
         out->ops = ops;
         set_flag(0);
     }
@@ -103,14 +105,23 @@ int main(int argc, char** argv) {
     const std::string plugin = argv[1];
     const int table = std::atoi(argv[2]);
     std::vector<std::string> modes;
-    for (int i = 3; i < argc; ++ i) modes.push_back(argv[i]);
+    std::vector<size_t> sizes;
+    for (int i = 3; i < argc; ++ i) {
+        if (std::strcmp(argv[i], "--size") == 0 and i + 1 < argc) {
+            const unsigned long long v = std::strtoull(argv[++ i], nullptr, 10);
+            if (v == 0 or v > kMaxBytes) { std::fprintf(stderr, "--size must be 1 to %zu bytes\n", kMaxBytes); return 2; }
+            sizes.push_back(size_t(v));
+        } else {
+            modes.push_back(argv[i]);
+        }
+    }
     if (modes.empty()) modes = {"srd", "inorder"};
+    if (sizes.empty()) sizes = {64, 8192, 64u << 10, 1u << 20};
     // The plugin runs with its defaults and the mode asked for, not with whatever the caller's environment holds.
     std::vector<std::string> names;
     for (char** e = environ; *e; ++ e)
         if (std::strncmp(*e, "SRDSIM_", 7) == 0) names.emplace_back(*e, std::strcspn(*e, "="));
     for (const auto& n : names) unsetenv(n.c_str());
-    const size_t sizes[] = {64, 8192, 64u << 10, 1u << 20};
     int failures = 0;
     for (const auto& mode : modes) {
         for (size_t size : sizes) {
@@ -141,8 +152,8 @@ int main(int argc, char** argv) {
             bool ok = true;
             for (pid_t p : pids) { int st = 0; waitpid(p, &st, 0); ok = ok and WIFEXITED(st) and WEXITSTATUS(st) == 0; }
             if (ok)
-                std::printf("BENCH mode=%s size=%zu ops=%zu MB/s=%.1f p50_us=%.1f p99_us=%.1f\n", mode.c_str(), size,
-                            result->ops, result->mbps, result->p50, result->p99);
+                std::printf("BENCH mode=%s size=%zu ops=%zu ops/s=%.0f MB/s=%.2f p50_us=%.1f p99_us=%.1f\n", mode.c_str(),
+                            size, result->ops, result->ops_per_s, result->mbps, result->p50, result->p99);
             else {
                 std::printf("BENCH mode=%s size=%zu failed: %s / %s\n", mode.c_str(), size, shared->status[0], shared->status[1]);
                 ++ failures;
