@@ -261,6 +261,21 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
     if (host.timeouts) { std::fflush(stdout); std::_Exit(3); }
+    // Every rank's last signal (the one that frees its upstream owner's source) is still on its way when its kernel
+    // ends, and a rank that tore down now could take it with it; the owner waits for it before its own kernel ends.
+    // So no rank tears down until every rank's kernel has ended.
+    {
+        const std::string mine = std::string(argv[3]) + ".done." + std::to_string(rank);
+        std::ofstream(mine).put('1');
+        for (int other = 0; other < nranks; ++other) {
+            const std::string theirs = std::string(argv[3]) + ".done." + std::to_string(other);
+            int waited = 0;
+            while (not std::ifstream(theirs).good()) {
+                if (++waited > 10 * timeout_s) { std::fprintf(stderr, "rank %d never finished\n", other); std::_Exit(3); }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
     CHECK_NCCL(ncclDevCommDestroy(comm, &dcomm));
     CHECK_NCCL(ncclCommFinalize(comm));
     CHECK_NCCL(ncclCommDestroy(comm));
