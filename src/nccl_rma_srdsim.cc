@@ -3188,7 +3188,14 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                     }
                     if (r == 0) continue;
                     fd = ::accept(lc->fd, nullptr, nullptr);
-                    if (fd < 0 and errno != EAGAIN and errno != EWOULDBLOCK and errno != EINTR and errno != ECONNABORTED) {
+                    // accept(2): errors already pending on the queued connection are to be treated like EAGAIN, and the
+                    // peer will dial again; only an error of this rank's own (descriptors, the socket) fails the connect.
+                    const auto retry = [](int e) {
+                        return e == EAGAIN or e == EWOULDBLOCK or e == EINTR or e == ECONNABORTED or e == ENETDOWN or
+                               e == EPROTO or e == ENOPROTOOPT or e == EHOSTDOWN or e == ENONET or e == EHOSTUNREACH or
+                               e == EOPNOTSUPP or e == ENETUNREACH;
+                    };
+                    if (fd < 0 and not retry(errno)) {
                         logf("rank %d could not accept a connection (errno %d); the connect fails", rank, errno);
                         broken = true;
                         abandon = true;
@@ -3289,7 +3296,9 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     }
 
     // Dial and introduce this rank to every peer first, then wait for the acknowledgements, so a peer that never accepts
-    // does not keep this rank from dialling the others, which would then report this rank as missing too.
+    // does not keep this rank from dialling the others, which would then report this rank as missing too. An
+    // acknowledgement says the peer accepted this link, not that its own connect succeeded: with three or more ranks
+    // arriving close to the deadline apart, a rank between two late ones can succeed while one of them has failed.
     std::vector<std::pair<int, int>> dialled;   // (peer, fd), waiting for the acknowledgement
     const auto close_dialled = [&] { for (const auto& d : dialled) ::close(d.second); dialled.clear(); };
     for (int peer = 0; peer < nranks; ++ peer) {
@@ -3327,6 +3336,9 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             return fail_connect();
         }
         dialled.emplace_back(peer, fd);
+        // In place now: a peer that has all its acknowledgements may already send here, a get request among them, whose
+        // reply goes out on this link.
+        cc->links.set(peer, fd);
     }
     for (size_t i = 0; i < dialled.size(); ++ i) {
         const int peer = dialled[i].first, fd = dialled[i].second;
@@ -3338,13 +3350,15 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                      connect_timeout_ms());
             else if (got == ReadResult::Closed)
                 logf("rank %d closed the link from rank %d instead of acknowledging it; the connect fails", peer, rank);
-            else if (got != ReadResult::Expired)
-                logf("rank %d answered the link from rank %d with %d, not an acknowledgement (read %d, errno %d); "
-                     "the connect fails", peer, rank, int(ack), int(got), errno);
-            for (size_t j = i; j < dialled.size(); ++ j) ::close(dialled[j].second);
+            else if (got == ReadResult::Error)
+                logf("could not read rank %d's acknowledgement of the link from rank %d (errno %d); the connect fails",
+                     peer, rank, errno);
+            else if (got == ReadResult::Ok)
+                logf("rank %d answered the link from rank %d with %d, not an acknowledgement; the connect fails", peer,
+                     rank, int(ack));
+            close_dialled();
             return fail_connect();
         }
-        cc->links.set(peer, fd);
     }
     if (acceptor.joinable()) acceptor.join();
     if (accept_failed) return fail_connect();
