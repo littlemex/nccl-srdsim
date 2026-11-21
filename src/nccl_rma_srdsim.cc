@@ -461,18 +461,19 @@ private:
 
     // SRDSIM_GET_REPLY_FAULT: this rank answers gets the way a faulty or hostile owner would, so a requester's checks
     // on reply frames can be tested through the plugin. `forge` sends, before each reply, one frame of 0x5A bytes under
-    // a token no get has, just past the range the get asked for; `duplicate` sends each reply's first frame twice.
+    // a token no get has, just past the range the get asked for; `duplicate` sends each reply's first frame twice (for a
+    // reply of one frame, the copy is dropped if the link refuses it, since the reply is then complete).
     enum class Fault { None, Forge, Duplicate };
     static Fault fault() {
         static const Fault f = [] {
             const std::string v = env_str("SRDSIM_GET_REPLY_FAULT", "");
-            Fault f = Fault::None;
-            if (v == "forge") f = Fault::Forge;
-            else if (v == "duplicate") f = Fault::Duplicate;
+            Fault chosen = Fault::None;
+            if (v == "forge") chosen = Fault::Forge;
+            else if (v == "duplicate") chosen = Fault::Duplicate;
             else if (not v.empty()) logf("unknown SRDSIM_GET_REPLY_FAULT '%s'; ignoring it", v.c_str());
-            if (f != Fault::None)
+            if (chosen != Fault::None)
                 logf("NEGATIVE CONTROL: SRDSIM_GET_REPLY_FAULT=%s; this rank answers gets with faulty frames", v.c_str());
-            return f;
+            return chosen;
         }();
         return f;
     }

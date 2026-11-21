@@ -67,7 +67,7 @@ These change what is reported, or check something at a cost; they leave the data
 
 ## Settings that change the data
 
-Each can change the bytes a run delivers, on purpose. Read once; the two negative controls are read when the library is loaded.
+Each can change the bytes a run delivers, on purpose. Read once; `SRDSIM_CORRUPT_EVERY` and `SRDSIM_DROP_EVERY` are read when the library is loaded, and `SRDSIM_GET_REPLY_FAULT` the first time the rank answers a get.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
