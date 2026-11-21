@@ -151,7 +151,9 @@ using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length
 // `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
 using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
 // Called before a frame of a GetResponse is written, with where it would land: whether it belongs to a get this rank
-// has outstanding with `peer_rank` and is the frame that get expects next (`reply_frame_is_next`). A frame it refuses is not written
+// has outstanding with `peer_rank` and is the frame that get expects next (`reply_frame_is_next`). The receiving thread
+// calls `get_response_landed` or `get_failed` for a frame before it reads the next header, so the next call sees every
+// earlier frame of the link accounted for, whether or not a device copy of it is still in flight. A frame it refuses is not written
 // and is handled as any frame that could not be written (`GetFailedFn`). Unset, every in-range frame is written.
 using GetResponseAcceptFn = bool (*)(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
                                      int peer_rank, void* user);

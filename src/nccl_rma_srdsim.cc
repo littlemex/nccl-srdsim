@@ -466,10 +466,13 @@ private:
     static Fault fault() {
         static const Fault f = [] {
             const std::string v = env_str("SRDSIM_GET_REPLY_FAULT", "");
-            if (v == "forge") return Fault::Forge;
-            if (v == "duplicate") return Fault::Duplicate;
-            if (not v.empty()) logf("unknown SRDSIM_GET_REPLY_FAULT '%s'; ignoring it", v.c_str());
-            return Fault::None;
+            Fault f = Fault::None;
+            if (v == "forge") f = Fault::Forge;
+            else if (v == "duplicate") f = Fault::Duplicate;
+            else if (not v.empty()) logf("unknown SRDSIM_GET_REPLY_FAULT '%s'; ignoring it", v.c_str());
+            if (f != Fault::None)
+                logf("NEGATIVE CONTROL: SRDSIM_GET_REPLY_FAULT=%s; this rank answers gets with faulty frames", v.c_str());
+            return f;
         }();
         return f;
     }
@@ -509,7 +512,8 @@ private:
                 const int peer = q.first;
                 Reply& r = q.second.front();   // only this thread pops, and a deque keeps references on push
                 g.unlock();
-                bool ok = fault() == Fault::None or r.sent != 0 or apply_fault(peer, r, false);
+                // A fault the link refused is applied again before the reply's next frame.
+                bool ok = fault() == Fault::None or apply_fault(peer, r, r.sent != 0);
                 while (ok and r.sent < r.bytes.size()) {
                     const size_t n = std::min(r.chunk, r.bytes.size() - r.sent);
                     if (not links_->send_placement(peer, r.dest_window, r.dest_off + r.sent, r.bytes.data() + r.sent,

@@ -819,7 +819,7 @@ const std::vector<Scenario>& scenarios() {
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
         {"get_reply_forged", get_reply_forged, 2, {"srd"}, {1}, "SRDSIM_GET_REPLY_FAULT=forge"},
-        {"get_reply_duplicated", get_reply_duplicated, 2, {"srd"}, {1}, "SRDSIM_GET_REPLY_FAULT=duplicate"},
+        {"get_reply_duplicated", get_reply_duplicated, 2, {"srd"}, {1}, "SRDSIM_GET_REPLY_FAULT=duplicate SRDSIM_CHUNK_BYTES=8192"},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},
