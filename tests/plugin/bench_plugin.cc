@@ -49,6 +49,16 @@ Op put_signal_op(size_t size, size_t i) {
     return o;
 }
 
+// Waits for `pred` without sleeping, so a latency is not rounded up to the harness's polling interval.
+template <class Pred> void spin_until(Pred pred, const char* what) {
+    set_where(what);
+    const auto start = Clock::now();
+    while (not pred()) {
+        if (Clock::now() - start > std::chrono::milliseconds(kRankWallMs)) fail("timeout", what, "%s", "");
+        std::this_thread::yield();
+    }
+}
+
 int64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 
 // Rank 0 puts, rank 1 watches its signal words. Words 0 and 1 count the throughput and latency phases.
@@ -65,7 +75,7 @@ void run(Rank& R, size_t size, Result* out) {
         }
         wait_flag(0, "throughput-seen");
     } else {
-        R.wait_peer([&] { return R.signal_word(0) == ops; }, "throughput");
+        spin_until([&] { return R.signal_word(0) == ops; }, "throughput");
         const double s = double(now_ns() - g_shared->t0_ns.load()) / 1e9;
         out->mbps = double(size) * double(ops) / s / 1e6;
         out->ops_per_s = double(ops) / s;
@@ -82,9 +92,9 @@ void run(Rank& R, size_t size, Result* out) {
             Op o = put_signal_op(size, size_t(r));
             o.word = 1;
             R.issue(o);
-            R.wait_peer([&] { return g_shared->flag[1].load() == r + 1; }, "latency-ack");
+            spin_until([&] { return g_shared->flag[1].load() == r + 1; }, "latency-ack");
         } else {
-            R.wait_peer([&] { return R.signal_word(1) == uint64_t(r + 1); }, "latency");
+            spin_until([&] { return R.signal_word(1) == uint64_t(r + 1); }, "latency");
             us.push_back(double(now_ns() - g_shared->t0_ns.load()) / 1e3);
             g_shared->flag[1].store(r + 1);
         }
