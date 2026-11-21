@@ -3259,11 +3259,16 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             }
         });
     }
+    // Tears down what this connect built, in closeColl's order: the receiving threads already serving accepted links
+    // report to `cc` until they are stopped, so they stop before it is deleted.
     const auto fail_connect = [&] {
         abandon = true;
         if (acceptor.joinable()) acceptor.join();
         // The monitor was given this comm above, so it has to be told before the delete.
         g_stall_monitor.unwatch(cc);
+        cc->responder.stop();
+        cc->links.shutdown_all();
+        if (cc->agent) cc->agent->stop();
         delete cc;
         return ncclSystemError;
     };
@@ -3299,11 +3304,10 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     // does not keep this rank from dialling the others, which would then report this rank as missing too. An
     // acknowledgement says the peer accepted this link, not that its own connect succeeded: with three or more ranks
     // arriving close to the deadline apart, a rank between two late ones can succeed while one of them has failed.
-    std::vector<std::pair<int, int>> dialled;   // (peer, fd), waiting for the acknowledgement
-    const auto close_dialled = [&] { for (const auto& d : dialled) ::close(d.second); dialled.clear(); };
+    std::vector<std::pair<int, int>> dialled;   // (peer, fd), waiting for the acknowledgement; owned by `cc->links`
     for (int peer = 0; peer < nranks; ++ peer) {
         if (peer == rank) continue;
-        if (accept_failed.load()) { close_dialled(); return fail_connect(); }
+        if (accept_failed.load()) return fail_connect();
         ConnHandle h{};
         std::memcpy(&h, handles[peer], sizeof(h));
         int why = 0;
@@ -3315,7 +3319,6 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             else if (not abandon.load())
                 logf("could not reach rank %d at %s:%u within %zu ms; the connect fails", peer, h.ip,
                      static_cast<unsigned>(h.port), connect_timeout_ms());
-            close_dialled();
             return fail_connect();
         }
         if (cc->impair.send_buffer_bytes != 0) {
@@ -3332,7 +3335,6 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         if (not srdsim::write_all(fd, &me, sizeof(me))) {
             logf("could not tell rank %d which rank this is; the connect fails", peer);
             ::close(fd);
-            close_dialled();
             return fail_connect();
         }
         dialled.emplace_back(peer, fd);
@@ -3356,7 +3358,6 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             else if (got == ReadResult::Ok)
                 logf("rank %d answered the link from rank %d with %d, not an acknowledgement; the connect fails", peer,
                      rank, int(ack));
-            close_dialled();
             return fail_connect();
         }
     }
