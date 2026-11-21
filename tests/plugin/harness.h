@@ -59,7 +59,8 @@ struct Shared {
     char where[kMaxRanks][64];        // the wait a rank is in, for a driver that has to kill it
     pid_t pid[kMaxRanks];             // so a rank can stop and continue a peer
     std::atomic<int> flag[16]{};
-    std::atomic<int64_t> t0_ns{0};    // a time one rank publishes for another (steady_clock, shared by processes)
+    std::atomic<int64_t> t0_ns{0};
+    std::atomic<int> expected_dead[kMaxRanks]{};   // a case kills this rank on purpose; its SIGKILL is not a failure    // a time one rank publishes for another (steady_clock, shared by processes)
 };
 
 inline Shared* g_shared = nullptr;
