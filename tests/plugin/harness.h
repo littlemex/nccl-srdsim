@@ -158,7 +158,8 @@ inline void set_flag(int i) { g_shared->flag[i].store(1, std::memory_order_relea
 // plugin writes at init naming its mode and seed is kept, so a case can check that its settings took.
 inline std::mutex g_log_mu;
 inline std::string g_init_line;
-inline std::string g_poison_line;     // the plugin reported a CUDA error or stopped asynchronous delivery
+inline std::string g_poison_line;
+inline std::string g_unclean_line;    // the plugin logged a link that closed without a shutdown     // the plugin reported a CUDA error or stopped asynchronous delivery
 inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int, const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -167,11 +168,9 @@ inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int,
     va_end(ap);
     std::lock_guard<std::mutex> g(g_log_mu);
     if (std::strncmp(buf, "SRD simulator: ", 15) == 0) g_init_line = buf;
-    bool death_expected = false;
-    for (int r = 0; r < kMaxRanks; ++ r) death_expected = death_expected or g_shared->expected_dead[r].load();
+    if (g_unclean_line.empty() and std::strstr(buf, "closed without a shutdown")) g_unclean_line = buf;
     if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped") or
-                                   std::strstr(buf, "outbox room still reserved") or
-                                   (not death_expected and std::strstr(buf, "closed without a shutdown"))))
+                                   std::strstr(buf, "outbox room still reserved")))
         g_poison_line = buf;
     if (g_verbose or level == NCCL_LOG_WARN) std::fprintf(stderr, "[rank %d] %s\n", g_rank, buf);
 }
@@ -418,12 +417,17 @@ struct Rank {
 
     // The case passed on this rank. Under AddressSanitizer, what teardown left allocated is a finding.
     [[noreturn]] void pass() {
-        std::string poison;
+        std::string poison, unclean;
         {
             std::lock_guard<std::mutex> g(g_log_mu);
             poison = g_poison_line;
+            unclean = g_unclean_line;
         }
         if (not poison.empty()) fail("assert", "delivery-poisoned", "%s", poison.c_str());
+        // A link that closed without a shutdown is a failure unless the case killed a rank on purpose.
+        bool death_expected = false;
+        for (int r = 0; r < kMaxRanks; ++ r) death_expected = death_expected or g_shared->expected_dead[r].load();
+        if (not unclean.empty() and not death_expected) fail("assert", "unclean-close", "%s", unclean.c_str());
 #if defined(HARNESS_ASAN)
         if (__lsan_do_recoverable_leak_check() != 0) fail("leak", "teardown", "%s", "see the report above");
 #endif

@@ -726,6 +726,10 @@ void get_owner_dies(Rank& R) {
         R.wait_retired(g, "get-from-dead-owner");
         R.wait_retired(R.issue(flush(0, 1)), "flush");
         if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
+        {   // and the plugin said why
+            std::lock_guard<std::mutex> lg(g_log_mu);
+            if (g_unclean_line.empty()) fail("assert", "loss-logged", "%s", "no line says the link closed without a shutdown");
+        }
         // A get issued after the loss fails at once.
         R.wait_retired(R.issue(get(0, 1, remote, n, local)), "get-after-loss");
         R.teardown(/*meet_peers=*/false);   // the peer it would meet at the barrier is gone
