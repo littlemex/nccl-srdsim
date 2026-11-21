@@ -144,6 +144,12 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
         }
         if (threadIdx.x == 0) gin.signal(world, up, ncclGin_WeakSignalInc{free_sig});
     }
+    // The reader downstream may still be getting this block's last source: the rank stays, with its memory registered,
+    // until that reader says it is done. Otherwise its last get could fail, and a failed get also completes the flush.
+    if (r == rounds) {
+        wait_signal(free_sig, uint64_t(rounds), 3);
+        (void)stopped();
+    }
     if (threadIdx.x == 0) {
         if (wrong) atomicAdd(&result->wrong, wrong);
         if (stop && atomicAdd(&result->timeouts, 1ull) == 0) {
