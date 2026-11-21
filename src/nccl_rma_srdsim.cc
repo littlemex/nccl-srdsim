@@ -3699,17 +3699,17 @@ bool from_owner(const GetRecord& rec, int peer_rank, const void* cc) {
 }
 
 // Whether a frame of a get's reply may be written: it names a get outstanding with the rank it came from, on this
-// communicator, still has that many bytes to come, and lands inside the range the get asked for. Anything else would
-// write memory no get of this rank's asked to fill.
+// communicator, whose context still exists, and it is the frame that get expects next (`srdsim::reply_frame_is_next`).
+// Anything else would write memory no get of this rank's asked to fill, or fill a get's range twice and leave a hole.
 bool srdsim_handle_get_response_accept(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
                                        int peer_rank, void* user) {
     std::lock_guard<std::mutex> g(g_gets.mu);
     auto it = g_gets.gets.find(owner_token);
     if (it == g_gets.gets.end()) return false;
     const GetRecord& rec = it->second;
-    return from_owner(rec, peer_rank, user) and rec.ctx != nullptr and window == rec.dst_window and
-           offset >= rec.dst_off and length <= rec.size and offset - rec.dst_off <= rec.size - length and
-           static_cast<int64_t>(length) <= rec.remaining;
+    return from_owner(rec, peer_rank, user) and rec.ctx != nullptr and rec.remaining >= 0 and
+           srdsim::reply_frame_is_next(rec.dst_window, rec.dst_off, rec.size, static_cast<uint64_t>(rec.remaining),
+                                       window, offset, length);
 }
 
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user) {

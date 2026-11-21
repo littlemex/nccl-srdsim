@@ -155,6 +155,16 @@ using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, int p
 // and is handled as any frame that could not be written (`GetFailedFn`). Unset, every in-range frame is written.
 using GetResponseAcceptFn = bool (*)(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
                                      int peer_rank, void* user);
+// Whether a reply frame is the next one a get expects. A get of `size` bytes into [dst_off, dst_off + size) of window
+// `dst_window`, with `remaining` bytes not yet accounted for, expects its frames in order, one after the other, from
+// its owner's one link: the next starts at dst_off + (size - remaining) and is no longer than what remains. A frame
+// that could not be written or was refused is accounted for too, so the expected start stays where the next frame
+// will begin.
+inline bool reply_frame_is_next(uint32_t dst_window, uint64_t dst_off, uint64_t size, uint64_t remaining,
+                                uint32_t window, uint64_t offset, uint64_t length) {
+    return window == dst_window and remaining <= size and length <= remaining and
+           offset == dst_off + (size - remaining);
+}
 // On the owner: a get request it received could not be served (unknown window, out of range, deregistered, or
 // the get-request hook failed). `requester_rank` and `owner_token` are what a GetError back needs.
 using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, void* user);

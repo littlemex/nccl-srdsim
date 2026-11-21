@@ -17,6 +17,8 @@
 //   G4  a GetRequest naming a window the receiver never registered is refused and the stream survives.
 //   G5  a GetResponse frame the `get_response_accept` hook refuses is not written, is reported through
 //       `get_failed` with its length, does not fire `get_response_landed`, and the stream survives it.
+//   G6  `reply_frame_is_next`, the rule the plugin's accept hook applies to a get it has outstanding: only the frame
+//       that starts where the bytes accounted for end, in the get's window and inside its range, is accepted.
 
 #include <cstdarg>
 #include <cstdio>
@@ -379,7 +381,7 @@ void test_get_unknown_window() {
 // G5: a reply frame the requester does not accept never reaches memory.
 // ---------------------------------------------------------------------------
 struct AcceptReport {
-    int asked = 0;
+    int asked = 0, asked_good = 0, landed_calls = 0, peer_seen = 0;
     uint32_t window = 0;
     uint64_t offset = 0, length = 0;
     uint64_t failed_token = 0, failed_bytes = 0;
@@ -396,12 +398,15 @@ void test_get_reply_not_accepted() {
     srdsim::ReceiveAgent::Hooks hooks{};
     hooks.device_copy = requester_host_copy;
     hooks.get_response_landed = [](uint64_t token, uint64_t bytes, int peer, void* user) {
+        ++ static_cast<AcceptReport*>(user)->landed_calls;
         requester_get_landed(token, bytes, peer, &static_cast<AcceptReport*>(user)->landed);
     };
     // Token 1 is refused, as a forged or stale reply would be; token 2 is accepted.
-    hooks.get_response_accept = [](uint64_t token, uint32_t window, uint64_t offset, uint64_t length, int, void* user) {
+    hooks.get_response_accept = [](uint64_t token, uint32_t window, uint64_t offset, uint64_t length, int peer, void* user) {
         auto* r = static_cast<AcceptReport*>(user);
+        r->peer_seen = peer;
         if (token == 1) { ++ r->asked; r->window = window; r->offset = offset; r->length = length; }
+        else ++ r->asked_good;
         return token != 1;
     };
     hooks.get_failed = [](uint64_t token, uint64_t bytes, int, void* user) {
@@ -437,9 +442,28 @@ void test_get_reply_not_accepted() {
            ctx("the refused frame was reported through get_failed with its length (calls %d, token %llu, bytes %llu)",
                rep.failed_calls, (unsigned long long)rep.failed_token, (unsigned long long)rep.failed_bytes));
     expect(landed == good.size(), "the accepted frame after it landed");
-    expect(rep.landed.landed_token == 2 and rep.landed.landed_bytes == good.size(),
-           "get_response_landed fired for the accepted frame only");
-    expect(agent.errors() >= 1, "the refused frame was counted");
+    expect(rep.asked_good == 1, "the accept hook was asked about the accepted frame too");
+    expect(rep.peer_seen == -1, ctx("the accept hook was given the link's peer rank (-1 for a link with none), got %d", rep.peer_seen));
+    expect(rep.landed_calls == 1 and rep.landed.landed_token == 2 and rep.landed.landed_bytes == good.size(),
+           ctx("get_response_landed fired once, for the accepted frame (%d call(s))", rep.landed_calls));
+    expect(agent.errors() == 1, ctx("the refused frame was counted once (%llu)", (unsigned long long)agent.errors()));
+}
+
+// G6: the next-frame rule, clause by clause, for a get of 100 bytes into [1000, 1100) of window 3.
+void test_reply_frame_is_next() {
+    const auto next = [](uint64_t remaining, uint32_t window, uint64_t offset, uint64_t length) {
+        return srdsim::reply_frame_is_next(/*dst_window=*/3, /*dst_off=*/1000, /*size=*/100, remaining, window, offset, length);
+    };
+    expect(next(100, 3, 1000, 40), "G6 the first frame, at the start of the range");
+    expect(next(60, 3, 1040, 60), "G6 the frame after 40 bytes, reaching the end exactly");
+    expect(not next(100, 4, 1000, 40), "G6 another window");
+    expect(not next(100, 3, 999, 40), "G6 before the range");
+    expect(not next(60, 3, 1000, 40), "G6 the first frame again: a duplicate would leave a hole at the end");
+    expect(not next(60, 3, 1060, 40), "G6 a frame that skips ahead");
+    expect(not next(60, 3, 1040, 61), "G6 a frame past the end of the range");
+    expect(not next(0, 3, 1100, 1), "G6 any frame once every byte is accounted for");
+    expect(not next(101, 3, 999, 1), "G6 more remaining than the get's size");
+    expect(next(0, 3, 1100, 0), "G6 an empty frame at the end changes nothing");
 }
 
 }  // namespace
@@ -449,6 +473,7 @@ int main() {
     test_get_out_of_range();
     test_get_unknown_window();
     test_get_reply_not_accepted();
+    test_reply_frame_is_next();
     std::printf(g_failures == 0 ? "PASS: %d checks, 0 failures\n" : "FAIL: %d checks, %d failures\n",
                g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
