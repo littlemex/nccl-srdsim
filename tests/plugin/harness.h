@@ -60,6 +60,7 @@ struct Shared {
     pid_t pid[kMaxRanks];             // so a rank can stop and continue a peer
     std::atomic<int> flag[16]{};
     std::atomic<int64_t> t0_ns{0};    // a time one rank publishes for another (steady_clock, shared by processes)
+    std::atomic<int> expected_dead[kMaxRanks]{};   // a case kills this rank on purpose; its SIGKILL is not a failure
 };
 
 inline Shared* g_shared = nullptr;
@@ -157,7 +158,8 @@ inline void set_flag(int i) { g_shared->flag[i].store(1, std::memory_order_relea
 // plugin writes at init naming its mode and seed is kept, so a case can check that its settings took.
 inline std::mutex g_log_mu;
 inline std::string g_init_line;
-inline std::string g_poison_line;     // the plugin reported a CUDA error or stopped asynchronous delivery
+inline std::string g_poison_line;
+inline std::string g_unclean_line;    // the plugin logged a link that closed without a shutdown     // the plugin reported a CUDA error or stopped asynchronous delivery
 inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int, const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -166,6 +168,7 @@ inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int,
     va_end(ap);
     std::lock_guard<std::mutex> g(g_log_mu);
     if (std::strncmp(buf, "SRD simulator: ", 15) == 0) g_init_line = buf;
+    if (g_unclean_line.empty() and std::strstr(buf, "closed without a shutdown")) g_unclean_line = buf;
     if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped") or
                                    std::strstr(buf, "outbox room still reserved")))
         g_poison_line = buf;
@@ -391,8 +394,9 @@ struct Rank {
         barrier("registered");
     }
 
-    // NCCL's order: the progress thread stops, then the context, the windows and the connection go.
-    void teardown() {
+    // NCCL's order: the progress thread stops, then the context, the windows and the connection go. Without
+    // `meet_peers` (a case whose peer is gone), the same calls and checks without the barriers.
+    void teardown(bool meet_peers = true) {
         // Every operation a case issued must have retired: one that never completes is a failure of the
         // case, not something for teardown to absorb.
         resume();
@@ -401,7 +405,7 @@ struct Rank {
             for (const Ticket& t : tickets_) if (t.retired.load(std::memory_order_acquire) == 0) return false;
             return true;
         }, "unretired");
-        barrier("before teardown");
+        if (meet_peers) barrier("before teardown");
         stop_.store(true);
         proxy_.join();
         check(rma.destroyContext(rmaCtx), "destroyContext");
@@ -413,12 +417,17 @@ struct Rank {
 
     // The case passed on this rank. Under AddressSanitizer, what teardown left allocated is a finding.
     [[noreturn]] void pass() {
-        std::string poison;
+        std::string poison, unclean;
         {
             std::lock_guard<std::mutex> g(g_log_mu);
             poison = g_poison_line;
+            unclean = g_unclean_line;
         }
         if (not poison.empty()) fail("assert", "delivery-poisoned", "%s", poison.c_str());
+        // A link that closed without a shutdown is a failure unless the case killed a rank on purpose.
+        bool death_expected = false;
+        for (int r = 0; r < kMaxRanks; ++ r) death_expected = death_expected or g_shared->expected_dead[r].load();
+        if (not unclean.empty() and not death_expected) fail("assert", "unclean-close", "%s", unclean.c_str());
 #if defined(HARNESS_ASAN)
         if (__lsan_do_recoverable_leak_check() != 0) fail("leak", "teardown", "%s", "see the report above");
 #endif

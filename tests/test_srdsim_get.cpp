@@ -129,7 +129,7 @@ bool requester_host_copy(void* dst, const void* src, size_t bytes, void* /*user*
     return true;
 }
 
-void requester_get_landed(uint64_t owner_token, uint64_t bytes, void* user) {
+void requester_get_landed(uint64_t owner_token, uint64_t bytes, int /*peer_rank*/, void* user) {
     auto* r = static_cast<RequesterReport*>(user);
     r->landed_called = true;
     r->landed_token = owner_token;
