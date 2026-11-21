@@ -133,9 +133,12 @@ std::string env_str(const char* name, const char* dflt) {
 size_t env_size(const char* name, size_t dflt) {
     const char* v = std::getenv(name);
     if (not v) return dflt;
+    // Digits only: strtoull would accept a leading sign or space, and "-1" would wrap to a very large count.
+    if (*v < '0' or *v > '9') return dflt;
     char* end = nullptr;
+    errno = 0;
     const unsigned long long parsed = std::strtoull(v, &end, 10);
-    return (end and *end == '\0' and parsed > 0) ? static_cast<size_t>(parsed) : dflt;
+    return (errno == 0 and end and *end == '\0' and parsed > 0) ? static_cast<size_t>(parsed) : dflt;
 }
 
 // Two switches make the plugin usable as a pure observer, to see whether an application's puts reach it
