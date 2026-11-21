@@ -4085,6 +4085,13 @@ void send_parked_of(CollComm* cc, const RmaCtx* owner) {
     for (const auto& p : failures) note_send_failure(p.owner, p.u);
 }
 
+// The most units one `rmaProgress` call releases from each plugin context. NCCL's proxy tests every outstanding request
+// between progress calls, so the number released per call sets how many such sweeps an operation waits for: at 8, a
+// burst of 4096 small puts with signals ran at 14,000 puts per second on an 8-core host, and at 64 at 560,000. Larger
+// values gave no more (`bench_plugin`); with no limit, 1 MiB puts ran at a quarter of the rate, a whole outbox of chunks
+// being queued in one call before any of it was sent.
+constexpr size_t kReleasePerCall = 64;
+
 ncclResult_t srdsim_progress(void* rmaCtx) {
     Mark mark("rmaProgress");
     auto* ctx = static_cast<RmaCtx*>(rmaCtx);
@@ -4183,7 +4190,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             room.links = c->coll ? &c->coll->links : nullptr;
             room.cc = c->coll;
             room.held = &held;
-            c->sched->progress(/*budget=*/8, &batch, &room);
+            c->sched->progress(kReleasePerCall, &batch, &room);
         }
         owners.resize(batch.size(), c);
         c->progress_calls.fetch_add(1, std::memory_order_relaxed);
