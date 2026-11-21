@@ -458,6 +458,8 @@ public:
         // that returns before its bytes land settles them here, so nothing it issued is still pending
         // while the link is quiet -- which is when an application tears its memory down.
         void (*idle)(void* user) = nullptr;
+        // An impairment: wait this long before applying each frame, as a slow receiver would.
+        uint32_t apply_interval_us = 0;
     };
 
     ReceiveAgent(WindowTable* windows, Hooks hooks) : windows_(windows), hooks_(hooks) {}
@@ -682,6 +684,8 @@ private:
             // wire but parked in the device copy looks, from the applied counters alone, identical to a
             // reader that has stopped receiving.
             last_header_at_.store(mono_ms(), std::memory_order_relaxed);
+            if (hooks_.apply_interval_us != 0)
+                std::this_thread::sleep_for(std::chrono::microseconds(hooks_.apply_interval_us));
             if (h.kind == static_cast<uint32_t>(WireKind::Shutdown))
                 break;
             if (h.kind == static_cast<uint32_t>(WireKind::GetError)) {

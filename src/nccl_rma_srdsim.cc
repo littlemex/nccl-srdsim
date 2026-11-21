@@ -64,6 +64,7 @@
 #include "nccl_rma.h"
 
 #include "srdsim_async.h"
+#include "srdsim_impair.h"
 #include "srdsim_mapping.h"
 #include "srdsim_schedule.h"
 #include "srdsim_transport.h"
@@ -491,6 +492,13 @@ struct CollComm {
     // Before `agent`, so that on destruction the receive threads, which hand it replies, stop first.
     GetResponder responder{&links};                    // sends the replies to gets this rank serves
     std::unique_ptr<srdsim::ReceiveAgent> agent;       // applies what peers send us
+    // Deliberate impairments from the environment (`srdsim_impair.h`): a delay before each released unit, bursts,
+    // a lag on signals, and a frozen link to one peer after a number of units. Touched by the progress thread.
+    srdsim::Impairments impair;
+    std::unique_ptr<srdsim::Delayer> delayer;          // only when a delay, a burst or a signal lag is set
+    uint64_t units_to_freeze_peer = 0;                 // units released to `impair.freeze_peer` so far
+    std::chrono::steady_clock::time_point frozen_until{};
+    bool freeze_done = false;
     // How many peers actually connected to this rank's agent. A mesh that came up half-formed is
     // indistinguishable from a peer that never sent anything unless this is counted.
     int accepted_connections = 0;
@@ -3055,6 +3063,11 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     // so which of its contexts) a request arrived on.
     hooks.user = cc;
     hooks.log = [](const char* m) { logf("agent: %s", m); };
+    cc->impair = srdsim::impairments_from_env();
+    hooks.apply_interval_us = cc->impair.apply_interval_us;
+    if (cc->impair.delay_us_max != 0 or cc->impair.burst != 0 or cc->impair.signal_lag_us != 0)
+        cc->delayer = std::make_unique<srdsim::Delayer>(cc->impair, scheduler_options().seed);
+    if (const std::string d = cc->impair.describe(); not d.empty()) lifecycle("impairments: %s", d.c_str());
     cc->agent = std::make_unique<srdsim::ReceiveAgent>(&cc->windows, hooks);
     cc->agent->set_max_frame_bytes(max_frame_bytes());
     if (log_ops()) {
@@ -3127,6 +3140,10 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             g_stall_monitor.unwatch(cc);
             delete cc;
             return ncclSystemError;
+        }
+        if (cc->impair.send_buffer_bytes != 0) {
+            const int bytes = static_cast<int>(cc->impair.send_buffer_bytes);
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
         }
         cc->links.set(peer, fd);
     }
@@ -3852,6 +3869,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         bool fits(int peer, size_t bytes) override {
             if (links == nullptr) return true;
             if (full.count(peer)) return false;
+            if (cc and frozen(peer)) { full.insert(peer); return false; }
             const size_t need = sizeof(srdsim::WireHeader) + bytes;
             size_t& have = granted[peer];
             if (have >= need) return true;
@@ -3863,7 +3881,20 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             have = need;
             return true;
         }
+        // The frozen-link impairment: after `freeze_after_units` units to `freeze_peer`, nothing more is released to
+        // it for `freeze_ms`, as if the link had stalled.
+        bool frozen(int peer) const {
+            if (cc->impair.freeze_peer != peer or cc->impair.freeze_ms == 0 or cc->freeze_done) return false;
+            if (cc->frozen_until == std::chrono::steady_clock::time_point{}) return false;
+            if (std::chrono::steady_clock::now() < cc->frozen_until) return true;
+            cc->freeze_done = true;
+            return false;
+        }
         void take(int peer, size_t bytes) override {
+            if (cc and cc->impair.freeze_peer == peer and cc->impair.freeze_ms != 0 and not cc->freeze_done and
+                cc->frozen_until == std::chrono::steady_clock::time_point{} and
+                ++ cc->units_to_freeze_peer >= cc->impair.freeze_after_units)
+                cc->frozen_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(cc->impair.freeze_ms);
             size_t& have = granted[peer];
             have -= std::min(have, sizeof(srdsim::WireHeader) + bytes);
         }
@@ -3912,6 +3943,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         srdsim::DeferDrain defer;
         for (size_t i = 0; i < batch.size(); ++ i) {
             const auto& u = batch[i];
+            if (CollComm* oc = owners[i]->coll; oc and oc->delayer)
+                oc->delayer->before_unit(u.kind == srdsim::Unit::Kind::Signal);
             if (send_unit(owners[i]->coll, u, owners[i]))
                 continue;
             release_reservation(owners[i]->coll, u);
