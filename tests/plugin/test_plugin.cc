@@ -713,7 +713,7 @@ void impaired_signal_lag(Rank& R) {
 
 // The owner of a get dies (SIGKILL) while the get is outstanding: the link from it closes without a Shutdown, and
 // the get fails instead of waiting for ever; a flush after it completes and queryLastError reports the failure.
-// The requester then ends without teardown, since its peer is gone.
+// The requester then tears down without meeting its peer, which is gone.
 void get_owner_dies(Rank& R) {
     constexpr size_t n = (64 << 10) + 13, remote = (256 << 10) + 7, local = (1200 << 10) + kGuard;
     barrier("ready");
@@ -726,7 +726,8 @@ void get_owner_dies(Rank& R) {
         R.wait_retired(g, "get-from-dead-owner");
         R.wait_retired(R.issue(flush(0, 1)), "flush");
         if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
-        finish("ok");   // no teardown: the peer it would meet at the barrier is gone
+        R.teardown_alone();   // the peer it would meet at the barrier is gone
+        R.pass();
     } else {
         wait_flag(0, "until-killed");
     }

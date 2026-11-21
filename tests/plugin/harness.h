@@ -392,6 +392,17 @@ struct Rank {
         barrier("registered");
     }
 
+    // Teardown without meeting the peers, for a case whose peer is gone: the same calls, no barrier.
+    void teardown_alone() {
+        stop_.store(true);
+        proxy_.join();
+        check(rma.destroyContext(rmaCtx), "destroyContext");
+        check(rma.deregMrSym(coll, signalMh), "deregMrSym signals");
+        check(rma.deregMrSym(coll, dataMh), "deregMrSym data");
+        check(rma.closeColl(coll), "closeColl");
+        check(rma.finalize(ctx), "finalize");
+    }
+
     // NCCL's order: the progress thread stops, then the context, the windows and the connection go.
     void teardown() {
         // Every operation a case issued must have retired: one that never completes is a failure of the
