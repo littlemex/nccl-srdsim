@@ -99,7 +99,8 @@ if(SRDSIM_BUILD_PLUGIN)
       target_link_libraries(test_plugin PRIVATE CUDA::cuda_driver)
     endif()
     target_compile_options(test_plugin PRIVATE ${SRDSIM_WARNINGS})
-    # Throughput and latency through the same op table; prints numbers and asserts nothing, so it is not a test.
+    # Throughput and latency through the same op table. It judges no number, so it is not a test; it fails only on wrong
+    # data, a failed rank or a hang.
     add_executable(bench_plugin tests/plugin/bench_plugin.cc)
     target_include_directories(bench_plugin SYSTEM PRIVATE ${NCCL_PLUGIN_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
     target_include_directories(bench_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -11,12 +11,14 @@
 //
 // Throughput: rank 0 issues `ops` puts back to back, each with a signal on the same word of rank 1, and the burst
 // lasts until rank 1 sees the last signal. The burst runs kBursts times; ops/s, MB/s and burst_ms are from the median
-// one. Rank 1 then checks that every destination holds the bytes put.
+// one. As each burst ends, rank 1 checks that every destination slot holds the bytes put and clears it; a slot is
+// written by every put that cycles to it, so the check sees the last of them. Puts of up to 1 KiB each have a slot.
 // Latency: one put with a signal at a time, from rank 0 issuing it to rank 1 seeing the signal, over kRounds rounds
 // after kWarmup discarded ones; p50_us and p99_us are nearest-rank percentiles.
 //
 // Nothing judges the numbers, which depend on the host. A case fails, and the program exits 1, when its data is wrong,
-// when a rank fails, or when a case does not finish within kCaseWallMs.
+// when a rank fails, or when a case does not finish within kCaseWallMs. The harness's own waits keep their bounds: a
+// barrier gives up after 10 s, and teardown after 3 s without progress.
 #include "harness.h"
 
 #include <signal.h>
@@ -28,6 +30,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <new>
@@ -39,12 +42,13 @@ namespace {
 using namespace harness;
 
 constexpr size_t kSrc = 4096;                 // the source, in rank 0's window
-constexpr size_t kDst = 4u << 20;             // destinations cycle through [kDst, kDst + kMaxBytes) of rank 1's window
-constexpr size_t kMaxBytes = 2u << 20;
+constexpr size_t kDst = 4u << 20;             // destinations cycle through [kDst, kDst + kSlotBytes) of rank 1's window
+constexpr size_t kSlotBytes = kDataBytes - kDst;
+constexpr size_t kMaxBytes = 2u << 20;        // the largest put
 constexpr int kBursts = 5;
 constexpr int kWarmup = 20, kRounds = 1000;
 constexpr int kWaitMs = 60000;                // any single wait inside a case
-constexpr int kCaseWallMs = 180000;           // the driver kills a case that runs longer
+constexpr int kCaseWallMs = 120000;           // the driver kills a case that runs longer
 
 struct Result { double mbps = 0, ops_per_s = 0, burst_ms = 0; double p50 = 0, p99 = 0; size_t ops = 0; };
 
@@ -55,7 +59,7 @@ Op put_signal_op(size_t size, size_t i, size_t word) {
     o.peer = 1;
     o.srcOff = kSrc;
     o.size = size;
-    o.dstOff = kDst + (i % std::max<size_t>(1, kMaxBytes / size)) * size;
+    o.dstOff = kDst + (i % (kSlotBytes / size)) * size;
     o.word = word;
     o.keep_source = true;   // the same source is read by every put
     return o;
@@ -103,14 +107,17 @@ void run(Rank& R, size_t size, Result* out) {
             const uint64_t want = uint64_t(b + 1) * ops;
             spin_until([&] { return R.signal_word(0) == want; }, "burst");
             burst_s.push_back(double(now_ns() - g_shared->t0_ns.load()) / 1e9);
+            // Checked as the signals say the burst landed, and cleared before the next one can start (it waits on the
+            // barrier below), so each burst is checked on its own.
+            const size_t slots = std::min(ops, kSlotBytes / size);
+            for (size_t k = 0; k < slots; ++ k)
+                if (size_t bad = mismatches(R.at(kDst + k * size), size, 0, 1))
+                    fail("assert", "data", "burst %d slot %zu: %zu of %zu bytes differ", b, k, bad, size);
+            std::memset(R.at(kDst), 0, slots * size);
         }
         barrier("burst done");
     }
     if (g_rank == 1) {
-        const size_t slots = std::min(ops, std::max<size_t>(1, kMaxBytes / size));
-        for (size_t k = 0; k < slots; ++ k)
-            if (size_t bad = mismatches(R.at(kDst + k * size), size, 0, 1))
-                fail("assert", "data", "slot %zu: %zu of %zu bytes differ", k, bad, size);
         std::sort(burst_s.begin(), burst_s.end());
         const double s = burst_s[burst_s.size() / 2];
         out->ops = ops;
@@ -163,8 +170,9 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, usage, argv[0]); return 2; }
     const std::string plugin = argv[1];
     char* end = nullptr;
+    errno = 0;
     const long table = std::strtol(argv[2], &end, 10);
-    if (end == argv[2] or *end != '\0' or table <= 0) {
+    if (errno != 0 or end == argv[2] or *end != '\0' or table <= 0 or table > INT_MAX) {
         std::fprintf(stderr, "TABLE_VERSION '%s' is not a positive number\n", argv[2]);
         return 2;
     }
@@ -226,10 +234,14 @@ int main(int argc, char** argv) {
                 for (int r = 0; r < 2; ++ r)
                     if (not exited[r] and waitpid(pids[r], &st[r], WNOHANG) == pids[r]) exited[r] = true;
                 if (not killed and Clock::now() - start > std::chrono::milliseconds(kCaseWallMs)) {
-                    std::printf("BENCH mode=%s size=%zu failed: killed after %d s, rank 0 in %s, rank 1 in %s\n",
-                                mode.c_str(), size, kCaseWallMs / 1000, shared->where[0], shared->where[1]);
                     for (int r = 0; r < 2; ++ r) if (not exited[r]) kill(pids[r], SIGKILL);
                     killed = true;
+                    std::string who;
+                    for (int r = 0; r < 2; ++ r)
+                        who += ", rank " + std::to_string(r) + (exited[r] ? ": " + describe(st[r], shared->status[r])
+                                                                         : " was waiting in " + std::string(shared->where[r]));
+                    std::printf("BENCH mode=%s size=%zu failed: killed after %d s%s\n", mode.c_str(), size,
+                                kCaseWallMs / 1000, who.c_str());
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
