@@ -656,16 +656,20 @@ private:
         std::atomic<bool> finished{false};
         // Operations (by the id their frames carry) a placement of which this link refused or could not write. Their
         // signal would announce bytes that never landed (I1), so it is withheld; other operations are unaffected.
-        // Touched only by this connection's receive thread, which applies its frames in order.
+        // Touched only by this connection's receive thread, which applies its frames in order. A link is one
+        // connection for its lifetime; it is not re-established.
         std::unordered_set<uint64_t> dropped_ops;
     };
+    static constexpr size_t kMaxDroppedOps = 65536;
 
     void loop(int fd, Conn* conn) {
         std::vector<char> buf;
+        bool link_failed = false;   // set when this link cannot keep its promises; the loop then closes it
         // The exit condition is the peer closing or sending Shutdown. `stopping_` is only an abort
         // for teardown, checked after each message rather than before the first one, so that a
         // caller which tears down immediately after serving still processes what already arrived.
         for (;;) {
+            if (link_failed) break;
             WireHeader h{};
             if (hooks_.idle != nullptr) {
                 pollfd pfd{fd, POLLIN, 0};
@@ -694,7 +698,15 @@ private:
             // Called on every path that drops a frame or fails to write it: a placement's operation loses its signal,
             // and a get request or reply is answered or failed.
             const auto on_dropped = [&] {
-                if (h.kind == static_cast<uint32_t>(WireKind::Placement)) conn->dropped_ops.insert(h.op_id);
+                if (h.kind == static_cast<uint32_t>(WireKind::Placement)) {
+                    // Bounded: a peer that keeps sending bad placements would otherwise grow this without end.
+                    if (conn->dropped_ops.size() >= kMaxDroppedOps and not conn->dropped_ops.count(h.op_id)) {
+                        say("too many operations lost a placement on this link; closing it");
+                        link_failed = true;
+                    } else {
+                        conn->dropped_ops.insert(h.op_id);
+                    }
+                }
                 if (h.kind == static_cast<uint32_t>(WireKind::GetRequest) and hooks_.get_refused)
                     hooks_.get_refused(h.requester_rank, h.op_id, hook_user);
                 if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_failed)
@@ -879,7 +891,7 @@ private:
                     refused_.fetch_add(1, std::memory_order_relaxed);
                     continue;                            // a signal carries no payload to drain
                 }
-                if (conn->dropped_ops.count(h.op_id)) {
+                if (conn->dropped_ops.erase(h.op_id)) {   // an operation has one signal frame
                     char m[160];
                     std::snprintf(m, sizeof(m), "operation %llu lost a placement on this link, so its signal is not "
                                   "applied: it would announce bytes that never landed",

@@ -71,6 +71,7 @@ struct Report {
     uint64_t applied_signals = 0;
     uint64_t refused_frames = 0;
     uint64_t failed_writes = 0;
+    uint64_t withheld_signals = 0;
     uint64_t errors = 0;
     unsigned char window[kWindowBytes] = {0};
     uint64_t connections = 0;
@@ -122,6 +123,7 @@ bool refuse_device_add(void*, uint64_t, void*) { return false; }
     r.applied_signals = agent.applied_signals();
     r.refused_frames = agent.refused_frames();
     r.failed_writes = agent.failed_writes();
+    r.withheld_signals = agent.withheld_signals();
     r.errors = agent.errors();
     r.connections = agent.connections();
     std::memcpy(r.window, data.data(), std::min(kWindowBytes, data.size()));
@@ -347,10 +349,12 @@ void test_peer_fault_and_local_failure_are_separate() {
         expect(false, "A8 the session opened");
         return;
     }
-    // The signal first: once a placement on a link has failed, no later signal on it is applied at all.
+    // A signal, then a placement of the same operation (the frames here all carry id 0) whose write fails, then the
+    // operation's signal again: the second is withheld, because its operation lost a placement, and counted apart.
     const auto sig = signal_header(1, 0, 1);
     expect(srdsim::write_all(s.fd, &sig, sizeof(sig)), "A8 a well-formed signal was sent");
     expect(send_good_placement(s.fd, 32), "A8 a well-formed placement was sent");
+    expect(srdsim::write_all(s.fd, &sig, sizeof(sig)), "A8 the operation's signal was sent again");
     // And one frame the peer did get wrong, so both counters have something to hold.
     const auto bad = placement_header(99, 0, 0);
     expect(srdsim::write_all(s.fd, &bad, sizeof(bad)), "A8 an unknown-window frame was sent");
@@ -369,6 +373,9 @@ void test_peer_fault_and_local_failure_are_separate() {
            ctx("A8 a failed write is not an application (placements=%llu signals=%llu)",
                (unsigned long long)res.report.applied_placements,
                (unsigned long long)res.report.applied_signals));
+    expect(res.report.withheld_signals == 1,
+           ctx("A8 the signal after its operation's failed placement was withheld (withheld=%llu, want 1)",
+               (unsigned long long)res.report.withheld_signals));
     expect(res.report.errors == res.report.refused_frames + res.report.failed_writes,
            "A8 errors() still equals the sum, so existing callers keep their meaning");
 }
