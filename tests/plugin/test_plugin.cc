@@ -612,6 +612,25 @@ void large_chunk(Rank& R) {
     }
 }
 
+// A get the owner cannot serve (it reads past the owner's window) fails instead of hanging: the get retires, a
+// flush after it completes, queryLastError reports it, and a valid get after it completes with its data.
+void get_refused_by_owner(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, remote = (512 << 10) + 7, local = (1200 << 10) + kGuard;
+    if (g_rank == 1) fill(R.at(remote), n, 1, 23);
+    barrier("owner filled");
+    if (g_rank == 0) {
+        R.wait_retired(R.issue(get(0, 1, kDataBytes - 100, n, local)), "refused-get");
+        R.wait_retired(R.issue(flush(0, 1)), "flush-after-refused");
+        if (not R.last_error()) fail("assert", "refusal-reported", "%s", "queryLastError reports nothing");
+        R.wait_retired(R.issue(get(0, 1, remote, n, local)), "get");
+        if (size_t bad = mismatches(R.at(local), n, 1, 23)) fail("assert", "data", "%zu bytes", bad);
+        expect_guards(R, local, n);
+        set_flag(0);
+    } else {
+        wait_flag(0, "requester-done");
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -652,6 +671,7 @@ const std::vector<Scenario>& scenarios() {
         {"device_put_signal", device_put_signal, 2, {"srd", "reverse-ops"}, {1, 2}, "SRDSIM_DELIVERY_CONTEXT=primary"},
 #endif
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
+        {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;

@@ -85,7 +85,9 @@ inline uint64_t age_ms(uint64_t mark, uint64_t never = ~uint64_t(0)) {
 // a get. GetResponse is the owner's reply, carrying the fetched bytes; it lands exactly like a
 // Placement (same code path in the receive loop) and differs only in that landing it also has to
 // release whichever `iflush` is waiting on it.
-enum class WireKind : uint32_t { Placement = 1, Signal = 2, Shutdown = 3, GetRequest = 4, GetResponse = 5 };
+// GetError: the owner could not serve a get request (header only; `op_id` is the request's token). The requester
+// fails that get instead of waiting for a reply that will not come.
+enum class WireKind : uint32_t { Placement = 1, Signal = 2, Shutdown = 3, GetRequest = 4, GetResponse = 5, GetError = 6 };
 
 // Fixed-size header, little-endian host order. Both ends are the same build on the same
 // architecture, so no byte-order conversion: this is a test transport between peers that were
@@ -147,6 +149,13 @@ using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length
 // `iflush` request that is fencing on the get. A reply of several chunks lands as several frames.
 // `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
 using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
+// On the owner: a get request it received could not be served (unknown window, out of range, deregistered, or
+// the get-request hook failed). `requester_rank` and `owner_token` are what a GetError back needs.
+using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, void* user);
+// On the requester: a get will not complete with its data. `bytes` is the length of a reply frame that could not be
+// written here, or kAllBytes for a GetError, which stands for every byte of the reply still to come.
+constexpr uint64_t kAllBytes = ~uint64_t{0};
+using GetFailedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
 
 class WindowTable {
 public:
@@ -440,6 +449,8 @@ public:
         DeviceAddFn  device_add = nullptr;
         GetRequestFn get_request = nullptr;
         GetResponseLandedFn get_response_landed = nullptr;
+        GetRefusedFn get_refused = nullptr;
+        GetFailedFn  get_failed = nullptr;
         void*        user = nullptr;
         void (*log)(const char*) = nullptr;
         // Called when the next frame has not arrived yet and the agent is about to wait for it. A writer
@@ -663,6 +674,23 @@ private:
             last_header_at_.store(mono_ms(), std::memory_order_relaxed);
             if (h.kind == static_cast<uint32_t>(WireKind::Shutdown))
                 break;
+            if (h.kind == static_cast<uint32_t>(WireKind::GetError)) {
+                // Header only, and it names no window of this rank's: the get it fails is found by its token.
+                if (h.length != 0) {
+                    say("a get error claims a payload; the stream is desynchronised, closing the link");
+                    refused_.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                if (hooks_.get_failed) hooks_.get_failed(h.op_id, kAllBytes, conn->user ? conn->user : hooks_.user);
+                continue;
+            }
+            void* const hook_user = conn->user ? conn->user : hooks_.user;
+            const auto refuse_get = [&] {
+                if (h.kind == static_cast<uint32_t>(WireKind::GetRequest) and hooks_.get_refused)
+                    hooks_.get_refused(h.requester_rank, h.op_id, hook_user);
+                if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_failed)
+                    hooks_.get_failed(h.op_id, h.length, hook_user);
+            };
 
             Window w{};
             const bool known_window = windows_->get(h.window_id, &w);
@@ -704,6 +732,7 @@ private:
                               h.window_id, windows_->size());
                 say(m);
                 refused_.fetch_add(1, std::memory_order_relaxed);
+                refuse_get();
                 if (not drain_payload()) break;
                 continue;
             }
@@ -720,6 +749,7 @@ private:
                                   (unsigned long long)h.length, w.bytes);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
+                    refuse_get();
                     if (not drain_payload()) break;
                     continue;
                 }
@@ -733,6 +763,7 @@ private:
                                   "being received; dropping", h.window_id);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
+                    refuse_get();
                     continue;
                 }
                 w = lease.window();
@@ -766,7 +797,7 @@ private:
                           if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and
                               hooks_.get_response_landed)
                               hooks_.get_response_landed(h.op_id, h.length, conn->user ? conn->user : hooks_.user); }
-                else    failed_writes_.fetch_add(1, std::memory_order_relaxed);
+                else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); refuse_get(); }
             } else if (h.kind == static_cast<uint32_t>(WireKind::GetRequest)) {
                 // No payload on the wire -- the requester does not have the bytes yet -- so the fetch
                 // size travels in `value`, not `length`; `length` stays "bytes trailing this frame" for
@@ -790,6 +821,7 @@ private:
                                   (unsigned long long)fetch_bytes, w.bytes);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
+                    refuse_get();
                     continue;
                 }
                 // Re-read under a lease, same as a Placement does, because the window this rank is
@@ -801,6 +833,7 @@ private:
                                   "was being served; dropping", h.window_id);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
+                    refuse_get();
                     continue;
                 }
                 w = lease.window();
@@ -812,7 +845,7 @@ private:
                 if (not hooks_.get_request)
                     say("a get request arrived but no get-request hook was installed");
                 if (ok) get_requests_.fetch_add(1, std::memory_order_release);
-                else    failed_writes_.fetch_add(1, std::memory_order_relaxed);
+                else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); refuse_get(); }
             } else if (h.kind == static_cast<uint32_t>(WireKind::Signal)) {
                 // A signal frame has no payload, so a non-zero length means the stream is no longer
                 // framed and the next header would be read out of somebody's data. There is no
@@ -1133,6 +1166,14 @@ public:
         h.value = value;
         h.op_id = op_id;
         return send_framed(peer, h, nullptr, 0, reserved);
+    }
+
+    // Tells `peer` that the get request carrying `owner_token` will not be answered.
+    bool send_get_error(int peer, uint64_t owner_token) {
+        WireHeader h{};
+        h.kind = static_cast<uint32_t>(WireKind::GetError);
+        h.op_id = owner_token;
+        return send_framed(peer, h, nullptr, 0);
     }
 
     // No payload: the requester does not have the bytes yet. `src_window_id`/`src_offset`/`fetch_bytes`
