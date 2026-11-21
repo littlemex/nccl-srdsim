@@ -24,8 +24,10 @@ for t in gin_signal_order gin_get; do
         -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
 done
 ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" "${1:-3}" "${2:-5}"
-# Gets are not reordered by the delivery modes (a reply is not scheduled), so two modes and the control suffice. The
-# control checks before the flush, with the receiver applying at most one frame every 200 us so that a get is still
-# landing when it looks.
-MODES="srd inorder control:srd" CONTROL_ENV="SRDSIM_APPLY_INTERVAL_US=200" \
+# Gets are not reordered by the delivery modes (a reply is not scheduled), so two modes suffice, with each delivery: the
+# default queued copies, with the control that counts a get as landed before its copy (it must fail every seed), and
+# copies waited for one by one. Each run must have taken the delivery it names.
+MODES="srd inorder control:srd" CONTROL_ENV="SRDSIM_GET_LANDED_EARLY=1" REQUIRE_LOG="CUDA copies, queued (asynchronous)" \
+    ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_get" "${1:-3}" "${2:-5}"
+SRDSIM_ASYNC_DELIVERY=0 MODES="srd inorder" REQUIRE_LOG="CUDA copies, each waited for" \
     ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_get" "${1:-3}" "${2:-5}"

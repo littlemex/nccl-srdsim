@@ -7,10 +7,10 @@
 // the round, the owning rank, the block and its own index, so a chunk that lands in the wrong place, from the wrong
 // owner or from the wrong round is caught.
 //
-// The flush is what makes a get's data visible (NCCL's GIN proxy tracks issued and visible gets per peer and
-// completes the flush only when the plugin reports every get landed). With GIN_GET_CHECK_EARLY=1 the receiver checks
-// without waiting for the flush: a negative control that some run should fail, which shows that the check reads what
-// the flush guards and that the gets went through the plugin.
+// The flush is what makes a get's data visible: NCCL's GIN proxy tracks issued and visible gets per peer and completes
+// the flush only when the plugin reports every get landed. Run with SRDSIM_GET_LANDED_EARLY=1, the plugin counts a get
+// as landed before its data is in device memory, and every run should then find wrong elements: the negative control
+// that shows the check catches a flush that completes too early.
 //
 // Usage: gin_get RANK NRANKS ID_FILE [ROUNDS] [ELEMENTS] [CHUNKS] [TIMEOUT_S]
 //   Every rank is a separate process. Rank 0 writes NCCL's unique id to ID_FILE; the others wait for it.
@@ -21,6 +21,8 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include "common.h"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -30,10 +32,6 @@
 #include <string>
 #include <thread>
 
-#define CHECK_CUDA(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
-    std::fprintf(stderr, "%s: %s\n", #x, cudaGetErrorString(e_)); std::exit(2); } } while (0)
-#define CHECK_NCCL(x) do { ncclResult_t r_ = (x); if (r_ != ncclSuccess) { \
-    std::fprintf(stderr, "%s: %s\n", #x, ncclGetErrorString(r_)); std::exit(2); } } while (0)
 
 struct Result {
     unsigned long long wrong;     // elements that did not hold the expected value
@@ -53,7 +51,7 @@ __device__ __forceinline__ uint32_t expected(int round, int owner, int block, si
 
 // Signals are read with absolute values, so the test assumes they start at zero: one launch per communicator.
 __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, size_t elts, int nchunks,
-                     size_t chunk_elts, long long timeout_cycles, bool check_early, Result* result) {
+                     size_t chunk_elts, long long timeout_cycles, Result* result) {
     const ncclTeam world = ncclTeamWorld(comm);
     const int blocks = gridDim.x, b = blockIdx.x;
     const int down = (world.rank + 1) % world.nRanks;
@@ -71,6 +69,7 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
     // reader downstream) is blocks + b.
     const ncclGinSignal_t ready_sig = ncclGinSignal_t(b), free_sig = ncclGinSignal_t(blocks) + b;
     ncclGin gin(comm, 0);
+    ncclCoopCta cta;
 
     __shared__ unsigned long long wrong;
     __shared__ int stop;     // 0 to go on, else the kind of wait that expired
@@ -106,15 +105,13 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
             gin.get(world, up, base.window, src_off + first * sizeof(uint32_t), base.window,
                     dst_off + first * sizeof(uint32_t), n * sizeof(uint32_t));
         }
-        __syncthreads();
-        if (not check_early) {
-            if (threadIdx.x == 0) {
-                ncclGinRequest_t req;
-                gin.flushAsync(world, uint32_t(up), &req);
-                if (gin.wait(req, ncclCoopThread{}, ncclGin_None{}, cuda::memory_order_acquire, uint64_t(timeout_cycles)) !=
-                    ncclSuccess)
-                    stop = 2;
-            }
+        // The flush of this block's gets to the owner, by the whole block, so every thread's reads are ordered after it.
+        {
+            ncclGinRequest_t req;
+            gin.flushAsync(world, uint32_t(up), &req, cta);
+            if (gin.wait(req, cta, ncclGin_None{}, cuda::memory_order_acquire, uint64_t(timeout_cycles)) != ncclSuccess and
+                threadIdx.x == 0)
+                stop = 2;
             __syncthreads();
             if (stopped()) break;
         }
@@ -130,18 +127,6 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
         }
         if (bad) atomicAdd(&wrong, bad);
         __syncthreads();
-        if (check_early) {
-            // Still wait for the gets before the destination is reused and before the owner refills the source.
-            if (threadIdx.x == 0) {
-                ncclGinRequest_t req;
-                gin.flushAsync(world, uint32_t(up), &req);
-                if (gin.wait(req, ncclCoopThread{}, ncclGin_None{}, cuda::memory_order_acquire, uint64_t(timeout_cycles)) !=
-                    ncclSuccess)
-                    stop = 2;
-            }
-            __syncthreads();
-            if (stopped()) break;
-        }
         if (threadIdx.x == 0) gin.signal(world, up, ncclGin_WeakSignalInc{free_sig});
     }
     // The reader downstream may still be getting this block's last source: the rank stays, with its memory registered,
@@ -159,33 +144,6 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
     }
 }
 
-static void exchange_id(int rank, const std::string& path, ncclUniqueId* id) {
-    if (rank == 0) {
-        CHECK_NCCL(ncclGetUniqueId(id));
-        const std::string tmp = path + ".tmp";
-        std::ofstream(tmp, std::ios::binary).write(reinterpret_cast<const char*>(id), sizeof(*id));
-        std::rename(tmp.c_str(), path.c_str());
-        return;
-    }
-    for (int waited = 0; waited < 600; ++waited) {
-        std::ifstream in(path, std::ios::binary);
-        if (in.read(reinterpret_cast<char*>(id), sizeof(*id))) return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    std::fprintf(stderr, "no unique id in %s after 60 s\n", path.c_str());
-    std::exit(2);
-}
-
-static long integer(const char* s, const char* what, long least) {
-    char* end = nullptr;
-    const long v = std::strtol(s, &end, 10);
-    if (end == s || *end != '\0' || v < least) {
-        std::fprintf(stderr, "%s must be an integer of at least %ld, got '%s'\n", what, least, s);
-        std::exit(2);
-    }
-    return v;
-}
-
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s RANK NRANKS ID_FILE [ROUNDS] [ELEMENTS] [CHUNKS] [TIMEOUT_S]\n", argv[0]);
@@ -199,12 +157,12 @@ int main(int argc, char** argv) {
     const size_t elts = argc > 5 ? size_t(integer(argv[5], "ELEMENTS", 1)) : size_t(1) << 16;
     const int chunks = argc > 6 ? int(integer(argv[6], "CHUNKS", 1)) : 16;
     const int timeout_s = argc > 7 ? int(integer(argv[7], "TIMEOUT_S", 1)) : 60;
-    const char* early = std::getenv("GIN_GET_CHECK_EARLY");
-    const bool check_early = early != nullptr && std::strcmp(early, "1") == 0;
     const int blocks = 4, threads = 256;
     const size_t chunk_elts = (elts + chunks - 1) / chunks;
     const int nchunks = int((elts + chunk_elts - 1) / chunk_elts);
 
+    // A done-file left by an earlier run with the same id file would let the teardown barrier below pass early.
+    std::remove((std::string(argv[3]) + ".done." + std::to_string(rank)).c_str());
     ncclUniqueId id;
     exchange_id(rank, argv[3], &id);
     CHECK_CUDA(cudaSetDevice(0));
@@ -231,7 +189,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&result, sizeof(*result)));
     const Result init = {0, 0, -1, 0, 0, 0, 0, 0, 0, 0};
     CHECK_CUDA(cudaMemcpy(result, &init, sizeof(init), cudaMemcpyHostToDevice));
-    ring<<<blocks, threads>>>(dcomm, hbuf, rounds, elts, nchunks, chunk_elts, timeout_cycles, check_early, result);
+    ring<<<blocks, threads>>>(dcomm, hbuf, rounds, elts, nchunks, chunk_elts, timeout_cycles, result);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     Result host;
@@ -244,8 +202,8 @@ int main(int argc, char** argv) {
                     "%llu wrong elements in what was checked before that\n", rank, host.timeouts, timeout_s,
                     host.first_timeout_round, rounds, kinds[host.first_timeout_kind], host.wrong);
     else
-        std::printf("rank %d: %d rounds, %zu elements in %d gets per block%s, %llu wrong elements\n", rank, rounds, elts,
-                    nchunks, check_early ? " checked before the flush" : "", host.wrong);
+        std::printf("rank %d: %d rounds, %zu elements in %d gets per block, %llu wrong elements\n", rank, rounds, elts,
+                    nchunks, host.wrong);
     if (host.first_wrong) {
         // What the wrong element held: the previous round's value, another block's or owner's, or something else.
         std::printf("rank %d: the first wrong element was round %d block %d index %llu: held %#x, expected %#x",

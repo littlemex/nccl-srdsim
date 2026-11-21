@@ -3,8 +3,8 @@
 #
 # Run a GPU test (tests/gpu/gin_signal_order.cu or tests/gpu/gin_get.cu) under the plugin on one GPU host, in each
 # delivery mode, and check the outcome each mode must produce: no wrong element in a mode that keeps the test's
-# guarantee, and at least one seed with a wrong element in a negative control. The controls are violate-i1, and any
-# mode written control:MODE, which runs MODE with GIN_GET_CHECK_EARLY=1 and the variables in CONTROL_ENV.
+# guarantee, at least one seed with a wrong element under violate-i1, and a wrong element in every seed of a mode
+# written control:MODE, which runs MODE with the variables in CONTROL_ENV set (a negative control the caller names).
 #
 # Each rank is a separate process on GPU 0 with its own NCCL_HOSTID, so NCCL treats every rank as a
 # separate node rather than reach the others through peer memory. An MPS server runs
@@ -13,13 +13,17 @@
 # Usage: tests/gpu/run.sh PLUGIN_SO TEST_BINARY [NRANKS] [SEEDS]
 # Environment: RUN_TIMEOUT (seconds per run, default 180), WAIT_TIMEOUT (seconds a kernel waits for one
 # signal before it gives up, default 60), ROUNDS (per seed, default 50), MODES (space-separated, default
-# every mode), CONTROL_ENV (NAME=VALUE pairs for the control: runs).
+# every mode), CONTROL_ENV (NAME=VALUE pairs for the control: runs), REQUIRE_LOG (text every rank's log must contain,
+# such as the delivery the plugin reports, so a run that did not take the path it was meant to test fails).
 set -uo pipefail
 PLUGIN="${1:?plugin .so}"; TEST="${2:?test binary}"; NRANKS="${3:-3}"; SEEDS="${4:-5}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-180}"; WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"; ROUNDS="${ROUNDS:-50}"
 MODES="${MODES:-srd inorder peer-seq reverse-ops signal-last defer-one violate-i1}"
 CONTROL_ENV="${CONTROL_ENV:-}"
-is_control() { [ "$1" = violate-i1 ] || [ "${1#control:}" != "$1" ]; }
+REQUIRE_LOG="${REQUIRE_LOG:-}"
+for kv in $CONTROL_ENV; do
+    case "$kv" in *=*) ;; *) echo "CONTROL_ENV holds '$kv', which is not NAME=VALUE" >&2; exit 2 ;; esac
+done
 for f in "$PLUGIN" "$TEST"; do [ -e "$f" ] || { echo "no such file: $f" >&2; exit 2; }; done
 command -v nvidia-cuda-mps-control >/dev/null || { echo "nvidia-cuda-mps-control is not on PATH" >&2; exit 2; }
 # Matched on the full command line: process names are cut at 15 characters, so -x on the name never matches.
@@ -63,15 +67,17 @@ GRACE=10
 run_once() {
     local mode=$1 seed=$2 id="$WORK/id-$1-$2" r p q alive rc stop_at=-1
     local -a status extra=()
-    # control:MODE runs MODE with the test's own negative control switched on.
+    # control:MODE runs MODE with the caller's negative control switched on. Split on spaces without globbing.
     if [ "${mode#control:}" != "$mode" ]; then
-        extra=(GIN_GET_CHECK_EARLY=1)
+        local IFS=' '
+        set -f
         # shellcheck disable=SC2206
-        extra+=($CONTROL_ENV)
+        extra=($CONTROL_ENV)
+        set +f
     fi
     RANK_PIDS=(); FIRST_STATUS=""
     for r in $(seq 0 $((NRANKS - 1))); do
-        env "${extra[@]}" NCCL_RMA_PLUGIN="$PLUGIN" NCCL_GIN_TYPE=2 NCCL_HOSTID="srdsim-rank-$r" \
+        env ${extra[@]+"${extra[@]}"} NCCL_RMA_PLUGIN="$PLUGIN" NCCL_GIN_TYPE=2 NCCL_HOSTID="srdsim-rank-$r" \
         SRDSIM_MODE="${mode#control:}" SRDSIM_SEED="$seed" \
             timeout -k 10 "$RUN_TIMEOUT" "$TEST" "$r" "$NRANKS" "$id" "$ROUNDS" 65536 16 "$WAIT_TIMEOUT" \
             > "$WORK/log-$mode-$seed-$r" 2>&1 &
@@ -114,14 +120,24 @@ for mode in $MODES; do
         restart=0; [ "$worst" -ge 3 ] && restart=1
         for rc in $RANK_STATUS; do [ "$rc" -ge 124 ] && restart=1; done
         if [ "$restart" -eq 1 ]; then mps_stop; mps_start; fi
-        if is_control "$mode"; then
+        if [ -n "$REQUIRE_LOG" ]; then
+            for f in "$WORK"/log-"$mode"-"$seed"-*; do
+                grep -qF -- "$REQUIRE_LOG" "$f" || { echo "    $f does not contain '$REQUIRE_LOG'"; bad_seeds+=("$seed"); break; }
+            done
+        fi
+        if [ "${mode#control:}" != "$mode" ]; then
+            [ "$worst" -eq 1 ] || bad_seeds+=("$seed")
+        elif [ "$mode" = violate-i1 ]; then
             [ "$worst" -le 1 ] || bad_seeds+=("$seed")
             [ "$worst" -eq 1 ] && found=1
         else
             [ "$worst" -eq 0 ] || bad_seeds+=("$seed")
         fi
     done
-    if is_control "$mode"; then
+    if [ "${mode#control:}" != "$mode" ]; then
+        expect="every seed finds a wrong element"
+        if [ "${#bad_seeds[@]}" -eq 0 ]; then verdict=PASS; else verdict=FAIL; fi
+    elif [ "$mode" = violate-i1 ]; then
         expect="some seed finds a wrong element"
         if [ "${#bad_seeds[@]}" -eq 0 ] && [ "$found" -eq 1 ]; then verdict=PASS; else verdict=FAIL; fi
     else

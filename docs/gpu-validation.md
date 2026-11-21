@@ -100,8 +100,9 @@ The test program's exit status, which the verdict is built from:
 | `RUN_TIMEOUT` | `180` | Seconds a rank may run before `timeout` stops it. Also ends a put or signal call that never returns |
 | `WAIT_TIMEOUT` | `60` | Seconds the kernel waits for one signal or one flush before the rank gives up with status 3 |
 | `ROUNDS` | `50` | Rounds per seed |
-| `MODES` | all seven | The delivery modes to run, separated by spaces; `control:MODE` runs MODE as the get test's control |
+| `MODES` | all seven | The delivery modes to run, separated by spaces; `control:MODE` runs MODE as a negative control, which must find wrong elements in every seed |
 | `CONTROL_ENV` | none | `NAME=VALUE` pairs, separated by spaces, set in the `control:` runs |
+| `REQUIRE_LOG` | none | Text every rank's log must contain, such as the delivery the plugin reports |
 
 ## The get test: tests/gpu/gin_get.cu
 
@@ -109,12 +110,12 @@ A *get* reads a range of a peer's GPU memory into the reader's own GPU memory. T
 
 `tests/gpu/gin_get.cu` passes data around the same ring with gets. In every round, block `b` of each rank fills its source slot, raises a weak signal on the next rank to say the slot is ready, and that rank reads the slot with one get per chunk. The reader waits for a flush of its gets, checks every element, and signals back that the source may be refilled. Each element encodes the round, the owning rank, the block and its index, as in the signal test, and a wrong element is reported with the round, rank and block whose value it held. No rank tears down until every rank's kernel has ended, so a last signal is not lost to a peer's teardown.
 
-Gets are not reordered by the delivery modes (a reply is not scheduled), so the recipe runs the test in `srd` and `inorder`, and once more as a control written `control:srd`: `run.sh` then sets `GIN_GET_CHECK_EARLY=1`, and the test checks before the flush, with `SRDSIM_APPLY_INTERVAL_US=200` (from `CONTROL_ENV`) so that a get is still landing when it looks. The control must find wrong elements in some seed, which shows the check reads what the flush guards and the gets went through the plugin.
+Gets are not reordered by the delivery modes (a reply is not scheduled), so the recipe runs the test in `srd` and `inorder`, once with the default delivery (copies into device memory queued) and once with `SRDSIM_ASYNC_DELIVERY=0` (each copy waited for). With the default delivery it also runs a control written `control:srd`: `run.sh` then sets `CONTROL_ENV`, here `SRDSIM_GET_LANDED_EARLY=1`, which makes the plugin count a get as landed before its data has been copied into device memory, so the flush can complete early. The control must find wrong elements in every seed, which shows the check catches a flush that completes too early. `REQUIRE_LOG` makes every rank's log name the delivery the run was meant to use, so a run that took another path (GDRCopy, say) fails.
 
 | Run | Required outcome |
 |---|---|
-| `srd`, `inorder` | No wrong element, in every seed |
-| `control:srd` | Wrong elements in at least one seed, and no crash or timeout in any |
+| `srd`, `inorder`, with either delivery | No wrong element, in every seed |
+| `control:srd` | Wrong elements in every seed, and no crash or timeout in any |
 
 ## Requirements
 
