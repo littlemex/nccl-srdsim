@@ -1421,6 +1421,8 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
                                uint32_t dest_window, uint64_t dest_off, uint32_t requester_rank,
                                uint64_t owner_token, void* user);
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
+bool srdsim_handle_get_response_accept(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
+                                       int peer_rank, void* user);
 void srdsim_handle_get_refused(uint32_t requester_rank, uint64_t owner_token, void* user);
 void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
 void srdsim_handle_link_lost(int peer_rank, bool clean, void* user);
@@ -2690,6 +2692,9 @@ struct GetRecord {
     bool    failed = false;   // will not complete with its data; see `srdsim_handle_get_failed`
     CollComm* coll = nullptr;   // the communicator the get was sent on
     int peer = -1;              // the rank the get was sent to
+    uint32_t dst_window = 0;    // where the reply may land: [dst_off, dst_off + size) of this window
+    uint64_t dst_off = 0;
+    uint64_t size = 0;
 };
 // A leaf lock: nothing else is taken while it is held.
 struct OutstandingGets {
@@ -3105,6 +3110,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
 #endif
     hooks.get_request = srdsim_handle_get_request;
     hooks.get_response_landed = srdsim_handle_get_response_landed;
+    hooks.get_response_accept = srdsim_handle_get_response_accept;
     hooks.get_refused = srdsim_handle_get_refused;
     hooks.get_failed = srdsim_handle_get_failed;
     hooks.link_lost = srdsim_handle_link_lost;
@@ -3629,7 +3635,8 @@ ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* re
     {
         std::lock_guard<std::mutex> g(g_gets.mu);
         id = g_gets.next ++;
-        GetRecord rec{ctx, static_cast<int64_t>(size), false, ctx->coll, static_cast<int>(rank)};
+        GetRecord rec{ctx, static_cast<int64_t>(size), false, ctx->coll, static_cast<int>(rank),
+                      op.get_dst_window, localOff, static_cast<uint64_t>(size)};
         g_gets.gets.emplace(id, rec);
     }
     op.get_response_token = id;
@@ -3689,6 +3696,20 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
 // sent to, on the communicator it was sent on.
 bool from_owner(const GetRecord& rec, int peer_rank, const void* cc) {
     return peer_rank == rec.peer and cc == rec.coll;
+}
+
+// Whether a frame of a get's reply may be written: it names a get outstanding with the rank it came from, on this
+// communicator, still has that many bytes to come, and lands inside the range the get asked for. Anything else would
+// write memory no get of this rank's asked to fill.
+bool srdsim_handle_get_response_accept(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
+                                       int peer_rank, void* user) {
+    std::lock_guard<std::mutex> g(g_gets.mu);
+    auto it = g_gets.gets.find(owner_token);
+    if (it == g_gets.gets.end()) return false;
+    const GetRecord& rec = it->second;
+    return from_owner(rec, peer_rank, user) and rec.ctx != nullptr and window == rec.dst_window and
+           offset >= rec.dst_off and length <= rec.size and offset - rec.dst_off <= rec.size - length and
+           static_cast<int64_t>(length) <= rec.remaining;
 }
 
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user) {

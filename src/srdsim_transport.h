@@ -150,6 +150,11 @@ using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length
 // `iflush` request that is fencing on the get. A reply of several chunks lands as several frames.
 // `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
 using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
+// Called before a frame of a GetResponse is written, with where it would land: whether it belongs to a get this rank
+// has outstanding with `peer_rank` and falls inside the range that get asked for. A frame it refuses is not written
+// and is handled as any frame that could not be written (`GetFailedFn`). Unset, every in-range frame is written.
+using GetResponseAcceptFn = bool (*)(uint64_t owner_token, uint32_t window, uint64_t offset, uint64_t length,
+                                     int peer_rank, void* user);
 // On the owner: a get request it received could not be served (unknown window, out of range, deregistered, or
 // the get-request hook failed). `requester_rank` and `owner_token` are what a GetError back needs.
 using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, void* user);
@@ -454,6 +459,7 @@ public:
         DeviceAddFn  device_add = nullptr;
         GetRequestFn get_request = nullptr;
         GetResponseLandedFn get_response_landed = nullptr;
+        GetResponseAcceptFn get_response_accept = nullptr;
         GetRefusedFn get_refused = nullptr;
         GetFailedFn  get_failed = nullptr;
         LinkLostFn   link_lost = nullptr;
@@ -793,6 +799,18 @@ private:
                     continue;
                 }
                 if (not drain_payload()) break;
+                if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_response_accept and
+                    not hooks_.get_response_accept(h.op_id, h.window_id, h.offset, h.length, conn->peer_rank, hook_user)) {
+                    char m[200];
+                    std::snprintf(m, sizeof(m), "a get reply for get %llu does not match a get outstanding with this "
+                                  "peer (window %u offset %llu length %llu); not writing it",
+                                  (unsigned long long)h.op_id, h.window_id, (unsigned long long)h.offset,
+                                  (unsigned long long)h.length);
+                    say(m);
+                    refused_.fetch_add(1, std::memory_order_relaxed);
+                    on_dropped();
+                    continue;
+                }
                 // Held from here until the write has been issued. Taken after the payload is off the
                 // socket, and the window re-read under it, because it may have been retired meanwhile.
                 WindowTable::Lease lease(windows_, h.window_id);

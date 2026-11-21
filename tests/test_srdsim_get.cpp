@@ -15,6 +15,8 @@
 //       the GetRequest carried -- unchanged, since the owner never interprets it.
 //   G3  a GetRequest naming a range past the end of its window is refused and the stream survives.
 //   G4  a GetRequest naming a window the receiver never registered is refused and the stream survives.
+//   G5  a GetResponse frame the `get_response_accept` hook refuses is not written, is reported through
+//       `get_failed` with its length, does not fire `get_response_landed`, and the stream survives it.
 
 #include <cstdarg>
 #include <cstdio>
@@ -373,12 +375,80 @@ void test_get_unknown_window() {
     expect(agent.errors() >= 1, "the unknown window was counted as refused");
 }
 
+// ---------------------------------------------------------------------------
+// G5: a reply frame the requester does not accept never reaches memory.
+// ---------------------------------------------------------------------------
+struct AcceptReport {
+    int asked = 0;
+    uint32_t window = 0;
+    uint64_t offset = 0, length = 0;
+    uint64_t failed_token = 0, failed_bytes = 0;
+    int failed_calls = 0;
+    RequesterReport landed;
+};
+
+void test_get_reply_not_accepted() {
+    std::vector<char> storage(1024, 0);
+    srdsim::WindowTable windows;
+    windows.add({storage.data(), storage.size(), false});
+
+    AcceptReport rep;
+    srdsim::ReceiveAgent::Hooks hooks{};
+    hooks.device_copy = requester_host_copy;
+    hooks.get_response_landed = [](uint64_t token, uint64_t bytes, int peer, void* user) {
+        requester_get_landed(token, bytes, peer, &static_cast<AcceptReport*>(user)->landed);
+    };
+    // Token 1 is refused, as a forged or stale reply would be; token 2 is accepted.
+    hooks.get_response_accept = [](uint64_t token, uint32_t window, uint64_t offset, uint64_t length, int, void* user) {
+        auto* r = static_cast<AcceptReport*>(user);
+        if (token == 1) { ++ r->asked; r->window = window; r->offset = offset; r->length = length; }
+        return token != 1;
+    };
+    hooks.get_failed = [](uint64_t token, uint64_t bytes, int, void* user) {
+        auto* r = static_cast<AcceptReport*>(user);
+        ++ r->failed_calls; r->failed_token = token; r->failed_bytes = bytes;
+    };
+    hooks.user = &rep;
+    hooks.log = [](const char*) {};
+    srdsim::ReceiveAgent agent(&windows, hooks);
+
+    int sv[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { expect(false, "socketpair"); return; }
+    srdsim::set_nodelay(sv[0]);
+    srdsim::set_nodelay(sv[1]);
+    agent.serve(sv[1]);
+
+    std::vector<char> bad(128, char(0xAA)), good(64, char(0x55));
+    srdsim::SendLinks links;
+    links.set(0, sv[0]);
+    links.send_placement(0, /*window=*/0, /*offset=*/256, bad.data(), bad.size(), /*token=*/1, srdsim::WireKind::GetResponse);
+    links.send_placement(0, /*window=*/0, /*offset=*/512, good.data(), good.size(), /*token=*/2, srdsim::WireKind::GetResponse);
+    links.shutdown_all();
+    agent.join();
+
+    size_t written = 0, landed = 0;
+    for (size_t i = 0; i < bad.size(); ++ i) written += storage[256 + i] != 0;
+    for (size_t i = 0; i < good.size(); ++ i) landed += storage[512 + i] == char(0x55);
+    expect(rep.asked == 1 and rep.window == 0 and rep.offset == 256 and rep.length == bad.size(),
+           ctx("the accept hook saw the refused frame's window, offset and length (asked %d, offset %llu, length %llu)",
+               rep.asked, (unsigned long long)rep.offset, (unsigned long long)rep.length));
+    expect(written == 0, ctx("the refused frame wrote nothing (%zu byte(s) changed)", written));
+    expect(rep.failed_calls == 1 and rep.failed_token == 1 and rep.failed_bytes == bad.size(),
+           ctx("the refused frame was reported through get_failed with its length (calls %d, token %llu, bytes %llu)",
+               rep.failed_calls, (unsigned long long)rep.failed_token, (unsigned long long)rep.failed_bytes));
+    expect(landed == good.size(), "the accepted frame after it landed");
+    expect(rep.landed.landed_token == 2 and rep.landed.landed_bytes == good.size(),
+           "get_response_landed fired for the accepted frame only");
+    expect(agent.errors() >= 1, "the refused frame was counted");
+}
+
 }  // namespace
 
 int main() {
     test_get_round_trip();
     test_get_out_of_range();
     test_get_unknown_window();
+    test_get_reply_not_accepted();
     std::printf(g_failures == 0 ? "PASS: %d checks, 0 failures\n" : "FAIL: %d checks, %d failures\n",
                g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
