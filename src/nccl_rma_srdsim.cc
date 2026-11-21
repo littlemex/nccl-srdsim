@@ -2655,10 +2655,10 @@ CrossOverlaps& g_cross = *new CrossOverlaps;
 // so a late reply for them is dropped and `test` finishes them without reporting their data as landed.
 struct GetRecord {
     RmaCtx* ctx;         // null once the context was destroyed with the reply outstanding
-    CollComm* coll = nullptr;   // the communicator the get was sent on
-    int peer = -1;              // the rank the get was sent to
     int64_t remaining;   // bytes of the reply that have not landed
     bool    failed = false;   // will not complete with its data; see `srdsim_handle_get_failed`
+    CollComm* coll = nullptr;   // the communicator the get was sent on
+    int peer = -1;              // the rank the get was sent to
 };
 // A leaf lock: nothing else is taken while it is held.
 struct OutstandingGets {
@@ -3568,9 +3568,7 @@ ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* re
     {
         std::lock_guard<std::mutex> g(g_gets.mu);
         id = g_gets.next ++;
-        GetRecord rec{ctx, static_cast<int64_t>(size)};
-        rec.coll = ctx->coll;
-        rec.peer = static_cast<int>(rank);
+        GetRecord rec{ctx, static_cast<int64_t>(size), false, ctx->coll, static_cast<int>(rank)};
         g_gets.gets.emplace(id, rec);
     }
     op.get_response_token = id;
