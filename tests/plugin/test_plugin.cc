@@ -680,7 +680,7 @@ void impaired_put(Rank& R, long min_ms, bool measure_on_target) {
         if (measure_on_target and ms < min_ms) fail("assert", "impairment-not-applied", "the signal took %ld ms, want >= %ld", ms, min_ms);
     }
 }
-void impaired_delay(Rank& R) { impaired_put(R, 16 * 2, false); }          // 2 ms before each of 17 units
+void impaired_delay(Rank& R) { impaired_put(R, 45, false); }              // each unit held 50 ms after its release
 void impaired_freeze(Rank& R) { impaired_put(R, 400, false); }            // frozen for 500 ms after 4 units
 void impaired_apply_interval(Rank& R) { impaired_put(R, 16 * 5, true); }  // 5 ms before each applied frame
 void impaired_signal_lag(Rank& R) { impaired_put(R, 150, false); }        // 200 ms before the signal
@@ -730,7 +730,7 @@ const std::vector<Scenario>& scenarios() {
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},
         {"overflowing_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=99999999999999999999"},
-        {"impaired_delay", impaired_delay, 2, {"srd"}, {1}, "SRDSIM_DELAY_US_MIN=2000 SRDSIM_DELAY_US_MAX=2000 SRDSIM_CHUNK_BYTES=8192"},
+        {"impaired_delay", impaired_delay, 2, {"srd"}, {1}, "SRDSIM_DELAY_US_MIN=50000 SRDSIM_DELAY_US_MAX=50000 SRDSIM_CHUNK_BYTES=8192"},
         {"impaired_freeze", impaired_freeze, 2, {"srd"}, {1},
          "SRDSIM_FREEZE_PEER=1 SRDSIM_FREEZE_AFTER_UNITS=4 SRDSIM_FREEZE_MS=500 SRDSIM_CHUNK_BYTES=8192"},
         {"impaired_apply_interval", impaired_apply_interval, 2, {"srd"}, {1}, "SRDSIM_APPLY_INTERVAL_US=5000 SRDSIM_CHUNK_BYTES=8192"},
