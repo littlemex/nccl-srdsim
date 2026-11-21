@@ -105,6 +105,7 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
             gin.get(world, up, base.window, src_off + first * sizeof(uint32_t), base.window,
                     dst_off + first * sizeof(uint32_t), n * sizeof(uint32_t));
         }
+        __syncthreads();   // every thread's gets are issued before the flush is
         // The flush of this block's gets to the owner, by the whole block, so every thread's reads are ordered after it.
         {
             ncclGinRequest_t req;

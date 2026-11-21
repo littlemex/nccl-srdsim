@@ -28,6 +28,7 @@ done
 # default queued copies, with the control that counts a get as landed before its copy (it must fail every seed), and
 # copies waited for one by one. Each run must have taken the delivery it names.
 MODES="srd inorder control:srd" CONTROL_ENV="SRDSIM_GET_LANDED_EARLY=1" REQUIRE_LOG="CUDA copies, queued (asynchronous)" \
+    CONTROL_EXPECT="the first wrong element was round ([0-9]+) block ([0-9]+) .*\(round [0-9]+'s value of rank [0-9]+ block \2\)" \
     ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_get" "${1:-3}" "${2:-5}"
 SRDSIM_ASYNC_DELIVERY=0 MODES="srd inorder" REQUIRE_LOG="CUDA copies, each waited for" \
     ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_get" "${1:-3}" "${2:-5}"

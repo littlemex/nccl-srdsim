@@ -67,7 +67,7 @@ These change what is reported, or check something at a cost; they leave the data
 
 ## Settings that change the data
 
-Each can change the bytes a run delivers, on purpose. Read once; the two negative controls are read when the library is loaded.
+Each can change the bytes a run delivers, on purpose. Read once; the three negative controls (`SRDSIM_CORRUPT_EVERY`, `SRDSIM_DROP_EVERY` and `SRDSIM_GET_LANDED_EARLY`) are read when the library is loaded.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
@@ -75,7 +75,7 @@ Each can change the bytes a run delivers, on purpose. Read once; the two negativ
 | `SRDSIM_SNAPSHOT_SOURCE` | flag | off | Copies the whole device source of each put when it is submitted, sends that copy, and counts every unit whose source changed before release. Does nothing in a build without CUDA. Needs GDRCopy or synchronous delivery (`SRDSIM_ASYNC_DELIVERY=0` or `SRDSIM_PAGEABLE_STAGING`); otherwise it is ignored, with one line on stderr. Slow |
 | `SRDSIM_CORRUPT_EVERY` | count | off | Negative control: flips one byte in the middle of every Nth device placement this rank applies. Does nothing on host windows or in a build without CUDA. Announced on stderr when active |
 | `SRDSIM_DROP_EVERY` | count | off | Negative control: reports every Nth device placement as applied without writing it. Same scope and announcement |
-| `SRDSIM_GET_LANDED_EARLY` | flag | off | Negative control: counts a get as landed when its last frame's copy into device memory has been queued, not when it has completed, so a flush can complete before the data is there. Does nothing in a build without CUDA or with copies waited for. Announced on stderr when active |
+| `SRDSIM_GET_LANDED_EARLY` | flag | off | Negative control: counts a get as landed when its last frame's copy into device memory has been queued, not when it has completed, so a flush can complete before the data is there. Does nothing in a build without CUDA, on host windows, with GDRCopy, or with copies waited for. Announced on stderr when active |
 
 ## Impairments
 

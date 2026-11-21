@@ -14,13 +14,15 @@
 # Environment: RUN_TIMEOUT (seconds per run, default 180), WAIT_TIMEOUT (seconds a kernel waits for one
 # signal before it gives up, default 60), ROUNDS (per seed, default 50), MODES (space-separated, default
 # every mode), CONTROL_ENV (NAME=VALUE pairs for the control: runs), REQUIRE_LOG (text every rank's log must contain,
-# such as the delivery the plugin reports, so a run that did not take the path it was meant to test fails).
+# such as the delivery the plugin reports, so a run that did not take the path it was meant to test fails),
+# CONTROL_EXPECT (an extended regular expression some rank's log must match in every seed of a control: run).
 set -uo pipefail
 PLUGIN="${1:?plugin .so}"; TEST="${2:?test binary}"; NRANKS="${3:-3}"; SEEDS="${4:-5}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-180}"; WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"; ROUNDS="${ROUNDS:-50}"
 MODES="${MODES:-srd inorder peer-seq reverse-ops signal-last defer-one violate-i1}"
 CONTROL_ENV="${CONTROL_ENV:-}"
 REQUIRE_LOG="${REQUIRE_LOG:-}"
+case " $MODES " in *" control:"*) [ -n "$CONTROL_ENV" ] || { echo "a control: mode needs CONTROL_ENV" >&2; exit 2; } ;; esac
 for kv in $CONTROL_ENV; do
     case "$kv" in *=*) ;; *) echo "CONTROL_ENV holds '$kv', which is not NAME=VALUE" >&2; exit 2 ;; esac
 done
@@ -120,7 +122,12 @@ for mode in $MODES; do
             done
         fi
         if [ "${mode#control:}" != "$mode" ]; then
+            # Wrong for the reason the control is about: a stale value, the previous round's of the same owner and block,
+            # where the test can name it, not any corruption.
             [ "$worst" -eq 1 ] || bad_seeds+=("$seed")
+            if [ -n "${CONTROL_EXPECT:-}" ] && ! grep -qhE -- "$CONTROL_EXPECT" "$WORK"/log-"$mode"-"$seed"-*; then
+                echo "    seed $seed: no rank logged a wrong element matching '$CONTROL_EXPECT'"; bad_seeds+=("$seed")
+            fi
         elif [ "$mode" = violate-i1 ]; then
             [ "$worst" -le 1 ] || bad_seeds+=("$seed")
             [ "$worst" -eq 1 ] && found=1
