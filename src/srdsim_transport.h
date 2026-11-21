@@ -684,8 +684,6 @@ private:
             // wire but parked in the device copy looks, from the applied counters alone, identical to a
             // reader that has stopped receiving.
             last_header_at_.store(mono_ms(), std::memory_order_relaxed);
-            if (hooks_.apply_interval_us != 0)
-                std::this_thread::sleep_for(std::chrono::microseconds(hooks_.apply_interval_us));
             if (h.kind == static_cast<uint32_t>(WireKind::Shutdown))
                 break;
             if (h.kind == static_cast<uint32_t>(WireKind::GetError)) {
@@ -698,6 +696,11 @@ private:
                 if (hooks_.get_failed) hooks_.get_failed(h.op_id, kAllBytes, conn->user ? conn->user : hooks_.user);
                 continue;
             }
+            // The slow-receiver impairment: a wait before each frame that writes this rank's memory.
+            if (hooks_.apply_interval_us != 0 and
+                (h.kind == static_cast<uint32_t>(WireKind::Placement) or h.kind == static_cast<uint32_t>(WireKind::Signal) or
+                 h.kind == static_cast<uint32_t>(WireKind::GetResponse)) and not stopping_.load())
+                std::this_thread::sleep_for(std::chrono::microseconds(hooks_.apply_interval_us));
             void* const hook_user = conn->user ? conn->user : hooks_.user;
             // Called on every path that drops a frame or fails to write it: a placement's operation loses its signal,
             // and a get request or reply is answered or failed.

@@ -666,13 +666,15 @@ void impaired_put(Rank& R, long min_ms, bool measure_on_target) {
         fill(R.at(src), n, 0, 25);
         barrier("ready");
         const auto t0 = Clock::now();
+        g_shared->t0_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count());
         R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 12, false)), "put-with-signal");
         const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count());
         if (not measure_on_target and ms < min_ms) fail("assert", "impairment-not-applied", "the put took %ld ms, want >= %ld", ms, min_ms);
     } else {
         barrier("ready");
-        const auto t0 = Clock::now();
         R.wait_peer([&] { return R.signal_word(12) == 1; }, "signal-word");
+        // From when the sender issued the put, not from this rank's own wake-up.
+        const auto t0 = Clock::time_point(std::chrono::nanoseconds(g_shared->t0_ns.load()));
         const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count());
         if (size_t bad = mismatches(R.at(dst), n, 0, 25)) fail("assert", "data", "%zu bytes", bad);
         if (measure_on_target and ms < min_ms) fail("assert", "impairment-not-applied", "the signal took %ld ms, want >= %ld", ms, min_ms);
@@ -728,11 +730,11 @@ const std::vector<Scenario>& scenarios() {
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},
         {"overflowing_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=99999999999999999999"},
-        {"impaired_delay", impaired_delay, 2, {"srd"}, {1}, "SRDSIM_DELAY_US_MIN=2000 SRDSIM_DELAY_US_MAX=2000"},
+        {"impaired_delay", impaired_delay, 2, {"srd"}, {1}, "SRDSIM_DELAY_US_MIN=2000 SRDSIM_DELAY_US_MAX=2000 SRDSIM_CHUNK_BYTES=8192"},
         {"impaired_freeze", impaired_freeze, 2, {"srd"}, {1},
-         "SRDSIM_FREEZE_PEER=1 SRDSIM_FREEZE_AFTER_UNITS=4 SRDSIM_FREEZE_MS=500"},
-        {"impaired_apply_interval", impaired_apply_interval, 2, {"srd"}, {1}, "SRDSIM_APPLY_INTERVAL_US=5000"},
-        {"impaired_signal_lag", impaired_signal_lag, 2, {"srd"}, {1}, "SRDSIM_SIGNAL_LAG_US=200000"},
+         "SRDSIM_FREEZE_PEER=1 SRDSIM_FREEZE_AFTER_UNITS=4 SRDSIM_FREEZE_MS=500 SRDSIM_CHUNK_BYTES=8192"},
+        {"impaired_apply_interval", impaired_apply_interval, 2, {"srd"}, {1}, "SRDSIM_APPLY_INTERVAL_US=5000 SRDSIM_CHUNK_BYTES=8192"},
+        {"impaired_signal_lag", impaired_signal_lag, 2, {"srd"}, {1}, "SRDSIM_SIGNAL_LAG_US=200000 SRDSIM_CHUNK_BYTES=8192"},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
