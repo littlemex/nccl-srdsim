@@ -124,8 +124,9 @@ void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 
 // Contexts are independent: a strong signal on one context is not ordered behind an earlier put on another
 // context to the same peer. Under reverse-ops the newest operation goes first, so the signal arrives while part
-// of the put on the other context is still missing. The sender holds after two proxy iterations (at most eight
-// chunks each, of the put's 128, with SRDSIM_RELEASE_BYTES_PER_CALL at 64 KiB) until the target has looked.
+// of the put on the other context is still missing. The sender holds after two proxy iterations (at most seven
+// chunks each, of the put's 128, with SRDSIM_RELEASE_BYTES_PER_CALL at 64 KiB and each chunk charged its header)
+// until the target has looked.
 // Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
 // can be dropped without a failure.
 void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
@@ -612,13 +613,20 @@ void large_chunk(Rank& R) {
     }
 }
 
-// With a payload limit per progress call smaller than any unit (SRDSIM_RELEASE_BYTES_PER_CALL=1), each call still
-// releases its first unit, so a put of several chunks and its signal still arrive, one unit per call, with the data.
+// With a payload limit per progress call smaller than any unit (SRDSIM_RELEASE_BYTES_PER_CALL=1), each call releases
+// only its first unit: a put of nine chunks with its signal is ten units, so after nine proxy iterations it is still
+// not done, and with the proxy running again it arrives with its data.
 void one_unit_per_call(Rank& R) {
     constexpr size_t n = (64 << 10) + 13, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 28);
-        R.wait_retired(R.issue(put_signal(0, 1, src, n, dst, 3, false)), "put-with-signal");
+        R.pause();
+        const Ticket* t = R.issue(put_signal(0, 1, src, n, dst, 3, false));
+        R.run_steps(9);
+        if (t->done.load(std::memory_order_acquire) != 0)
+            fail("assert", "limit", "%s", "ten units were released in nine progress calls");
+        R.resume();
+        R.wait_retired(t, "put-with-signal");
     } else {
         R.wait_peer([&] { return R.signal_word(3) >= 1; }, "signal-word");
         if (size_t bad = mismatches(R.at(dst), n, 0, 28)) fail("assert", "data", "%zu bytes", bad);

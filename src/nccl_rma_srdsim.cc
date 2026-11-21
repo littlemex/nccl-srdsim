@@ -4086,12 +4086,12 @@ void send_parked_of(CollComm* cc, const RmaCtx* owner) {
     for (const auto& p : failures) note_send_failure(p.owner, p.u);
 }
 
-// The most payload one `rmaProgress` call releases, over every plugin context of the communicator; a unit is always
-// released when it is the first of the call, so a chunk larger than this still goes. NCCL's proxy submits up to a batch
-// of operations per target in each pass of its loop and tests every outstanding request between progress calls, so a
-// call that releases less than a pass submits leaves a queue that grows, and every pass then tests all of it. A limit by
-// bytes keeps pace with a pass whatever the operations' sizes; it stops one call from filling a whole outbox before any
-// of it is pushed. Each unit is charged its payload and its frame header.
+// The most one `rmaProgress` call releases, payload and frame headers, over every plugin context of the communicator;
+// a unit is always released when it is the first of the call, so a chunk larger than this still goes. NCCL's proxy
+// submits up to a batch of operations per target in each pass of its loop and tests every outstanding request between
+// progress calls, so a call that releases less than a pass submits leaves a queue that grows, and every pass then tests
+// all of it. A limit by bytes keeps pace with a pass of any mix of sizes up to the limit, which a count of units cannot;
+// it also stops one call from filling a whole outbox before any of it is pushed.
 // SRDSIM_RELEASE_BYTES_PER_CALL changes it, for a test that needs an operation to span several calls.
 size_t release_bytes_per_call() {
     static const size_t v = env_size("SRDSIM_RELEASE_BYTES_PER_CALL", size_t{4} << 20);
@@ -4206,6 +4206,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
     bool released_any = false, spent = false;
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
+        if (spent) break;   // the call's limit is used up: no later context can release anything
         const size_t before = batch.size();
         {
             std::lock_guard<std::mutex> g(c->mu);
