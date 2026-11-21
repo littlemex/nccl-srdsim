@@ -5,7 +5,7 @@ NAME = "wire-frame"
 
 
 def draw(L):
-    f = Fig(1100, 350, L, L.t("One frame on the wire: a 56-byte header, then the payload",
+    f = Fig(1100, 380, L, L.t("One frame on the wire: a 56-byte header, then the payload",
                                "トランスポートの 1 フレーム: 56 バイトのヘッダと、その後のペイロード"))
     fields = [("kind", 4, "wire"), ("window", 4, "target"), ("dest_window", 4, "neutral"), ("requester", 4, "neutral"),
               ("offset", 8, "target"), ("length", 8, "wire"), ("value", 8, "sig"), ("op_id", 8, "nccl"),
@@ -21,6 +21,7 @@ def draw(L):
         ("Signal", L.t("add value to the 8 bytes at window + offset", "window + offset の 8 バイトに value を足す")),
         ("GetRequest", L.t("read value bytes (length is 0); reply to requester at dest_window", "value バイトを読み (length は 0)、requester の dest_window に返す")),
         ("GetResponse", L.t("a placement, counted for the requester's get whose id is op_id", "配置として書き、op_id の番号を持つ要求側の get の分として数える")),
+        ("GetError", L.t("the get whose id is op_id will not be served: fail it (length is 0)", "op_id の番号の get には応えられない。その get を失敗にする (length は 0)")),
         ("Shutdown", L.t("the sender is closing the stream", "送り手が接続を閉じる")),
     ]
     yy = 180
@@ -29,5 +30,5 @@ def draw(L):
     for i, (k, what) in enumerate(rows):
         f.text(30, yy + 28 + i * 26, k, size=13, anchor="start", mono=True)
         f.text(220, yy + 28 + i * 26, what, size=13, anchor="start")
-    f.text(1070, 340, L.t("grey fields are used by gets only", "灰色の欄は get だけが使う"), size=12, anchor="end", color="#555555")
+    f.text(1070, 370, L.t("grey fields are used by gets only", "灰色の欄は get だけが使う"), size=12, anchor="end", color="#555555")
     return f
