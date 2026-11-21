@@ -67,14 +67,8 @@ GRACE=10
 run_once() {
     local mode=$1 seed=$2 id="$WORK/id-$1-$2" r p q alive rc stop_at=-1
     local -a status extra=()
-    # control:MODE runs MODE with the caller's negative control switched on. Split on spaces without globbing.
-    if [ "${mode#control:}" != "$mode" ]; then
-        local IFS=' '
-        set -f
-        # shellcheck disable=SC2206
-        extra=($CONTROL_ENV)
-        set +f
-    fi
+    # control:MODE runs MODE with the caller's negative control switched on (split on white space, never globbed).
+    if [ "${mode#control:}" != "$mode" ]; then read -r -a extra <<< "$CONTROL_ENV"; fi
     RANK_PIDS=(); FIRST_STATUS=""
     for r in $(seq 0 $((NRANKS - 1))); do
         env ${extra[@]+"${extra[@]}"} NCCL_RMA_PLUGIN="$PLUGIN" NCCL_GIN_TYPE=2 NCCL_HOSTID="srdsim-rank-$r" \
