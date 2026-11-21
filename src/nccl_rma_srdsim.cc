@@ -3101,6 +3101,8 @@ private:
 
 StallMonitor g_stall_monitor;
 
+void destroy_comm(CollComm* cc);   // below, next to closeColl
+
 ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank,
                             void* listenComm, void** collComm) {
     auto* cc = new CollComm();
@@ -3172,6 +3174,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                     if (r != rank and not served.count(r)) m += (m.empty() ? "" : " ") + std::to_string(r);
                 return m;
             };
+            int last_retried = 0;   // the last error accept retried on, named if the deadline then passes
             for (int i = 0; i < expected_inbound; ++ i) {
                 int fd = -1;
                 bool broken = false;
@@ -3195,6 +3198,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                                e == EPROTO or e == ENOPROTOOPT or e == EHOSTDOWN or e == ENONET or e == EHOSTUNREACH or
                                e == EOPNOTSUPP or e == ENETUNREACH;
                     };
+                    if (fd < 0 and errno != EAGAIN and errno != EWOULDBLOCK) last_retried = errno;
                     if (fd < 0 and not retry(errno)) {
                         logf("rank %d could not accept a connection (errno %d); the connect fails", rank, errno);
                         broken = true;
@@ -3204,8 +3208,9 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                 }
                 if (fd < 0) {
                     if (not broken and not abandon.load())
-                        logf("rank(s) %s did not connect to rank %d within %zu ms; the connect fails", missing().c_str(),
-                             rank, connect_timeout_ms());
+                        logf("rank(s) %s did not connect to rank %d within %zu ms%s; the connect fails", missing().c_str(),
+                             rank, connect_timeout_ms(),
+                             last_retried ? (" (accept last retried on errno " + std::to_string(last_retried) + ")").c_str() : "");
                     accept_failed = true;
                     abandon = true;
                     break;
@@ -3259,17 +3264,12 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             }
         });
     }
-    // Tears down what this connect built, in closeColl's order: the receiving threads already serving accepted links
-    // report to `cc` until they are stopped, so they stop before it is deleted.
+    // Tears down what this connect built with closeColl's teardown: the receiving threads already serving accepted links,
+    // and a peer that has finished its own connect, can already be working on `cc`.
     const auto fail_connect = [&] {
         abandon = true;
         if (acceptor.joinable()) acceptor.join();
-        // The monitor was given this comm above, so it has to be told before the delete.
-        g_stall_monitor.unwatch(cc);
-        cc->responder.stop();
-        cc->links.shutdown_all();
-        if (cc->agent) cc->agent->stop();
-        delete cc;
+        destroy_comm(cc);
         return ncclSystemError;
     };
 
@@ -3304,10 +3304,11 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     // does not keep this rank from dialling the others, which would then report this rank as missing too. An
     // acknowledgement says the peer accepted this link, not that its own connect succeeded: with three or more ranks
     // arriving close to the deadline apart, a rank between two late ones can succeed while one of them has failed.
-    std::vector<std::pair<int, int>> dialled;   // (peer, fd), waiting for the acknowledgement; owned by `cc->links`
+    std::vector<std::pair<int, int>> dialled;   // (peer, a copy of the link's descriptor), waiting for the acknowledgement
+    const auto close_copies = [&](size_t from) { for (size_t j = from; j < dialled.size(); ++ j) ::close(dialled[j].second); };
     for (int peer = 0; peer < nranks; ++ peer) {
         if (peer == rank) continue;
-        if (accept_failed.load()) return fail_connect();
+        if (accept_failed.load()) { close_copies(0); return fail_connect(); }
         ConnHandle h{};
         std::memcpy(&h, handles[peer], sizeof(h));
         int why = 0;
@@ -3319,7 +3320,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             else if (not abandon.load())
                 logf("could not reach rank %d at %s:%u within %zu ms; the connect fails", peer, h.ip,
                      static_cast<unsigned>(h.port), connect_timeout_ms());
-            return fail_connect();
+            { close_copies(0); return fail_connect(); }
         }
         if (cc->impair.send_buffer_bytes != 0) {
             const int bytes = static_cast<int>(std::min<uint32_t>(cc->impair.send_buffer_bytes, INT32_MAX));
@@ -3335,17 +3336,28 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         if (not srdsim::write_all(fd, &me, sizeof(me))) {
             logf("could not tell rank %d which rank this is; the connect fails", peer);
             ::close(fd);
+            close_copies(0);
             return fail_connect();
         }
-        dialled.emplace_back(peer, fd);
-        // In place now: a peer that has all its acknowledgements may already send here, a get request among them, whose
-        // reply goes out on this link.
+        // The acknowledgement is read from a copy of the descriptor: the link is in place now (a peer that has all its
+        // acknowledgements may already send here, a get request among them, whose reply goes out on this link), and a
+        // failed send would close the link's own descriptor.
+        const int ack_fd = ::dup(fd);
+        if (ack_fd < 0) {
+            logf("could not keep a descriptor for rank %d's acknowledgement (errno %d); the connect fails", peer, errno);
+            ::close(fd);
+            close_copies(0);
+            return fail_connect();
+        }
+        dialled.emplace_back(peer, ack_fd);
         cc->links.set(peer, fd);
     }
     for (size_t i = 0; i < dialled.size(); ++ i) {
         const int peer = dialled[i].first, fd = dialled[i].second;
         char ack = 0;
         const ReadResult got = read_within(fd, &ack, 1, ms_left(), &abandon);
+        const int read_errno = errno;
+        ::close(fd);   // the copy; the link keeps its own
         if (got != ReadResult::Ok or ack != 1) {
             if (got == ReadResult::Expired and not abandon.load())
                 logf("rank %d did not acknowledge the link from rank %d within %zu ms; the connect fails", peer, rank,
@@ -3354,10 +3366,11 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                 logf("rank %d closed the link from rank %d instead of acknowledging it; the connect fails", peer, rank);
             else if (got == ReadResult::Error)
                 logf("could not read rank %d's acknowledgement of the link from rank %d (errno %d); the connect fails",
-                     peer, rank, errno);
+                     peer, rank, read_errno);
             else if (got == ReadResult::Ok)
                 logf("rank %d answered the link from rank %d with %d, not an acknowledgement; the connect fails", peer,
                      rank, int(ack));
+            close_copies(i + 1);
             return fail_connect();
         }
     }
@@ -3587,16 +3600,23 @@ ncclResult_t srdsim_destroy_context(void* rmaCtx) {
     return ncclSuccess;
 }
 
+// Stops everything that works on `cc` and deletes it: closeColl's teardown, and a failed connect's.
+void destroy_comm(CollComm* cc) {
+    g_stall_monitor.unwatch(cc);   // before the delete, or the monitor reads freed memory
+#ifdef SRDSIM_WITH_CUDA
+    if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
+#endif
+    cc->responder.stop();          // before the links it sends on go
+    drop_parked(cc, nullptr);
+    cc->links.shutdown_all();      // tells every peer's agent to finish
+    if (cc->agent) cc->agent->stop();
+    delete cc;
+}
+
 ncclResult_t srdsim_close_coll(void* collComm) {
     auto* cc = static_cast<CollComm*>(collComm);
     lifecycle("communicator %p closing", collComm);
     if (cc) {
-        g_stall_monitor.unwatch(cc);   // before the delete, or the monitor reads freed memory
-#ifdef SRDSIM_WITH_CUDA
-        if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
-#endif
-        cc->responder.stop();          // before the links it sends on go
-        drop_parked(cc, nullptr);
 
         if (cc->agent and cc->agent->withheld_signals() != 0)
             lifecycle("communicator %p withheld %llu signal(s) whose operation lost a placement", collComm,
@@ -3607,9 +3627,7 @@ ncclResult_t srdsim_close_coll(void* collComm) {
                   static_cast<unsigned long long>(cc->links.refused_for_budget()));
         if (const size_t r = cc->links.reserved_total())
             logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
-        cc->links.shutdown_all();      // tells every peer's agent to finish
-        if (cc->agent) cc->agent->stop();
-        delete cc;
+        destroy_comm(cc);
     }
     return ncclSuccess;
 }
