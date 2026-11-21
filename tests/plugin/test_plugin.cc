@@ -124,8 +124,9 @@ void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 
 // Contexts are independent: a strong signal on one context is not ordered behind an earlier put on another
 // context to the same peer. Under reverse-ops the newest operation goes first, so the signal arrives while part
-// of the put on the other context is still missing. The sender holds after two proxy iterations (at most eight
-// chunks each, of the put's 128) until the target has looked.
+// of the put on the other context is still missing. The sender holds after two proxy iterations (at most seven
+// chunks each, of the put's 128, with SRDSIM_RELEASE_BYTES_PER_CALL at 64 KiB and each chunk charged its header)
+// until the target has looked.
 // Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
 // can be dropped without a failure.
 void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
@@ -612,6 +613,28 @@ void large_chunk(Rank& R) {
     }
 }
 
+// With a payload limit per progress call smaller than any unit (SRDSIM_RELEASE_BYTES_PER_CALL=1), each call releases
+// only its first unit: a put of nine chunks with its signal is ten units, so after nine proxy iterations it is still
+// not done, and with the proxy running again it arrives with its data.
+void one_unit_per_call(Rank& R) {
+    constexpr size_t n = (64 << 10) + 13, src = 4099, dst = (1 << 20) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 28);
+        R.pause();
+        const Ticket* t = R.issue(put_signal(0, 1, src, n, dst, 3, false));
+        R.run_steps(9);
+        if (t->done.load(std::memory_order_acquire) != 0)
+            fail("assert", "limit", "%s", "ten units were released in nine progress calls");
+        R.resume();
+        R.wait_retired(t, "put-with-signal");
+    } else {
+        R.wait_peer([&] { return R.signal_word(3) >= 1; }, "signal-word");
+        if (size_t bad = mismatches(R.at(dst), n, 0, 28)) fail("assert", "data", "%zu bytes", bad);
+        expect_guards(R, dst, n);
+        expect_signals(R, {{3, 1}});
+    }
+}
+
 // A get the owner cannot serve (it reads past the owner's window) fails instead of hanging: the get retires, a
 // flush after it completes, queryLastError reports it, and a valid get after it completes with its data.
 void get_refused_by_owner(Rank& R) {
@@ -753,9 +776,10 @@ const std::vector<const char*> kKeepI1 = {"srd", "inorder", "peer-seq", "reverse
 const std::vector<Scenario>& scenarios() {
     static const std::vector<Scenario> s = {
         {"put_then_strong_signal", put_then_strong_signal, 2, kKeepI1, {1, 2, 3}, nullptr},
-        {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, nullptr},
-        {"strong_signal_other_context_01", strong_signal_other_context_01, 2, {"reverse-ops"}, {1}, nullptr},
-        {"strong_signal_other_context_10", strong_signal_other_context_10, 2, {"reverse-ops"}, {1}, nullptr},
+        // A put has to span several progress calls for these to see the order inside one.
+        {"weak_signal_control", weak_signal_control, 2, {"reverse-ops"}, {1, 2, 3}, "SRDSIM_RELEASE_BYTES_PER_CALL=65536"},
+        {"strong_signal_other_context_01", strong_signal_other_context_01, 2, {"reverse-ops"}, {1}, "SRDSIM_RELEASE_BYTES_PER_CALL=65536"},
+        {"strong_signal_other_context_10", strong_signal_other_context_10, 2, {"reverse-ops"}, {1}, "SRDSIM_RELEASE_BYTES_PER_CALL=65536"},
         {"i1_holds", i1_holds, 2, kKeepI1, {1, 2, 3}, nullptr},
         {"violate_control", violate_control, 2, {"violate-i1"}, {1, 2, 3}, nullptr},
         {"get_completes_with_data", get_completes_with_data, 2, {"srd"}, {1}, nullptr},
@@ -780,6 +804,7 @@ const std::vector<Scenario>& scenarios() {
 #endif
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
+        {"one_unit_per_call", one_unit_per_call, 2, {"srd", "inorder"}, {1}, "SRDSIM_RELEASE_BYTES_PER_CALL=1"},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},

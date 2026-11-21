@@ -515,6 +515,7 @@ private:
 struct CollComm {
     int nranks = 0;
     int rank = 0;
+    uint64_t progress_rotation = 0;                    // under `mu`: which context a progress call advances first
     srdsim::WindowTable windows;                       // this rank's own windows, by id
     srdsim::SendLinks links;                           // one stream per peer
     // Before `agent`, so that on destruction the receive threads, which hand it replies, stop first.
@@ -4085,6 +4086,18 @@ void send_parked_of(CollComm* cc, const RmaCtx* owner) {
     for (const auto& p : failures) note_send_failure(p.owner, p.u);
 }
 
+// The most one `rmaProgress` call releases, payload and frame headers, over every plugin context of the communicator;
+// a unit is always released when it is the first of the call, so a chunk larger than this still goes. NCCL's proxy
+// submits up to a batch of operations per target in each pass of its loop and tests every outstanding request between
+// progress calls, so a call that releases less than a pass submits leaves a queue that grows, and every pass then tests
+// all of it. A limit by bytes keeps pace with a pass of any mix of sizes up to the limit, which a count of units cannot;
+// it also stops one call from filling a whole outbox before any of it is pushed.
+// SRDSIM_RELEASE_BYTES_PER_CALL changes it, for a test that needs an operation to span several calls.
+size_t release_bytes_per_call() {
+    static const size_t v = env_size("SRDSIM_RELEASE_BYTES_PER_CALL", size_t{4} << 20);
+    return v;
+}
+
 ncclResult_t srdsim_progress(void* rmaCtx) {
     Mark mark("rmaProgress");
     auto* ctx = static_cast<RmaCtx*>(rmaCtx);
@@ -4123,6 +4136,12 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         std::lock_guard<std::mutex> g(ctx->coll->mu);
         to_advance = ctx->coll->rma_contexts;
         if (to_advance.empty()) to_advance.push_back(ctx);
+        // The call's payload limit is shared by the contexts, so the one advanced first changes from call to call on
+        // this communicator; otherwise the first could take all of it every call while the others wait.
+        if (to_advance.size() > 1)
+            std::rotate(to_advance.begin(),
+                        to_advance.begin() + static_cast<std::ptrdiff_t>(ctx->coll->progress_rotation ++ % to_advance.size()),
+                        to_advance.end());
     }
 
     // Each unit keeps the context that released it. The batch is filled from every context, and a unit handed on
@@ -4140,9 +4159,16 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         CollComm* cc = nullptr;
         std::set<std::pair<CollComm*, int>>* held = nullptr;   // peers already counted as held in this call
         std::map<int, size_t> granted;   // reserved and not yet taken
+        size_t* bytes_left = nullptr;    // of `release_bytes_per_call()`, shared by the call's contexts
+        bool* released_any = nullptr;    // whether the call released a unit yet
+        bool* spent = nullptr;           // the call refused a unit for the limit: it releases nothing more
         std::set<int> full;
         std::set<int> held_by_freeze;   // the frozen-link impairment, apart from a full outbox
         bool fits(int peer, size_t bytes) override {
+            // Charged with the frame's header, so a call of small units is bounded too. Once a unit is refused for
+            // the limit the call releases nothing more, to any peer, so a refusal stays one for the rest of the call.
+            if (*spent) return false;
+            if (*released_any and sizeof(srdsim::WireHeader) + bytes > *bytes_left) { *spent = true; return false; }
             if (links == nullptr) return true;
             if (full.count(peer)) return false;
             if (cc and frozen(peer)) { held_by_freeze.insert(peer); return false; }
@@ -4166,6 +4192,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             return frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{};
         }
         void take(int peer, size_t bytes) override {
+            *released_any = true;
+            *bytes_left -= std::min(*bytes_left, sizeof(srdsim::WireHeader) + bytes);
             size_t& have = granted[peer];
             have -= std::min(have, sizeof(srdsim::WireHeader) + bytes);
         }
@@ -4174,8 +4202,11 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         }
     };
     std::set<std::pair<CollComm*, int>> held;
+    size_t bytes_left = release_bytes_per_call();
+    bool released_any = false, spent = false;
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
+        if (spent) break;   // the call's limit is used up: no later context can release anything
         const size_t before = batch.size();
         {
             std::lock_guard<std::mutex> g(c->mu);
@@ -4183,7 +4214,10 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             room.links = c->coll ? &c->coll->links : nullptr;
             room.cc = c->coll;
             room.held = &held;
-            c->sched->progress(/*budget=*/8, &batch, &room);
+            room.bytes_left = &bytes_left;
+            room.released_any = &released_any;
+            room.spent = &spent;
+            c->sched->progress(SIZE_MAX, &batch, &room);
         }
         owners.resize(batch.size(), c);
         c->progress_calls.fetch_add(1, std::memory_order_relaxed);
