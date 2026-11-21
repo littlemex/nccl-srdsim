@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 
 #if defined(__SANITIZE_ADDRESS__)
 #define HARNESS_ASAN 1
@@ -369,6 +370,24 @@ struct Rank {
         barrier("handles published");
         void* handles[kMaxRanks];
         for (int r = 0; r < g_nranks; ++ r) handles[r] = g_shared->handles[r];
+        // HARNESS_CONNECT_ABSENT=r: rank r publishes its handle and listens but never calls connect, as a peer that
+        // stalls or dies during setup would. Every other rank's connect must then fail within the plugin's deadline
+        // (SRDSIM_CONNECT_TIMEOUT_MS) rather than wait for it; the case ends there.
+        if (const char* absent = std::getenv("HARNESS_CONNECT_ABSENT")) {
+            const int a = std::atoi(absent);
+            if (g_rank == a) {
+                g_shared->expected_dead[a].store(1);
+                set_where("absent");
+                pause_forever();
+            }
+            const auto start = Clock::now();
+            const ncclResult_t rc = rma.connect(ctx, handles, g_nranks, g_rank, listenComm, &coll);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+            if (rc == ncclSuccess) fail("assert", "connect-absent", "connected although rank %d never called connect", a);
+            if (ms > kRankWallMs) fail("assert", "connect-absent", "the connect took %lld ms to fail", static_cast<long long>(ms));
+            kill(g_shared->pid[a], SIGKILL);
+            finish("ok");
+        }
         check(rma.connect(ctx, handles, g_nranks, g_rank, listenComm, &coll), "connect");
         check(rma.closeListen(listenComm), "closeListen");
 #if defined(RMA_V16_H_)

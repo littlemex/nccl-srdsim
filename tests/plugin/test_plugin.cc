@@ -780,6 +780,8 @@ const std::vector<Scenario>& scenarios() {
 #endif
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
+        // The case is the connect itself (`Rank::setup`), so its body never runs.
+        {"connect_peer_absent", [](Rank&) {}, 2, {"srd"}, {1}, "HARNESS_CONNECT_ABSENT=1 SRDSIM_CONNECT_TIMEOUT_MS=2000"},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
         {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},

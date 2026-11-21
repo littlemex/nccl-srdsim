@@ -375,6 +375,12 @@ bool read_within(int fd, void* buf, size_t bytes, int ms) {
     return true;
 }
 
+// How long `connect` waits for every peer to dial in.
+size_t connect_timeout_ms() {
+    static const size_t v = env_size("SRDSIM_CONNECT_TIMEOUT_MS", 120000);
+    return v;
+}
+
 // The first bytes a dialled link carries: who is calling. The accepting side checks them before it serves the link.
 struct LinkHello {
     static constexpr uint32_t kMagic = 0x53524448;   // "SRDH"
@@ -3129,16 +3135,38 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
 
     // Accept from every peer and dial every peer. Both halves are needed: a rank both sends and
     // receives. Dialling retries, so the order ranks reach this point does not matter.
+    //
+    // Accepting has a deadline: a peer that never dials (it died, or never called connect) fails the connect after
+    // SRDSIM_CONNECT_TIMEOUT_MS instead of holding it forever. A dial that fails gives up the accepting at once, so the
+    // connect returns its error rather than waiting for the deadline.
     auto* lc = static_cast<ListenComm*>(listenComm);
     std::thread acceptor;
     std::atomic<bool> accept_failed{false};
+    std::atomic<bool> abandon{false};
     const int expected_inbound = nranks - 1;
     if (lc != nullptr and expected_inbound > 0) {
-        acceptor = std::thread([lc, expected_inbound, cc, nranks, rank, &accept_failed] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(connect_timeout_ms());
+        acceptor = std::thread([lc, expected_inbound, cc, nranks, rank, deadline, &accept_failed, &abandon] {
             std::set<int> served;
             for (int i = 0; i < expected_inbound; ++ i) {
-                const int fd = ::accept(lc->fd, nullptr, nullptr);
-                if (fd < 0) break;
+                int fd = -1;
+                while (fd < 0 and not abandon.load() and std::chrono::steady_clock::now() < deadline) {
+                    pollfd pfd{lc->fd, POLLIN, 0};
+                    const int r = ::poll(&pfd, 1, 100);
+                    if (r < 0 and errno != EINTR) break;
+                    if (r > 0) fd = ::accept(lc->fd, nullptr, nullptr);
+                }
+                if (fd < 0) {
+                    if (not abandon.load()) {
+                        std::string missing;
+                        for (int r = 0; r < nranks; ++ r)
+                            if (r != rank and not served.count(r)) missing += (missing.empty() ? "" : " ") + std::to_string(r);
+                        logf("rank(s) %s did not connect to rank %d within %zu ms; the connect fails", missing.c_str(), rank,
+                             connect_timeout_ms());
+                    }
+                    accept_failed = true;
+                    break;
+                }
                 srdsim::set_nodelay(fd);
                 // The dialler first says which rank it is, so the agent can say where a frame came from. Read
                 // under a deadline: a dialler that never writes must not hang the connect.
@@ -3202,6 +3230,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         const int fd = srdsim::dial(h.ip, h.port);
         if (fd < 0) {
             logf("could not reach rank %d at %s:%u", peer, h.ip, static_cast<unsigned>(h.port));
+            abandon = true;
             if (acceptor.joinable()) acceptor.join();
             // The monitor was given this comm a few lines above, so it has to be told before the delete.
             g_stall_monitor.unwatch(cc);
@@ -3222,6 +3251,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         if (not srdsim::write_all(fd, &me, sizeof(me))) {
             logf("could not tell rank %d which rank this is", peer);
             ::close(fd);
+            abandon = true;
             if (acceptor.joinable()) acceptor.join();
             g_stall_monitor.unwatch(cc);
             delete cc;
