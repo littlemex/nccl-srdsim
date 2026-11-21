@@ -741,28 +741,43 @@ void get_owner_dies(Rank& R) {
 
 // The owner of a get dies (SIGKILL) part way through sending its reply. The owner's send buffer is small
 // (SRDSIM_SEND_BUFFER_BYTES) and the requester applies a frame at most every 2 ms (SRDSIM_APPLY_INTERVAL_US), so a
-// reply of 6 MiB takes over a second to land and most of it is still in the owner's outbox when the owner is killed,
-// as soon as the first bytes have landed. The get then fails rather than waiting for ever or completing: it retires,
-// queryLastError reports it, and the bytes from where the landed frames end are not written.
+// reply of 6 MiB in frames of 8 KiB takes over a second to land. Once the first frame has landed the owner is stopped,
+// and once the landed prefix has stopped growing (everything the owner's kernel had already sent has been applied)
+// the rest of the reply is known to be in the owner's own outbox; the owner is then killed. The get must fail rather
+// than wait for ever or complete: it retires, queryLastError reports it, and after a further wait the bytes that landed
+// are still exactly that prefix, with nothing written after it or past the destination.
 void get_owner_dies_mid_reply(Rank& R) {
-    constexpr size_t n = 6u << 20, remote = 7, local = kGuard;
+    constexpr size_t n = 6u << 20, frame = 8192, remote = 7, local = kGuard;
     if (g_rank == 1) fill(R.at(remote), n, 1, 29);
     barrier("ready");
     if (g_rank == 0) {
+        // The reply's frames land in order, so what landed is a prefix of whole frames.
+        const auto prefix = [&] {
+            size_t landed = 0;
+            while (landed < n and mismatches_from(R.at(local + landed), landed, std::min(frame, n - landed), 1, 29) == 0)
+                landed += std::min(frame, n - landed);
+            return landed;
+        };
         const Ticket* g = R.issue(get(0, 1, remote, n, local));
-        R.wait_peer([&] { return mismatches(R.at(local), 8192, 1, 29) == 0; }, "first-frame");
+        R.wait_peer([&] { return prefix() >= frame; }, "first-frame");
+        stop_peer(1);
+        size_t before = prefix();
+        for (auto still = Clock::now(); Clock::now() - still < std::chrono::milliseconds(200);) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (const size_t now = prefix(); now != before) { before = now; still = Clock::now(); }
+        }
+        if (before == n) fail("harness", "precondition", "%s", "the whole reply landed before the owner was stopped");
         g_shared->expected_dead[1].store(1);
-        kill(g_shared->pid[1], SIGKILL);
+        if (kill(g_shared->pid[1], SIGKILL) != 0) fail("harness", "kill", "errno %d", errno);
         R.wait_retired(g, "get-from-dead-owner");
         if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
-        // The reply's frames land in order, so what landed is a prefix: find where it ends, and require it short of the
-        // whole reply (the owner died with part of it unsent) and nothing written past it.
-        size_t landed = 0;
-        while (landed < n and mismatches_from(R.at(local + landed), landed, std::min<size_t>(8192, n - landed), 1, 29) == 0)
-            landed += std::min<size_t>(8192, n - landed);
-        if (landed == n) fail("assert", "partial", "%s", "the whole reply landed before the owner died");
-        if (size_t bad = nonzero(R.at(local + landed), n - landed))
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   // fifty apply intervals: nothing more may land
+        const size_t after = prefix();
+        if (after != before)
+            fail("assert", "prefix", "%zu bytes had landed when the owner was killed and %zu after the get retired", before, after);
+        if (size_t bad = nonzero(R.at(local + after), n - after))
             fail("assert", "past-the-prefix", "%zu bytes written after the landed frames", bad);
+        expect_guards(R, local, n);
         R.teardown(/*meet_peers=*/false);
         R.pass();
     } else {
@@ -822,7 +837,7 @@ const std::vector<Scenario>& scenarios() {
         {"impaired_signal_lag", impaired_signal_lag, 2, {"srd"}, {1}, "SRDSIM_SIGNAL_LAG_US=200000 SRDSIM_CHUNK_BYTES=8192"},
         {"get_owner_dies", get_owner_dies, 2, {"srd"}, {1}, nullptr},
         {"get_owner_dies_mid_reply", get_owner_dies_mid_reply, 2, {"srd"}, {1},
-         "SRDSIM_SEND_BUFFER_BYTES=65536 SRDSIM_APPLY_INTERVAL_US=2000"},
+         "SRDSIM_SEND_BUFFER_BYTES=65536 SRDSIM_APPLY_INTERVAL_US=2000 SRDSIM_CHUNK_BYTES=8192"},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
