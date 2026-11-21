@@ -631,6 +631,25 @@ void get_refused_by_owner(Rank& R) {
     }
 }
 
+// A placement the target refuses (it runs past the target's window) does not let its own signal apply: the signal
+// would announce bytes that never landed. A put with a signal after it on the same link applies both, which shows
+// the earlier signal frame was seen and withheld, and that only the operation that lost a placement is affected.
+void signal_after_dropped_placement(Rank& R) {
+    constexpr size_t n = (16 << 10) + 13, src = 4099, good = (512 << 10) + kGuard;
+    if (g_rank == 0) {
+        fill(R.at(src), n, 0, 24);
+        Op bad = put_signal(0, 1, src, n, kDataBytes - 100, 10, false);
+        bad.keep_source = true;   // the good put after it reads the same source
+        R.wait_retired(R.issue(bad), "bad-put-with-signal");
+        R.wait_retired(R.issue(put_signal(0, 1, src, n, good, 11, false)), "good-put-with-signal");
+    } else {
+        R.wait_peer([&] { return R.signal_word(11) == 1; }, "good-signal");
+        if (size_t bad = mismatches(R.at(good), n, 0, 24)) fail("assert", "good-put-data", "%zu bytes", bad);
+        if (R.signal_word(10) != 0) fail("assert", "signal-without-data", "%s", "the signal of a dropped placement applied");
+        if (size_t bad = nonzero(R.at(kDataBytes - 100), 100)) fail("assert", "dropped-placement-wrote", "%zu bytes", bad);
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -672,6 +691,7 @@ const std::vector<Scenario>& scenarios() {
 #endif
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
+        {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;

@@ -534,7 +534,7 @@ struct RmaCtx {
     // Counted without the context's lock, from where the failure is seen; `queryLastError` reports it.
     std::atomic<uint64_t> failed_gets{0};
     std::unique_ptr<srdsim::Scheduler> sched;
-    uint64_t next_op_id = 1;
+
     bool has_error = false;
     std::string error;
     std::mutex mu;
@@ -2684,7 +2684,10 @@ void note_cross_overlap(RmaCtx* ctx, const srdsim::Op& op) {
 ncclResult_t submit(RmaCtx* ctx, const srdsim::Op& op, void** request) {
     std::lock_guard<std::mutex> g(ctx->mu);
     srdsim::Op with_id = op;
-    with_id.id = ctx->next_op_id++;
+    // Unique in the process, not only in the context: a receiver keys per-operation state by the id frames carry,
+    // and every context of a communicator sends on the same links.
+    static std::atomic<uint64_t> next_op_id{1};
+    with_id.id = next_op_id.fetch_add(1, std::memory_order_relaxed);
     // The window ids are the part worth logging. Everything else can look right while a signal lands
     // in a window the peer is not watching, and then the only symptom is a wait that never ends.
     // NCCL lays indexed signals out as `(signalId + contextId * nSignalsPerContext) * sizeof(uint64_t)`

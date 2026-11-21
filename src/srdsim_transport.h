@@ -43,6 +43,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <csignal>
@@ -588,6 +589,7 @@ public:
     uint64_t failed_writes() const { return failed_writes_.load(std::memory_order_relaxed); }
     uint64_t get_requests_answered() const { return get_requests_.load(std::memory_order_acquire); }
     uint64_t errors() const { return refused_frames() + failed_writes(); }
+    uint64_t withheld_signals() const { return withheld_signals_.load(std::memory_order_relaxed); }
 
     // Whether this agent is still alive, and if it is stuck, where. Every field is a duration rather
     // than a count, because the question a stall poses is never "how many" but "how long ago", and a
@@ -652,14 +654,22 @@ private:
         std::atomic<uint64_t> signals{0};
         std::atomic<uint64_t> bytes{0};
         std::atomic<bool> finished{false};
+        // Operations (by the id their frames carry) a placement of which this link refused or could not write. Their
+        // signal would announce bytes that never landed (I1), so it is withheld; other operations are unaffected.
+        // Touched only by this connection's receive thread, which applies its frames in order. A link is one
+        // connection for its lifetime; it is not re-established.
+        std::unordered_set<uint64_t> dropped_ops;
     };
+    static constexpr size_t kMaxDroppedOps = 65536;
 
     void loop(int fd, Conn* conn) {
         std::vector<char> buf;
+        bool link_failed = false;   // set when this link cannot keep its promises; the loop then closes it
         // The exit condition is the peer closing or sending Shutdown. `stopping_` is only an abort
         // for teardown, checked after each message rather than before the first one, so that a
         // caller which tears down immediately after serving still processes what already arrived.
         for (;;) {
+            if (link_failed) break;
             WireHeader h{};
             if (hooks_.idle != nullptr) {
                 pollfd pfd{fd, POLLIN, 0};
@@ -685,7 +695,18 @@ private:
                 continue;
             }
             void* const hook_user = conn->user ? conn->user : hooks_.user;
-            const auto refuse_get = [&] {
+            // Called on every path that drops a frame or fails to write it: a placement's operation loses its signal,
+            // and a get request or reply is answered or failed.
+            const auto on_dropped = [&] {
+                if (h.kind == static_cast<uint32_t>(WireKind::Placement)) {
+                    // Bounded: a peer that keeps sending bad placements would otherwise grow this without end.
+                    if (conn->dropped_ops.size() >= kMaxDroppedOps and not conn->dropped_ops.count(h.op_id)) {
+                        say("too many operations lost a placement on this link; closing it");
+                        link_failed = true;
+                    } else {
+                        conn->dropped_ops.insert(h.op_id);
+                    }
+                }
                 if (h.kind == static_cast<uint32_t>(WireKind::GetRequest) and hooks_.get_refused)
                     hooks_.get_refused(h.requester_rank, h.op_id, hook_user);
                 if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_failed)
@@ -732,7 +753,7 @@ private:
                               h.window_id, windows_->size());
                 say(m);
                 refused_.fetch_add(1, std::memory_order_relaxed);
-                refuse_get();
+                on_dropped();
                 if (not drain_payload()) break;
                 continue;
             }
@@ -749,7 +770,7 @@ private:
                                   (unsigned long long)h.length, w.bytes);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
-                    refuse_get();
+                    on_dropped();
                     if (not drain_payload()) break;
                     continue;
                 }
@@ -763,7 +784,7 @@ private:
                                   "being received; dropping", h.window_id);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
-                    refuse_get();
+                    on_dropped();
                     continue;
                 }
                 w = lease.window();
@@ -797,7 +818,7 @@ private:
                           if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and
                               hooks_.get_response_landed)
                               hooks_.get_response_landed(h.op_id, h.length, conn->user ? conn->user : hooks_.user); }
-                else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); refuse_get(); }
+                else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); on_dropped(); }
             } else if (h.kind == static_cast<uint32_t>(WireKind::GetRequest)) {
                 // No payload on the wire -- the requester does not have the bytes yet -- so the fetch
                 // size travels in `value`, not `length`; `length` stays "bytes trailing this frame" for
@@ -821,7 +842,7 @@ private:
                                   (unsigned long long)fetch_bytes, w.bytes);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
-                    refuse_get();
+                    on_dropped();
                     continue;
                 }
                 // Re-read under a lease, same as a Placement does, because the window this rank is
@@ -833,7 +854,7 @@ private:
                                   "was being served; dropping", h.window_id);
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
-                    refuse_get();
+                    on_dropped();
                     continue;
                 }
                 w = lease.window();
@@ -845,7 +866,7 @@ private:
                 if (not hooks_.get_request)
                     say("a get request arrived but no get-request hook was installed");
                 if (ok) get_requests_.fetch_add(1, std::memory_order_release);
-                else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); refuse_get(); }
+                else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); on_dropped(); }
             } else if (h.kind == static_cast<uint32_t>(WireKind::Signal)) {
                 // A signal frame has no payload, so a non-zero length means the stream is no longer
                 // framed and the next header would be read out of somebody's data. There is no
@@ -869,6 +890,15 @@ private:
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
                     continue;                            // a signal carries no payload to drain
+                }
+                if (conn->dropped_ops.erase(h.op_id)) {   // an operation has one signal frame
+                    char m[160];
+                    std::snprintf(m, sizeof(m), "operation %llu lost a placement on this link, so its signal is not "
+                                  "applied: it would announce bytes that never landed",
+                                  static_cast<unsigned long long>(h.op_id));
+                    say(m);
+                    withheld_signals_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
                 }
                 WindowTable::Lease lease(windows_, h.window_id);
                 if (not lease.ok() or not range_fits(h.offset, sizeof(uint64_t), lease.window().bytes)) {
@@ -948,6 +978,7 @@ private:
     mutable std::mutex activity_mu_;
     std::map<uint32_t, WindowActivity> activity_;
     std::atomic<uint64_t> refused_{0};
+    std::atomic<uint64_t> withheld_signals_{0};   // signals not applied because their operation lost a placement
     std::atomic<uint64_t> failed_writes_{0};
     std::atomic<uint64_t> get_requests_{0};
 };
