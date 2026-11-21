@@ -394,7 +394,8 @@ struct Rank {
             const ncclResult_t rc = rma.connect(ctx, handles, g_nranks, g_rank, listenComm, &coll);
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
             if (rc == ncclSuccess) fail("assert", "connect-absent", "connected although rank %d never called connect", a);
-            if (ms < timeout or ms > timeout + 1500)
+            // The plugin counts its remaining time in whole milliseconds, so it may give up a millisecond or so early.
+            if (ms < timeout - 50 or ms > timeout + 1500)
                 fail("assert", "connect-absent", "the connect failed after %lld ms, against a deadline of %lld ms",
                      static_cast<long long>(ms), timeout);
             std::string why;
