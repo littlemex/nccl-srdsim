@@ -356,29 +356,39 @@ struct MrHandle {
 // Bootstrap and connection state
 // ---------------------------------------------------------------------------
 
-// Reads exactly `bytes`, or gives up when `ms` have passed without them.
-bool read_within(int fd, void* buf, size_t bytes, int ms) {
+// Reads exactly `bytes`, or gives up when `ms` have passed without them, or once `*stop` is set (checked every 100 ms).
+enum class ReadResult { Ok, Closed, Expired, Error };
+ReadResult read_within(int fd, void* buf, size_t bytes, int ms, const std::atomic<bool>* stop = nullptr) {
     char* p = static_cast<char*>(buf);
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     while (bytes > 0) {
+        if (stop and stop->load()) return ReadResult::Expired;
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
-        if (left <= 0) return false;
+        if (left <= 0) return ReadResult::Expired;
         pollfd pfd{fd, POLLIN, 0};
-        const int r = ::poll(&pfd, 1, static_cast<int>(left));
+        const int r = ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left, 100)));
         if (r < 0 and errno == EINTR) continue;
-        if (r <= 0) return false;
+        if (r < 0) return ReadResult::Error;
+        if (r == 0) continue;
         const ssize_t n = ::recv(fd, p, bytes, 0);
         if (n > 0) { p += n; bytes -= static_cast<size_t>(n); continue; }
-        if (n == 0) return false;
-        if (errno != EINTR and errno != EAGAIN) return false;
+        if (n == 0) return ReadResult::Closed;
+        if (errno != EINTR and errno != EAGAIN) return ReadResult::Error;
     }
-    return true;
+    return ReadResult::Ok;
+}
+
+// How long `connect` waits for every peer to dial in.
+size_t connect_timeout_ms() {
+    // 0, or more than a day, gives the default.
+    static const size_t v = env_size("SRDSIM_CONNECT_TIMEOUT_MS", 120000, size_t{24} * 3600 * 1000);
+    return v;
 }
 
 // The first bytes a dialled link carries: who is calling. The accepting side checks them before it serves the link.
 struct LinkHello {
     static constexpr uint32_t kMagic = 0x53524448;   // "SRDH"
-    static constexpr uint32_t kVersion = 1;
+    static constexpr uint32_t kVersion = 2;   // 2: the accepting rank acknowledges with one byte
     uint32_t magic;
     uint32_t version;
     int32_t rank;
@@ -3091,6 +3101,8 @@ private:
 
 StallMonitor g_stall_monitor;
 
+void destroy_comm(CollComm* cc);   // below, next to closeColl
+
 ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank,
                             void* listenComm, void** collComm) {
     auto* cc = new CollComm();
@@ -3129,28 +3141,113 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
 
     // Accept from every peer and dial every peer. Both halves are needed: a rank both sends and
     // receives. Dialling retries, so the order ranks reach this point does not matter.
+    //
+    // The whole connect has one deadline, SRDSIM_CONNECT_TIMEOUT_MS from when this rank's connect began: accepting,
+    // dialling (with its retries), reading a peer's hello and waiting for a peer's acknowledgement all give up at it,
+    // so a peer that stalls or dies during setup fails the connect instead of holding it forever. A failure on either
+    // side gives up the other at once. Each link is acknowledged by the rank that accepted it, so a rank that dialled
+    // a peer whose accepting had already given up fails too rather than reporting a mesh that peer does not have.
     auto* lc = static_cast<ListenComm*>(listenComm);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(connect_timeout_ms());
+    const auto ms_left = [deadline] {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        return static_cast<int>(std::max<long long>(0, std::min<long long>(left.count(), INT32_MAX)));
+    };
     std::thread acceptor;
     std::atomic<bool> accept_failed{false};
+    // Set by whichever side fails first, accepting or dialling; both check it and give up.
+    std::atomic<bool> abandon{false};
+    // Every return below joins the acceptor first, because it holds references to these locals.
+    struct JoinAcceptor {
+        std::thread* t; std::atomic<bool>* abandon;
+        ~JoinAcceptor() { if (t->joinable()) { abandon->store(true); t->join(); } }
+    } join_acceptor{&acceptor, &abandon};
     const int expected_inbound = nranks - 1;
     if (lc != nullptr and expected_inbound > 0) {
-        acceptor = std::thread([lc, expected_inbound, cc, nranks, rank, &accept_failed] {
+        // Non-blocking, so a connection that is gone between the poll and the accept cannot block the accept.
+        ::fcntl(lc->fd, F_SETFL, ::fcntl(lc->fd, F_GETFL) | O_NONBLOCK);
+        acceptor = std::thread([lc, expected_inbound, cc, nranks, rank, &ms_left, &accept_failed, &abandon] {
             std::set<int> served;
+            const auto missing = [&] {
+                std::string m;
+                for (int r = 0; r < nranks; ++ r)
+                    if (r != rank and not served.count(r)) m += (m.empty() ? "" : " ") + std::to_string(r);
+                return m;
+            };
+            int last_retried = 0;   // the last error accept retried on, named if the deadline then passes
             for (int i = 0; i < expected_inbound; ++ i) {
-                const int fd = ::accept(lc->fd, nullptr, nullptr);
-                if (fd < 0) break;
+                int fd = -1;
+                bool broken = false;
+                while (fd < 0 and not abandon.load() and ms_left() > 0) {
+                    pollfd pfd{lc->fd, POLLIN, 0};
+                    const int r = ::poll(&pfd, 1, std::min(100, ms_left()));
+                    if (r < 0 and errno == EINTR) continue;
+                    if (r < 0 or (pfd.revents & (POLLERR | POLLNVAL))) {
+                        logf("rank %d could not wait for connections (errno %d, events %#x); the connect fails", rank,
+                             r < 0 ? errno : 0, pfd.revents);
+                        broken = true;
+                        abandon = true;
+                        break;
+                    }
+                    if (r == 0) continue;
+                    fd = ::accept(lc->fd, nullptr, nullptr);
+                    // accept(2): errors already pending on the queued connection are to be treated like EAGAIN, and the
+                    // peer will dial again; only an error of this rank's own (descriptors, the socket) fails the connect.
+                    const auto retry = [](int e) {
+                        return e == EAGAIN or e == EWOULDBLOCK or e == EINTR or e == ECONNABORTED or e == ENETDOWN or
+                               e == EPROTO or e == ENOPROTOOPT or e == EHOSTDOWN or e == ENONET or e == EHOSTUNREACH or
+                               e == EOPNOTSUPP or e == ENETUNREACH;
+                    };
+                    if (fd < 0 and errno != EAGAIN and errno != EWOULDBLOCK) last_retried = errno;
+                    if (fd < 0 and not retry(errno)) {
+                        logf("rank %d could not accept a connection (errno %d); the connect fails", rank, errno);
+                        broken = true;
+                        abandon = true;
+                        break;
+                    }
+                }
+                if (fd < 0) {
+                    if (not broken and not abandon.load())
+                        logf("rank(s) %s did not connect to rank %d within %zu ms%s; the connect fails", missing().c_str(),
+                             rank, connect_timeout_ms(),
+                             last_retried ? (" (accept last retried on errno " + std::to_string(last_retried) + ")").c_str() : "");
+                    accept_failed = true;
+                    abandon = true;
+                    break;
+                }
+                // Accepted sockets do not inherit O_NONBLOCK on Linux; the receive loop needs a blocking one.
+                ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) & ~O_NONBLOCK);
                 srdsim::set_nodelay(fd);
                 // The dialler first says which rank it is, so the agent can say where a frame came from. Read
-                // under a deadline: a dialler that never writes must not hang the connect.
+                // under the deadline, and at most 10 s: a dialler that never writes must not hang the connect.
                 LinkHello hello{};
-                const bool read = read_within(fd, &hello, sizeof(hello), 10000);
-                if (not read or hello.magic != LinkHello::kMagic or hello.version != LinkHello::kVersion or
+                const ReadResult got = read_within(fd, &hello, sizeof(hello), std::min(10000, ms_left()), &abandon);
+                if (got == ReadResult::Expired and (abandon.load() or ms_left() == 0)) {
+                    if (not abandon.load())
+                        logf("rank(s) %s did not connect to rank %d within %zu ms; the connect fails", missing().c_str(),
+                             rank, connect_timeout_ms());
+                    ::close(fd);
+                    accept_failed = true;
+                    abandon = true;
+                    break;
+                }
+                if (got != ReadResult::Ok or hello.magic != LinkHello::kMagic or hello.version != LinkHello::kVersion or
                     hello.rank < 0 or hello.rank >= nranks or hello.rank == rank or served.count(hello.rank)) {
                     logf("an accepted connection did not introduce itself as a new peer of this communicator "
-                         "(read %d, magic %#x, version %u, rank %d); the connect fails", int(read), hello.magic,
+                         "(read %d, magic %#x, version %u, rank %d); the connect fails", int(got), hello.magic,
                          hello.version, hello.rank);
                     ::close(fd);
                     accept_failed = true;
+                    abandon = true;
+                    break;
+                }
+                // The acknowledgement the dialler waits for: this link is part of this rank's mesh.
+                const char ack = 1;
+                if (not srdsim::write_all(fd, &ack, 1)) {
+                    logf("could not acknowledge the link from rank %d; the connect fails", hello.rank);
+                    ::close(fd);
+                    accept_failed = true;
+                    abandon = true;
                     break;
                 }
                 served.insert(hello.rank);
@@ -3167,6 +3264,14 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
             }
         });
     }
+    // Tears down what this connect built with closeColl's teardown: the receiving threads already serving accepted links,
+    // and a peer that has finished its own connect, can already be working on `cc`.
+    const auto fail_connect = [&] {
+        abandon = true;
+        if (acceptor.joinable()) acceptor.join();
+        destroy_comm(cc);
+        return ncclSystemError;
+    };
 
     // A link to itself, over a socket pair. DeepEP puts to its own rank on the rail team -- the local
     // bypass in the dispatch kernel does exactly that -- and on real hardware a NIC loops such a write
@@ -3195,18 +3300,27 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         }
     }
 
+    // Dial and introduce this rank to every peer first, then wait for the acknowledgements, so a peer that never accepts
+    // does not keep this rank from dialling the others, which would then report this rank as missing too. An
+    // acknowledgement says the peer accepted this link, not that its own connect succeeded: with three or more ranks
+    // arriving close to the deadline apart, a rank between two late ones can succeed while one of them has failed.
+    std::vector<std::pair<int, int>> dialled;   // (peer, a copy of the link's descriptor), waiting for the acknowledgement
+    const auto close_copies = [&](size_t from) { for (size_t j = from; j < dialled.size(); ++ j) ::close(dialled[j].second); };
     for (int peer = 0; peer < nranks; ++ peer) {
         if (peer == rank) continue;
+        if (accept_failed.load()) { close_copies(0); return fail_connect(); }
         ConnHandle h{};
         std::memcpy(&h, handles[peer], sizeof(h));
-        const int fd = srdsim::dial(h.ip, h.port);
+        int why = 0;
+        const int fd = srdsim::dial_until(h.ip, h.port, deadline, &abandon, &why);
         if (fd < 0) {
-            logf("could not reach rank %d at %s:%u", peer, h.ip, static_cast<unsigned>(h.port));
-            if (acceptor.joinable()) acceptor.join();
-            // The monitor was given this comm a few lines above, so it has to be told before the delete.
-            g_stall_monitor.unwatch(cc);
-            delete cc;
-            return ncclSystemError;
+            if (why != 0)
+                logf("could not dial rank %d at %s:%u (errno %d); the connect fails", peer, h.ip,
+                     static_cast<unsigned>(h.port), why);
+            else if (not abandon.load())
+                logf("could not reach rank %d at %s:%u within %zu ms; the connect fails", peer, h.ip,
+                     static_cast<unsigned>(h.port), connect_timeout_ms());
+            { close_copies(0); return fail_connect(); }
         }
         if (cc->impair.send_buffer_bytes != 0) {
             const int bytes = static_cast<int>(std::min<uint32_t>(cc->impair.send_buffer_bytes, INT32_MAX));
@@ -3220,21 +3334,48 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
         }
         const LinkHello me{LinkHello::kMagic, LinkHello::kVersion, rank};
         if (not srdsim::write_all(fd, &me, sizeof(me))) {
-            logf("could not tell rank %d which rank this is", peer);
+            logf("could not tell rank %d which rank this is; the connect fails", peer);
             ::close(fd);
-            if (acceptor.joinable()) acceptor.join();
-            g_stall_monitor.unwatch(cc);
-            delete cc;
-            return ncclSystemError;
+            close_copies(0);
+            return fail_connect();
         }
+        // The acknowledgement is read from a copy of the descriptor: the link is in place now (a peer that has all its
+        // acknowledgements may already send here, a get request among them, whose reply goes out on this link), and a
+        // failed send would close the link's own descriptor.
+        const int ack_fd = ::dup(fd);
+        if (ack_fd < 0) {
+            logf("could not keep a descriptor for rank %d's acknowledgement (errno %d); the connect fails", peer, errno);
+            ::close(fd);
+            close_copies(0);
+            return fail_connect();
+        }
+        dialled.emplace_back(peer, ack_fd);
         cc->links.set(peer, fd);
     }
-    if (acceptor.joinable()) acceptor.join();
-    if (accept_failed) {
-        g_stall_monitor.unwatch(cc);
-        delete cc;
-        return ncclSystemError;
+    for (size_t i = 0; i < dialled.size(); ++ i) {
+        const int peer = dialled[i].first, fd = dialled[i].second;
+        char ack = 0;
+        const ReadResult got = read_within(fd, &ack, 1, ms_left(), &abandon);
+        const int read_errno = errno;
+        ::close(fd);   // the copy; the link keeps its own
+        if (got != ReadResult::Ok or ack != 1) {
+            if (got == ReadResult::Expired and not abandon.load())
+                logf("rank %d did not acknowledge the link from rank %d within %zu ms; the connect fails", peer, rank,
+                     connect_timeout_ms());
+            else if (got == ReadResult::Closed)
+                logf("rank %d closed the link from rank %d instead of acknowledging it; the connect fails", peer, rank);
+            else if (got == ReadResult::Error)
+                logf("could not read rank %d's acknowledgement of the link from rank %d (errno %d); the connect fails",
+                     peer, rank, read_errno);
+            else if (got == ReadResult::Ok)
+                logf("rank %d answered the link from rank %d with %d, not an acknowledgement; the connect fails", peer,
+                     rank, int(ack));
+            close_copies(i + 1);
+            return fail_connect();
+        }
     }
+    if (acceptor.joinable()) acceptor.join();
+    if (accept_failed) return fail_connect();
 
     *collComm = cc;
     logf("connected: rank %d of %d, mesh established", rank, nranks);
@@ -3459,16 +3600,23 @@ ncclResult_t srdsim_destroy_context(void* rmaCtx) {
     return ncclSuccess;
 }
 
+// Stops everything that works on `cc` and deletes it: closeColl's teardown, and a failed connect's.
+void destroy_comm(CollComm* cc) {
+    g_stall_monitor.unwatch(cc);   // before the delete, or the monitor reads freed memory
+#ifdef SRDSIM_WITH_CUDA
+    if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
+#endif
+    cc->responder.stop();          // before the links it sends on go
+    drop_parked(cc, nullptr);
+    cc->links.shutdown_all();      // tells every peer's agent to finish
+    if (cc->agent) cc->agent->stop();
+    delete cc;
+}
+
 ncclResult_t srdsim_close_coll(void* collComm) {
     auto* cc = static_cast<CollComm*>(collComm);
     lifecycle("communicator %p closing", collComm);
     if (cc) {
-        g_stall_monitor.unwatch(cc);   // before the delete, or the monitor reads freed memory
-#ifdef SRDSIM_WITH_CUDA
-        if (delivery_async()) drop_sends_on(cc);   // nothing may be sent on it after this
-#endif
-        cc->responder.stop();          // before the links it sends on go
-        drop_parked(cc, nullptr);
 
         if (cc->agent and cc->agent->withheld_signals() != 0)
             lifecycle("communicator %p withheld %llu signal(s) whose operation lost a placement", collComm,
@@ -3479,9 +3627,7 @@ ncclResult_t srdsim_close_coll(void* collComm) {
                   static_cast<unsigned long long>(cc->links.refused_for_budget()));
         if (const size_t r = cc->links.reserved_total())
             logf("communicator %p closing with %zu byte(s) of outbox room still reserved", collComm, r);
-        cc->links.shutdown_all();      // tells every peer's agent to finish
-        if (cc->agent) cc->agent->stop();
-        delete cc;
+        destroy_comm(cc);
     }
     return ncclSuccess;
 }

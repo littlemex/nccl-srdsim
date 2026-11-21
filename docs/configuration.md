@@ -47,6 +47,7 @@ Read once, the first time the plugin needs each, except `SRDSIM_LOCAL_IP`, which
 | `SRDSIM_PAGEABLE_STAGING` | flag | off | Stages through pageable instead of pinned host memory, and waits for every copy. A reproduction mode |
 | `SRDSIM_SIGNAL_KERNEL` | flag | off | Applies signals to device memory with a kernel launch instead of a store of the running total the plugin keeps |
 | `SRDSIM_PROGRESS_ONE_CONTEXT` | flag | off | Advances only the context NCCL passes to `rmaProgress`, instead of every context of the communicator |
+| `SRDSIM_CONNECT_TIMEOUT_MS` | count | `120000` | The deadline of `connect`, from when this rank calls it: accepting every other rank's link, dialling each (with retries) and waiting for each to acknowledge the link all give up at it, and the connect fails with the missing rank named on stderr. Ranks that reach `connect` further apart than this fail. A value above a day (86400000) gives the default |
 | `SRDSIM_LOCAL_IP` | address | the address of the default route | The address this rank publishes for its peers' connections |
 
 ## Diagnostics

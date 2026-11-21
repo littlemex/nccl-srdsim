@@ -437,6 +437,50 @@ inline int dial(const char* ip, uint16_t port, int attempts = 600) {
     return -1;
 }
 
+// The same with a deadline instead of a count of attempts, giving up early once `*cancel` is set. Each attempt connects
+// without blocking and waits in slices of at most 100 ms, so a peer whose host is gone, which answers nothing, is given
+// up at the deadline rather than after the kernel's own retries. Returns the descriptor, or -1 with `*why` set: 0 when
+// the deadline passed or `*cancel` was set, otherwise the errno of a local failure (no socket, an address that does not
+// parse) that retrying cannot cure.
+inline int dial_until(const char* ip, uint16_t port, std::chrono::steady_clock::time_point deadline,
+                      const std::atomic<bool>* cancel, int* why) {
+    ignore_sigpipe_once();
+    *why = 0;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    if (::inet_pton(AF_INET, ip, &a.sin_addr) != 1) { *why = EINVAL; return -1; }
+    const auto stopped = [&] { return (cancel and cancel->load()) or std::chrono::steady_clock::now() >= deadline; };
+    while (not stopped()) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { *why = errno; return -1; }
+        const int flags = ::fcntl(fd, F_GETFL);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        bool connected = ::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+        if (not connected and errno == EINPROGRESS) {
+            while (not stopped()) {
+                pollfd pfd{fd, POLLOUT, 0};
+                const int r = ::poll(&pfd, 1, 100);
+                if (r < 0 and errno == EINTR) continue;
+                if (r < 0) break;   // this attempt failed; the next one starts afresh
+                if (r == 0) continue;
+                int err = 0;
+                socklen_t len = sizeof(err);
+                connected = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 and err == 0;
+                break;
+            }
+        }
+        if (connected) {
+            ::fcntl(fd, F_SETFL, flags);
+            set_nodelay(fd);
+            return fd;
+        }
+        ::close(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // The receiving agent
 // ---------------------------------------------------------------------------
