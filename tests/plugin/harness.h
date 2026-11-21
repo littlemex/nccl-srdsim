@@ -377,26 +377,27 @@ struct Rank {
         // during setup would; with HARNESS_CONNECT_ABSENT_CLOSED it also closes its listening socket first, so dialling
         // it is refused. Every other rank's connect must then fail at the plugin's deadline (SRDSIM_CONNECT_TIMEOUT_MS,
         // which the case sets): not before it, not much after it, and saying why. The case ends there.
-        // With HARNESS_CONNECT_ABSENT_DUPLICATE, rank r instead connects as rank 0 of a communicator of three whose
-        // other handles are its own and rank 0's, so rank 0 receives a link that says it comes from rank 0. Rank 0's
-        // accepting then fails at once, and its connect must fail well before the deadline: one side's failure stops
-        // the other.
+        // With HARNESS_CONNECT_ABSENT_FOREIGN as well as _CLOSED, rank r, no longer listening, also dials rank 0 as rank 2
+        // of a communicator of three, a rank rank 0's communicator does not have. Rank 0's accepting fails at once while
+        // its dial to rank r is still being refused, and its connect must fail well before the deadline: the failed
+        // accepting stops the dialling.
         if (const char* absent = std::getenv("HARNESS_CONNECT_ABSENT")) {
             const int a = std::atoi(absent);
             if (a < 0 or a >= g_nranks) fail("harness", "connect-absent", "rank %d is not a rank of the case", a);
             const char* t = std::getenv("SRDSIM_CONNECT_TIMEOUT_MS");
             const long long timeout = t ? std::atoll(t) : 0;
             if (timeout <= 0 or timeout >= kRankWallMs) fail("harness", "connect-absent", "%s", "set SRDSIM_CONNECT_TIMEOUT_MS below 10 s");
-            const bool duplicate = std::getenv("HARNESS_CONNECT_ABSENT_DUPLICATE") != nullptr;
-            if (duplicate and (g_nranks != 2 or a != 1)) fail("harness", "connect-absent", "%s", "the duplicate case has two ranks, rank 1 absent");
+            const bool foreign = std::getenv("HARNESS_CONNECT_ABSENT_FOREIGN") != nullptr;
+            if (foreign and (g_nranks != 2 or a != 1 or not std::getenv("HARNESS_CONNECT_ABSENT_CLOSED")))
+                fail("harness", "connect-absent", "%s", "the foreign case has two ranks, rank 1 absent and not listening");
             if (g_rank == a) {
                 g_shared->expected_dead[a].store(1);
                 if (std::getenv("HARNESS_CONNECT_ABSENT_CLOSED")) check(rma.closeListen(listenComm), "closeListen");
-                if (duplicate) {
-                    std::thread([this, listenComm] {
-                        void* three[3] = {g_shared->handles[0], g_shared->handles[1], g_shared->handles[0]};
+                if (foreign) {
+                    std::thread([this] {
+                        void* three[3] = {g_shared->handles[0], g_shared->handles[0], g_shared->handles[0]};
                         void* c = nullptr;
-                        (void)rma.connect(ctx, three, 3, /*rank=*/0, listenComm, &c);
+                        (void)rma.connect(ctx, three, 3, /*rank=*/2, /*listenComm=*/nullptr, &c);
                     }).detach();
                 }
                 barrier("absent-ready");
@@ -414,12 +415,12 @@ struct Rank {
                 std::lock_guard<std::mutex> g(g_log_mu);
                 why = g_connect_line;
             }
-            if (duplicate) {
+            if (foreign) {
                 if (ms > timeout / 2)
                     fail("assert", "connect-absent", "the connect failed after %lld ms, though its accepting failed at once",
                          static_cast<long long>(ms));
                 if (why.find("did not introduce itself") == std::string::npos)
-                    fail("assert", "connect-absent", "the failure was not the duplicate link: '%s'", why.c_str());
+                    fail("assert", "connect-absent", "the failure was not the foreign link: '%s'", why.c_str());
                 g_shared->flag[kConnectFailedFlag].fetch_add(1);
                 kill(g_shared->pid[a], SIGKILL);
                 finish("ok");
