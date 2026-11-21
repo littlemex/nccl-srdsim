@@ -652,6 +652,11 @@ private:
         std::atomic<uint64_t> signals{0};
         std::atomic<uint64_t> bytes{0};
         std::atomic<bool> finished{false};
+        // A placement on this link was refused or could not be written. A signal that follows it on the link may
+        // belong to the same operation, and applying it would announce bytes that never landed (I1), so from then
+        // on no signal on this link is applied. This is an error path a conforming peer never takes.
+        bool placement_dropped = false;
+        uint64_t signals_withheld = 0;
     };
 
     void loop(int fd, Conn* conn) {
@@ -686,6 +691,7 @@ private:
             }
             void* const hook_user = conn->user ? conn->user : hooks_.user;
             const auto refuse_get = [&] {
+                if (h.kind == static_cast<uint32_t>(WireKind::Placement) and conn) conn->placement_dropped = true;
                 if (h.kind == static_cast<uint32_t>(WireKind::GetRequest) and hooks_.get_refused)
                     hooks_.get_refused(h.requester_rank, h.op_id, hook_user);
                 if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_failed)
@@ -869,6 +875,13 @@ private:
                     say(m);
                     refused_.fetch_add(1, std::memory_order_relaxed);
                     continue;                            // a signal carries no payload to drain
+                }
+                if (conn and conn->placement_dropped) {
+                    if (conn->signals_withheld ++ == 0)
+                        say("a placement on this link was dropped, so no later signal on it is applied: one could "
+                            "announce bytes that never landed");
+                    refused_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
                 }
                 WindowTable::Lease lease(windows_, h.window_id);
                 if (not lease.ok() or not range_fits(h.offset, sizeof(uint64_t), lease.window().bytes)) {
