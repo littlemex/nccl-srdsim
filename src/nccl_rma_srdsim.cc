@@ -3692,6 +3692,12 @@ bool from_owner(const GetRecord& rec, int peer_rank, const void* cc) {
 }
 
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user) {
+#ifdef SRDSIM_WITH_CUDA
+    // With asynchronous delivery the frame's copy into a device window has only been queued. Counting it now would let
+    // a flush complete, and the kernel read the window, before the bytes are there; so this thread's copies are
+    // waited for first. A put needs no such wait: its signal is queued on the same stream after its data.
+    delivery_idle(nullptr);
+#endif
     std::lock_guard<std::mutex> g(g_gets.mu);
     auto it = g_gets.gets.find(owner_token);
     if (it == g_gets.gets.end()) {
