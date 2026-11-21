@@ -149,7 +149,7 @@ using GetRequestFn = bool (*)(const void* src, bool src_is_device, size_t length
 // all a placement's own completion ever meant -- with the bytes it carried, so the plugin can release the
 // `iflush` request that is fencing on the get. A reply of several chunks lands as several frames.
 // `owner_token` is the opaque token the requester put in the GetRequest's `op_id`, echoed back unchanged.
-using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
+using GetResponseLandedFn = void (*)(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
 // On the owner: a get request it received could not be served (unknown window, out of range, deregistered, or
 // the get-request hook failed). `requester_rank` and `owner_token` are what a GetError back needs.
 using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, void* user);
@@ -158,8 +158,9 @@ using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, voi
 constexpr uint64_t kAllBytes = ~uint64_t{0};
 // `peer_rank` is the rank the frame came from (-1 when the link does not know it).
 using GetFailedFn = void (*)(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
-// A link closed without a Shutdown frame while this rank was not stopping: the peer went away. `peer_rank` as above.
-using LinkLostFn = void (*)(int peer_rank, void* user);
+// A link ended while this rank was not stopping: no more frames will come from `peer_rank` (as above). `clean` says
+// whether the peer sent Shutdown first; without it the peer went away.
+using LinkLostFn = void (*)(int peer_rank, bool clean, void* user);
 
 class WindowTable {
 public:
@@ -834,7 +835,7 @@ private:
                           // merely that it was sent -- the distinction `iflush`/`flushAsync` exist for.
                           if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and
                               hooks_.get_response_landed)
-                              hooks_.get_response_landed(h.op_id, h.length, conn->user ? conn->user : hooks_.user); }
+                              hooks_.get_response_landed(h.op_id, h.length, conn->peer_rank, conn->user ? conn->user : hooks_.user); }
                 else  { failed_writes_.fetch_add(1, std::memory_order_relaxed); on_dropped(); }
             } else if (h.kind == static_cast<uint32_t>(WireKind::GetRequest)) {
                 // No payload on the wire -- the requester does not have the bytes yet -- so the fetch
@@ -954,8 +955,8 @@ private:
             if (stopping_.load(std::memory_order_acquire))
                 break;
         }
-        if (not clean_shutdown and not stopping_.load(std::memory_order_acquire) and hooks_.link_lost)
-            hooks_.link_lost(conn->peer_rank, conn->user ? conn->user : hooks_.user);
+        if (not stopping_.load(std::memory_order_acquire) and hooks_.link_lost)
+            hooks_.link_lost(conn->peer_rank, clean_shutdown, conn->user ? conn->user : hooks_.user);
         if (conn) conn->finished.store(true, std::memory_order_release);
         // Out of the table before it is closed. Without this, `fds_` keeps a number the loop has already
         // closed, and a later `stop()` calls `::shutdown` on whatever the operating system has since

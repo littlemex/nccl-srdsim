@@ -726,7 +726,9 @@ void get_owner_dies(Rank& R) {
         R.wait_retired(g, "get-from-dead-owner");
         R.wait_retired(R.issue(flush(0, 1)), "flush");
         if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
-        R.teardown_alone();   // the peer it would meet at the barrier is gone
+        // A get issued after the loss fails at once.
+        R.wait_retired(R.issue(get(0, 1, remote, n, local)), "get-after-loss");
+        R.teardown(/*meet_peers=*/false);   // the peer it would meet at the barrier is gone
         R.pass();
     } else {
         wait_flag(0, "until-killed");
