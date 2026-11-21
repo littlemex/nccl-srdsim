@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # tests/gpu/recipe.sh [NRANKS] [SEEDS]
 # From the repository root on a GPU host: installs the pinned NCCL wheel into .venv, fetches the pinned
-# NCCL source for the plugin headers, builds the plugin and the GPU test, and runs tests/gpu/run.sh.
+# NCCL source for the plugin headers, builds the plugin and the two GPU tests, and runs tests/gpu/run.sh on each.
 # Every version comes from versions.env; any failing step stops the recipe.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -19,6 +19,13 @@ test "$(git -C .nccl-src rev-parse HEAD)" = "$NCCL_DEFAULT_COMMIT" \
 NCCL_SRC=$PWD/.nccl-src ./scripts/prepare_nccl_headers.sh "$PWD/.inc"
 cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_PLUGIN=ON -DNCCL_PLUGIN_INCLUDE_DIRS="$PWD/.inc/nccl"
 cmake --build build -j
-nvcc -std=c++17 -arch=native -I "$NCCL_ROOT/include" tests/gpu/gin_signal_order.cu -o build/gin_signal_order \
-    -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
-exec ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" "${1:-3}" "${2:-5}"
+for t in gin_signal_order gin_get; do
+    nvcc -std=c++17 -arch=native -I "$NCCL_ROOT/include" "tests/gpu/$t.cu" -o "build/$t" \
+        -L "$NCCL_ROOT/lib" -l:libnccl.so.2 -Xlinker -rpath -Xlinker "$NCCL_ROOT/lib"
+done
+./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_signal_order" "${1:-3}" "${2:-5}"
+# Gets are not reordered by the delivery modes (a reply is not scheduled), so two modes and the control suffice. The
+# control checks before the flush, with the receiver applying at most one frame every 200 us so that a get is still
+# landing when it looks.
+MODES="srd inorder control:srd" CONTROL_ENV="SRDSIM_APPLY_INTERVAL_US=200" \
+    ./tests/gpu/run.sh "$PWD/build/libnccl-rma-srdsim.so" "$PWD/build/gin_get" "${1:-3}" "${2:-5}"
