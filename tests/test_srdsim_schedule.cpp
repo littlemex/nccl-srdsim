@@ -790,9 +790,11 @@ void test_release_fingerprints() {
     }
 }
 
-// S13: `pick` chooses exactly what the list-building `pick_reference` would, unit by unit, in every mode and over
-// random workloads: operations of 0 to 300 chunks to three peers on two contexts, weak and strong signals, gets,
-// progress budgets from 1 to 17, and links that are full for some peers on some calls.
+// S13: `pick` (and `srd`'s release tree) chooses exactly what the list-building `pick_reference` would, unit by unit,
+// in every mode and over random workloads: operations of 0 to 300 chunks to three peers on two contexts, weak and
+// strong signals, gets, progress budgets from 1 to 17, and links that are full for some peers on some calls. On even
+// seeds the ids are not in submission order: earlier means submitted earlier, whatever the ids. The release
+// tree's indices are recounted after every call, and the workloads are long enough to compact its slots.
 void test_pick_matches_reference() {
     struct Room final : srdsim::Scheduler::Room {
         int call = 0;
@@ -801,6 +803,7 @@ void test_pick_matches_reference() {
     };
     const srdsim::Mode modes[] = {srdsim::Mode::Srd, srdsim::Mode::InOrder, srdsim::Mode::PeerSeq, srdsim::Mode::ReverseOps,
                                   srdsim::Mode::SignalLast, srdsim::Mode::DeferOne, srdsim::Mode::ViolateI1};
+    uint64_t compactions = 0;
     for (srdsim::Mode m : modes) {
         for (uint64_t seed = 1; seed <= 6; ++ seed) {
             Fabric f(4 << 20, 64);
@@ -817,10 +820,16 @@ void test_pick_matches_reference() {
             uint64_t id = 0;
             size_t units = 0;
             bool same = true;
+            // Ids for this run: 1, 2, 3, ... or, on even seeds, the same numbers shuffled.
+            std::vector<uint64_t> ids(200);
+            for (size_t i = 0; i < ids.size(); ++ i) ids[i] = i + 1;
+            if (seed % 2 == 0)
+                for (size_t i = ids.size() - 1; i > 0; -- i) std::swap(ids[i], ids[script.below(i + 1)]);
+            size_t next_id = 0;
             for (int round = 0; round < 40 and same; ++ round) {
                 const int submits = static_cast<int>(script.below(4));
-                for (int k = 0; k < submits; ++ k) {
-                    ++ id;
+                for (int k = 0; k < submits and next_id < ids.size(); ++ k) {
+                    id = ids[next_id ++];
                     const size_t chunks = script.below(4) == 0 ? script.below(300) : script.below(6);
                     srdsim::Op op = make_op(id, f, 0, chunks * 1024 - (chunks ? script.below(1000) : 0),
                                             script.below(2) ? static_cast<int>(id % 60) : -1);
@@ -855,7 +864,7 @@ void test_pick_matches_reference() {
                 br.clear();
                 fast.progress(8, &bf);
                 ref.progress(8, &br);
-                same = bf.size() == br.size();
+                same = bf.size() == br.size() and fast.consistent();
                 for (size_t j = 0; same and j < bf.size(); ++ j)
                     same = bf[j].op_id == br[j].op_id and bf[j].chunk_index == br[j].chunk_index and bf[j].kind == br[j].kind;
                 units += bf.size();
@@ -863,7 +872,74 @@ void test_pick_matches_reference() {
             expect(same and fast.idle() and ref.idle(),
                    ctx("S13 pick matches the reference: mode=%s seed=%llu after %zu units", srdsim::mode_name(m),
                        static_cast<unsigned long long>(seed), units));
+            if (m == srdsim::Mode::Srd) compactions += fast.compactions();
         }
+    }
+    expect(compactions > 0, ctx("S13 srd's workloads compacted the release tree's slots (%llu times)",
+                                static_cast<unsigned long long>(compactions)));
+}
+
+// S14: `srd` under a Room whose answer depends on the unit's size (a byte budget per peer per call, as an outbox has):
+// every unit released fits the room left when it is released, the indices stay consistent, nothing is released to a
+// peer that has no room left even for a signal, and everything drains with every byte in place.
+void test_srd_byte_budget_room() {
+    struct Budget final : srdsim::Scheduler::Room {
+        size_t budget = 0;
+        size_t used[3] = {0, 0, 0};
+        int violations = 0;
+        bool fits(int peer, size_t bytes) override { return used[peer] + bytes + 16 <= budget; }
+        void take(int peer, size_t bytes) override {
+            if (used[peer] + bytes + 16 > budget) ++ violations;
+            used[peer] += bytes + 16;
+        }
+    };
+    for (uint64_t seed = 1; seed <= 8; ++ seed) {
+        Fabric f(4 << 20, 64);
+        srdsim::Scheduler::Options o;
+        o.seed = seed;
+        o.chunk_bytes = 1024;
+        srdsim::Scheduler s(o);
+        srdsim::Rng script(seed * 104729);
+        std::vector<srdsim::Unit> batch;
+        Budget room;
+        bool consistent = true;
+        uint64_t id = 0;
+        size_t off = 0;
+        for (int round = 0; round < 300; ++ round) {
+            for (int k = static_cast<int>(script.below(3)); k > 0; -- k) {
+                const size_t bytes = script.below(4) == 0 ? 0 : 1 + script.below(6000);
+                if (off + bytes > f.src.size()) break;
+                ++ id;
+                srdsim::Op op = make_op(id, f, off, bytes, bytes == 0 or script.below(2) ? int(id % 60) : -1);
+                op.peer = static_cast<int>(script.below(3));
+                op.context = static_cast<int>(script.below(2));
+                op.signal_is_strong = script.below(4) == 0;
+                off += bytes;
+                std::string why;
+                expect(s.submit(op, &why), ctx("S14 submit: %s", why.c_str()));
+            }
+            room.budget = 500 + script.below(4000);
+            for (size_t& u : room.used) u = 0;
+            batch.clear();
+            s.progress(1 + script.below(17), &batch, &room);
+            for (const auto& u : batch) f.apply(u);
+            consistent = consistent and s.consistent();
+        }
+        for (int i = 0; i < 100'000 and not s.idle(); ++ i) {
+            room.budget = 1100;   // a whole chunk and its header always fit an empty outbox
+            for (size_t& u : room.used) u = 0;
+            batch.clear();
+            s.progress(8, &batch, &room);
+            for (const auto& u : batch) f.apply(u);
+            consistent = consistent and s.consistent();
+        }
+        expect(s.compactions() > 0, ctx("S14 the release tree's slots were compacted: seed=%llu", static_cast<unsigned long long>(seed)));
+        expect(room.violations == 0, ctx("S14 every unit fit when it was released: seed=%llu, %d did not",
+                                         static_cast<unsigned long long>(seed), room.violations));
+        expect(consistent, ctx("S14 the release tree's indices stay consistent: seed=%llu", static_cast<unsigned long long>(seed)));
+        expect(s.idle(), ctx("S14 everything drains: seed=%llu", static_cast<unsigned long long>(seed)));
+        expect(std::equal(f.dst.begin(), f.dst.begin() + static_cast<std::ptrdiff_t>(off), f.src.begin()),
+               ctx("S14 every byte arrives: seed=%llu", static_cast<unsigned long long>(seed)));
     }
 }
 
@@ -883,6 +959,7 @@ int main() {
     test_peer_seq_is_per_context();
     test_release_fingerprints();
     test_pick_matches_reference();
+    test_srd_byte_budget_room();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
