@@ -130,15 +130,19 @@ std::string env_str(const char* name, const char* dflt) {
 // while NCCL's threads run -- DeepEP calls `setenv("NCCL_ELASTIC_BUFFER_REGISTER", ...)` when it allocates a
 // buffer -- so a `getenv` on a proxy thread can read a table being reallocated and crash. Every read on a path
 // that runs repeatedly is a function-local static, read once.
-size_t env_size(const char* name, size_t dflt) {
+// A count from the environment: digits only (strtoull would accept a leading sign or space, and "-1" would wrap to a
+// very large count), greater than 0 and at most `max`; anything else gives `dflt`. The caller's errno is kept.
+size_t env_size(const char* name, size_t dflt, size_t max = SIZE_MAX) {
     const char* v = std::getenv(name);
     if (not v) return dflt;
-    // Digits only: strtoull would accept a leading sign or space, and "-1" would wrap to a very large count.
     if (*v < '0' or *v > '9') return dflt;
-    char* end = nullptr;
+    const int saved = errno;
     errno = 0;
+    char* end = nullptr;
     const unsigned long long parsed = std::strtoull(v, &end, 10);
-    return (errno == 0 and end and *end == '\0' and parsed > 0) ? static_cast<size_t>(parsed) : dflt;
+    const bool ok = errno == 0 and *end == '\0' and parsed > 0 and parsed <= max;
+    errno = saved;
+    return ok ? static_cast<size_t>(parsed) : dflt;
 }
 
 // Two switches make the plugin usable as a pure observer, to see whether an application's puts reach it
@@ -1649,7 +1653,7 @@ RecordProbe& record_probe() {
         auto* q = new RecordProbe;
         q->rec = env_size("SRDSIM_PROBE_RECORD_BYTES", 0);
         q->off = env_size("SRDSIM_PROBE_STAMP_OFFSET", 0);
-        if (q->rec != 0 and q->off + sizeof(int) > q->rec) q->rec = 0;
+        if (q->rec != 0 and (q->rec < sizeof(int) or q->off > q->rec - sizeof(int))) q->rec = 0;   // the stamp must fit
         if (q->rec != 0)
             lifecycle("record probe active: %zu-byte records, stamp at offset %zu", q->rec, q->off);
         return q;
@@ -2975,10 +2979,10 @@ public:
 
 private:
     void loop() {
-        static const int64_t quiet_ms = static_cast<int64_t>(env_size("SRDSIM_STALL_MS", 10000));
+        static const int64_t quiet_ms = static_cast<int64_t>(env_size("SRDSIM_STALL_MS", 10000, INT64_MAX));
         // How often to repeat the report while a stall persists. Often enough that a trend is visible
         // inside one run, rarely enough that the log stays readable.
-        static const int64_t kRepeatMs = static_cast<int64_t>(env_size("SRDSIM_STALL_REPEAT_MS", 5000));
+        static const int64_t kRepeatMs = static_cast<int64_t>(env_size("SRDSIM_STALL_REPEAT_MS", 5000, INT64_MAX));
         uint64_t last_total = ~0ull;
         auto last_change = std::chrono::steady_clock::now();
         bool reported = false;
