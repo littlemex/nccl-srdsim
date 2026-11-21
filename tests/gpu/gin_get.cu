@@ -40,6 +40,10 @@ struct Result {
     unsigned long long timeouts;  // blocks that gave up waiting
     int first_timeout_round;      // the round of the first block that gave up, or -1
     int first_timeout_kind;       // 1 waiting for the source to be ready, 2 for the flush, 3 for the source to be free
+    int first_wrong;              // set once the first wrong element below is recorded
+    int wrong_round, wrong_block;
+    unsigned long long wrong_index;
+    uint32_t wrong_got, wrong_want;
 };
 
 __device__ __forceinline__ uint32_t expected(int round, int owner, int block, size_t index) {
@@ -115,8 +119,15 @@ __global__ void ring(ncclDevComm comm, ncclDevResourceHandle hbuf, int rounds, s
             if (stopped()) break;
         }
         unsigned long long bad = 0;
-        for (size_t i = threadIdx.x; i < elts; i += blockDim.x)
-            if (dst[i] != expected(r, up, b, i)) ++bad;
+        for (size_t i = threadIdx.x; i < elts; i += blockDim.x) {
+            const uint32_t got = dst[i], want = expected(r, up, b, i);
+            if (got == want) continue;
+            ++bad;
+            if (atomicCAS(&result->first_wrong, 0, 1) == 0) {
+                result->wrong_round = r; result->wrong_block = b; result->wrong_index = i;
+                result->wrong_got = got; result->wrong_want = want;
+            }
+        }
         if (bad) atomicAdd(&wrong, bad);
         __syncthreads();
         if (check_early) {
@@ -212,7 +223,7 @@ int main(int argc, char** argv) {
 
     Result* result;
     CHECK_CUDA(cudaMalloc(&result, sizeof(*result)));
-    const Result init = {0, 0, -1, 0};
+    const Result init = {0, 0, -1, 0, 0, 0, 0, 0, 0, 0};
     CHECK_CUDA(cudaMemcpy(result, &init, sizeof(init), cudaMemcpyHostToDevice));
     ring<<<blocks, threads>>>(dcomm, hbuf, rounds, elts, nchunks, chunk_elts, timeout_cycles, check_early, result);
     CHECK_CUDA(cudaGetLastError());
@@ -229,6 +240,20 @@ int main(int argc, char** argv) {
     else
         std::printf("rank %d: %d rounds, %zu elements in %d gets per block%s, %llu wrong elements\n", rank, rounds, elts,
                     nchunks, check_early ? " checked before the flush" : "", host.wrong);
+    if (host.first_wrong) {
+        // What the wrong element held: the previous round's value, another block's or owner's, or something else.
+        std::printf("rank %d: the first wrong element was round %d block %d index %llu: held %#x, expected %#x",
+                    rank, host.wrong_round, host.wrong_block, host.wrong_index, host.wrong_got, host.wrong_want);
+        bool named = false;
+        for (int rr = -1; rr <= rounds and not named; ++rr)
+            for (int o = 0; o < nranks and not named; ++o)
+                for (int bb = 0; bb < blocks and not named; ++bb) {
+                    const uint32_t v = (uint32_t(rr + 1) * 0x9E3779B1u) ^ (uint32_t(o) * 0x85EBCA6Bu) ^
+                                       (uint32_t(bb) * 0xC2B2AE35u) ^ uint32_t(host.wrong_index);
+                    if (v == host.wrong_got) { std::printf(" (round %d's value of rank %d block %d)", rr, o, bb); named = true; }
+                }
+        std::printf("\n");
+    }
     if (host.timeouts) { std::fflush(stdout); std::_Exit(3); }
     CHECK_NCCL(ncclDevCommDestroy(comm, &dcomm));
     CHECK_NCCL(ncclCommFinalize(comm));
