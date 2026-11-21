@@ -7,8 +7,7 @@
 # below, in a .cc or .h file under src/ (the only place the plugin and its headers live). A read whose
 # name is not such a literal, a name assembled from an "SRDSIM_" prefix, and a quoted full name that no
 # known helper takes all fail the check instead of being guessed at. A variable counts as listed when it
-# is the first cell of a row of one of a document's tables. The check also fails once
-# impairments_from_env() has a caller, since the document then says wrongly that it is not applied.
+# is the first cell of a row of one of a document's tables.
 set -euo pipefail
 export LC_ALL=C
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,9 +32,6 @@ built=$(grep -rnE --include='*.cc' --include='*.h' '"SRDSIM_"|"SRDSIM_[A-Z0-9_]*
 # not know.
 quoted=$(grep -rhE --include='*.cc' --include='*.h' '"SRDSIM_[A-Z0-9_]+"' "$ROOT/src" \
          | grep -vE '^[[:space:]]*(//|\*)' | grep -oE '"SRDSIM_[A-Z0-9_]+"' | tr -d '"' | sort -u || true)
-# The "Not applied" section holds while impairments_from_env() has no caller in src/.
-impairment_callers=$(grep -rnE --include='*.cc' --include='*.h' '\bimpairments_from_env[[:space:]]*\(' "$ROOT/src" \
-                     | grep -vE 'inline Impairments impairments_from_env\(' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 if [ -z "$read_vars" ]; then
     echo "found no variables read; the patterns in this script no longer match" >&2
     exit 1
@@ -49,10 +45,6 @@ fi
 unread=$(comm -23 <(echo "$quoted") <(echo "$read_vars"))
 if [ -n "$unread" ]; then
     echo "names quoted in src/ that no known read helper takes:"; echo "$unread"; fail=1
-fi
-if [ -n "$impairment_callers" ]; then
-    echo "impairments_from_env() now has a caller, so the 'Not applied' section of docs/configuration.md is stale:"
-    echo "$impairment_callers"; fail=1
 fi
 for doc in "${DOCS[@]}"; do
     name=${doc#"$ROOT/"}

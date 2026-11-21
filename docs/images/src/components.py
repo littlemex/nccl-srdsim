@@ -20,10 +20,10 @@ def draw(L):
     f.text(450, 370, L.t("the headers need only the C++ standard library, and POSIX sockets for the transport",
                          "ヘッダが要るのは C++ の標準ライブラリと、トランスポートの POSIX のソケットだけ"),
            size=13, italic=True)
-    f.box(880, 250, 196, 72, "srdsim_impair.h", "neutral", L.t("impairments", "インペアメント"), size=14, dash=True)
+    f.box(880, 250, 196, 72, "srdsim_impair.h", "sim", L.t("impairments", "インペアメント"), size=14)
+    f.arrow(450, 140, 978, 248, colour="#555555")
     f.box(880, 380, 196, 50, L.t("liveness test", "liveness のテスト"), "neutral", size=13)
     f.arrow(978, 380, 978, 324, colour="#555555", dash=True)
-    f.text(978, 232, L.t("not used by the plugin", "プラグインは使わない"), size=12, color="#555555")
     ext = [(L.t("NCCL plugin headers", "NCCL のプラグインのヘッダ"), False),
            (L.t("CUDA driver, NVRTC", "CUDA ドライバ、NVRTC"), True),
            (L.t("GDRCopy", "GDRCopy"), True)]

@@ -45,11 +45,11 @@ def draw(L):
          ["DRY_RUN", "SNAPSHOT_SOURCE", L.t("(at submit)", "(投入時)")], "sig")
     note(4, False, L.t("Negative controls", "ネガティブコントロール"),
          ["CORRUPT_EVERY", "DROP_EVERY", L.t("(device writes)", "(デバイスへの書き込み)")], "sig")
-    # Not applied: parsed, never used.
-    f.box(cx[1] - w / 2, 370, w * 2 + gap, 170, L.t("Not applied (#18)", "効いていない (#18)"), "neutral",
+    # Impairments: read at connect, applied on the send and receive sides.
+    f.box(cx[1] - w / 2, 370, w * 2 + gap, 170, L.t("Impairments", "インペアメント"), "neutral",
           ["DELAY_US_MIN, DELAY_US_MAX", "BURST, BURST_PAUSE_US", "APPLY_INTERVAL_US, SEND_BUFFER_BYTES",
            "FREEZE_PEER, FREEZE_AFTER_UNITS, FREEZE_MS", "SIGNAL_LAG_US",
-           L.t("(parsed, but nothing uses them)", "(読み込まれるが、使われない)")], dash=True, size=14, pattern=False)
+           L.t("(read at connect, slow the fabric on purpose)", "(接続時に読み、わざと遅くする)")], size=14, pattern=False)
     f.box(cx[3] - w / 2, 370, w, 170, L.t("Diagnostics", "診断"), "neutral",
           [L.t("logs, probes,", "ログ、プローブ、"), L.t("stall monitor,", "停止の監視、"),
            L.t("crash handler", "クラッシュハンドラ"), L.t("(whole path)", "(通り道全体)")], size=14, pattern=False)
