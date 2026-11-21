@@ -745,7 +745,8 @@ void get_owner_dies(Rank& R) {
 // and once the landed prefix has stopped growing (everything the owner's kernel had already sent has been applied)
 // the rest of the reply is known to be in the owner's own outbox; the owner is then killed. The get must fail rather
 // than wait for ever or complete: it retires, queryLastError reports it, and after a further wait the bytes that landed
-// are still exactly that prefix, with nothing written after it or past the destination.
+// are still exactly that prefix, with nothing written after it or past the destination. Because the case settles before
+// the kill, no whole frame is in flight then, so it does not cover frames received but applied after the get retired.
 void get_owner_dies_mid_reply(Rank& R) {
     constexpr size_t n = 6u << 20, frame = 8192, remote = 7, local = kGuard;
     if (g_rank == 1) fill(R.at(remote), n, 1, 29);
@@ -766,15 +767,19 @@ void get_owner_dies_mid_reply(Rank& R) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             if (const size_t now = prefix(); now != before) { before = now; still = Clock::now(); }
         }
-        if (before == n) fail("harness", "precondition", "%s", "the whole reply landed before the owner was stopped");
+        if (before == n) fail("harness", "precondition", "%s", "the owner had already sent the whole reply when it was stopped");
         g_shared->expected_dead[1].store(1);
         if (kill(g_shared->pid[1], SIGKILL) != 0) fail("harness", "kill", "errno %d", errno);
         R.wait_retired(g, "get-from-dead-owner");
         if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
+        // A prefix that grew after the settle means the settle was too short (a starved receive thread), not a plugin
+        // fault, so it is reported as the harness's.
+        const size_t at_retire = prefix();
+        if (at_retire != before) fail("harness", "settle", "%zu bytes when the owner was killed, %zu when the get retired", before, at_retire);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));   // fifty apply intervals: nothing more may land
         const size_t after = prefix();
-        if (after != before)
-            fail("assert", "prefix", "%zu bytes had landed when the owner was killed and %zu after the get retired", before, after);
+        if (after != at_retire)
+            fail("assert", "prefix", "%zu bytes had landed when the get retired and %zu after", at_retire, after);
         if (size_t bad = nonzero(R.at(local + after), n - after))
             fail("assert", "past-the-prefix", "%zu bytes written after the landed frames", bad);
         expect_guards(R, local, n);
