@@ -10,7 +10,7 @@ def draw(L):
     steps = [
         ("nccl", L.t("Submit", "投入"), [L.t("iputSignal returns", "iputSignal がすぐ"), L.t("at once", "戻る")]),
         ("sim", L.t("Split", "分割"), [L.t("8 KiB placements", "8 KiB の配置"), L.t("+ 1 signal unit", "+ シグナル 1 つ")]),
-        ("sim", L.t("Release", "リリース"), [L.t("rmaProgress pulls", "rmaProgress が"), L.t("64 per plugin", "プラグインの"), L.t("context", "コンテキストごと 64 個")]),
+        ("sim", L.t("Release", "リリース"), [L.t("rmaProgress pulls", "rmaProgress が"), L.t("up to 4 MiB", "1 回に"), L.t("per call", "4 MiB まで")]),
         ("wire", L.t("Send", "送信"), [L.t("in release order", "リリースした順に"), L.t("to the target", "宛先ランクの接続へ")]),
         ("target", L.t("Apply", "反映"), [L.t("the target writes", "宛先ランクが自分の"), L.t("its own memory", "メモリに書く")]),
         ("nccl", L.t("Complete", "完了"), [L.t("test: source reusable", "test: 送り元を再利用可"),

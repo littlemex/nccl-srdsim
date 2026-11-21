@@ -4085,12 +4085,13 @@ void send_parked_of(CollComm* cc, const RmaCtx* owner) {
     for (const auto& p : failures) note_send_failure(p.owner, p.u);
 }
 
-// The most units one `rmaProgress` call releases from each plugin context. NCCL's proxy tests every outstanding request
-// between progress calls, so the number released per call sets how many such sweeps an operation waits for: at 8, a
-// burst of 4096 small puts with signals ran at 14,000 puts per second on an 8-core host, and at 64 at 560,000. Larger
-// values gave no more (`bench_plugin`); with no limit, 1 MiB puts ran at a quarter of the rate, a whole outbox of chunks
-// being queued in one call before any of it was sent.
-constexpr size_t kReleasePerCall = 64;
+// The most payload one `rmaProgress` call releases, over every plugin context of the communicator; a unit is always
+// released when it is the first of the call, so a chunk larger than this still goes. NCCL's proxy submits up to a batch
+// of operations per target in each pass of its loop and tests every outstanding request between progress calls, so a
+// call that releases less than a pass submits leaves a queue that grows, and every pass then tests all of it. A limit by
+// bytes keeps pace with a pass whatever the operations' sizes; it stops one call from filling a whole outbox before any
+// of it is pushed.
+constexpr size_t kReleaseBytesPerCall = 4u << 20;
 
 ncclResult_t srdsim_progress(void* rmaCtx) {
     Mark mark("rmaProgress");
@@ -4147,9 +4148,12 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         CollComm* cc = nullptr;
         std::set<std::pair<CollComm*, int>>* held = nullptr;   // peers already counted as held in this call
         std::map<int, size_t> granted;   // reserved and not yet taken
+        size_t* bytes_left = nullptr;    // of `kReleaseBytesPerCall`, shared by the call's contexts
+        bool* released_any = nullptr;    // whether the call released a unit yet
         std::set<int> full;
         std::set<int> held_by_freeze;   // the frozen-link impairment, apart from a full outbox
         bool fits(int peer, size_t bytes) override {
+            if (*released_any and bytes > *bytes_left) return false;
             if (links == nullptr) return true;
             if (full.count(peer)) return false;
             if (cc and frozen(peer)) { held_by_freeze.insert(peer); return false; }
@@ -4173,6 +4177,8 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             return frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{};
         }
         void take(int peer, size_t bytes) override {
+            *released_any = true;
+            *bytes_left -= std::min(*bytes_left, bytes);
             size_t& have = granted[peer];
             have -= std::min(have, sizeof(srdsim::WireHeader) + bytes);
         }
@@ -4181,6 +4187,15 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         }
     };
     std::set<std::pair<CollComm*, int>> held;
+    size_t bytes_left = kReleaseBytesPerCall;
+    bool released_any = false;
+    // The call's payload is shared by the contexts, so the one advanced first changes from call to call; otherwise the
+    // first could take all of it every call while the others wait.
+    static std::atomic<uint64_t> rotation{0};
+    if (to_advance.size() > 1)
+        std::rotate(to_advance.begin(),
+                    to_advance.begin() + static_cast<std::ptrdiff_t>(rotation.fetch_add(1) % to_advance.size()),
+                    to_advance.end());
     for (RmaCtx* c : to_advance) {
         if (c == nullptr or c->sched == nullptr) continue;
         const size_t before = batch.size();
@@ -4190,7 +4205,9 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
             room.links = c->coll ? &c->coll->links : nullptr;
             room.cc = c->coll;
             room.held = &held;
-            c->sched->progress(kReleasePerCall, &batch, &room);
+            room.bytes_left = &bytes_left;
+            room.released_any = &released_any;
+            c->sched->progress(SIZE_MAX, &batch, &room);
         }
         owners.resize(batch.size(), c);
         c->progress_calls.fetch_add(1, std::memory_order_relaxed);

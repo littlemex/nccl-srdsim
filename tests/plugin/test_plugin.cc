@@ -129,7 +129,9 @@ void weak_signal_control(Rank& R) { put_then_signal(R, false, 2); }
 // Run with the put on context 0 and the signal on 1, and the other way round, so neither entry point's context
 // can be dropped without a failure.
 void strong_signal_other_context(Rank& R, int put_ctx, int sig_ctx) {
-    constexpr size_t n = (1 << 20) - 256 + 13, src = 4099, dst = (1 << 20) + kGuard;
+    // Larger than one progress call releases (4 MiB of payload), so the put still has chunks to release when the
+    // signal is submitted.
+    constexpr size_t n = (5 << 20) + 13, src = 4099, dst = (1 << 20) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 19);
         // The put is submitted in one proxy iteration and the signal in the next, so the put is the earlier
