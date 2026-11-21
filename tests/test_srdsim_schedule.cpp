@@ -909,7 +909,8 @@ void test_srd_byte_budget_room() {
             for (int k = static_cast<int>(script.below(3)); k > 0; -- k) {
                 const size_t bytes = script.below(4) == 0 ? 0 : 1 + script.below(6000);
                 if (off + bytes > f.src.size()) break;
-                srdsim::Op op = make_op(++ id, f, off, bytes, bytes == 0 or script.below(2) ? int(id % 60) : -1);
+                ++ id;
+                srdsim::Op op = make_op(id, f, off, bytes, bytes == 0 or script.below(2) ? int(id % 60) : -1);
                 op.peer = static_cast<int>(script.below(3));
                 op.context = static_cast<int>(script.below(2));
                 op.signal_is_strong = script.below(4) == 0;
