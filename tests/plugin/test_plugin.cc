@@ -711,6 +711,27 @@ void impaired_signal_lag(Rank& R) {
     });
 }
 
+// The owner of a get dies (SIGKILL) while the get is outstanding: the link from it closes without a Shutdown, and
+// the get fails instead of waiting for ever; a flush after it completes and queryLastError reports the failure.
+// The requester then ends without teardown, since its peer is gone.
+void get_owner_dies(Rank& R) {
+    constexpr size_t n = (64 << 10) + 13, remote = (256 << 10) + 7, local = (1200 << 10) + kGuard;
+    barrier("ready");
+    if (g_rank == 0) {
+        stop_peer(1);
+        const Ticket* g = R.issue(get(0, 1, remote, n, local));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        g_shared->expected_dead[1].store(1);
+        kill(g_shared->pid[1], SIGKILL);
+        R.wait_retired(g, "get-from-dead-owner");
+        R.wait_retired(R.issue(flush(0, 1)), "flush");
+        if (not R.last_error()) fail("assert", "loss-reported", "%s", "queryLastError reports nothing");
+        finish("ok");   // no teardown: the peer it would meet at the barrier is gone
+    } else {
+        wait_flag(0, "until-killed");
+    }
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -761,6 +782,7 @@ const std::vector<Scenario>& scenarios() {
          "SRDSIM_FREEZE_PEER=1 SRDSIM_FREEZE_AFTER_UNITS=4 SRDSIM_FREEZE_MS=500 SRDSIM_CHUNK_BYTES=8192"},
         {"impaired_apply_interval", impaired_apply_interval, 2, {"srd"}, {1}, "SRDSIM_APPLY_INTERVAL_US=5000 SRDSIM_CHUNK_BYTES=8192"},
         {"impaired_signal_lag", impaired_signal_lag, 2, {"srd"}, {1}, "SRDSIM_SIGNAL_LAG_US=200000 SRDSIM_CHUNK_BYTES=8192"},
+        {"get_owner_dies", get_owner_dies, 2, {"srd"}, {1}, nullptr},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;
@@ -850,6 +872,7 @@ Result run_case(const std::string& plugin, int table, const Scenario& sc, const 
             std::string s = shared->status[r];
             const bool clean = WIFEXITED(st) and WEXITSTATUS(st) == 0;
             if (s == "ok" and not clean) s = "exit:after-ok status " + std::to_string(st);
+            if (s.empty() and WIFSIGNALED(st) and WTERMSIG(st) == SIGKILL and shared->expected_dead[r].load()) s = "ok";
             if (s.empty()) s = WIFSIGNALED(st) ? "crash:signal " + std::to_string(WTERMSIG(st))
                                                : "exit:no-status code " + std::to_string(WEXITSTATUS(st));
             if (s != "ok" and result.status == "ok") {
