@@ -3893,9 +3893,9 @@ bool park_if_delayed(CollComm* cc, const srdsim::Unit& u, RmaCtx* owner) {
 // Sends every held unit that is due (or every one, with `all`), in order per peer, but nothing to a peer while it
 // is frozen. Returns how many failed to send.
 size_t send_due_parked(CollComm* cc, bool all = false) {
-    size_t failed = 0;
+    std::vector<CollComm::Parked> failures;   // reported after `parked_mu` is released: reporting takes the context's lock
     const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> g(cc->parked_mu);
+    std::unique_lock<std::mutex> g(cc->parked_mu);
     for (auto& [peer, q] : cc->parked) {
         if (not all and frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{}) continue;
         while (not q.empty() and (all or q.front().due <= now)) {
@@ -3906,11 +3906,12 @@ size_t send_due_parked(CollComm* cc, bool all = false) {
             if (it != cc->parked_ops.end() and -- it->second == 0) cc->parked_ops.erase(it);
             if (send_unit(cc, p.u, p.owner)) { note_sent_for_freeze_locked(cc, peer); continue; }
             release_reservation(cc, p.u);
-            ++ failed;
-            note_send_failure(p.owner, p.u);
+            failures.push_back(p);
         }
     }
-    return failed;
+    g.unlock();
+    for (const auto& p : failures) note_send_failure(p.owner, p.u);
+    return failures.size();
 }
 
 // Whether a unit of operation `op_id` (or, with op_id 0, of any operation) of `owner` is still held back.
@@ -3931,7 +3932,8 @@ void drop_parked(CollComm* cc, const RmaCtx* owner) {
 // Sends, at once and in order, every held unit of `owner`. The units ahead of one of them to the same peer go too,
 // so a link's order is kept.
 void send_parked_of(CollComm* cc, const RmaCtx* owner) {
-    std::lock_guard<std::mutex> g(cc->parked_mu);
+    std::vector<CollComm::Parked> failures;
+    std::unique_lock<std::mutex> g(cc->parked_mu);
     for (auto& [peer, q] : cc->parked) {
         size_t last = 0;
         bool any = false;
@@ -3942,9 +3944,11 @@ void send_parked_of(CollComm* cc, const RmaCtx* owner) {
             q.pop_front();
             auto it = cc->parked_ops.find({p.owner, p.u.op_id});
             if (it != cc->parked_ops.end() and -- it->second == 0) cc->parked_ops.erase(it);
-            if (not send_unit(cc, p.u, p.owner)) { release_reservation(cc, p.u); note_send_failure(p.owner, p.u); }
+            if (not send_unit(cc, p.u, p.owner)) { release_reservation(cc, p.u); failures.push_back(p); }
         }
     }
+    g.unlock();
+    for (const auto& p : failures) note_send_failure(p.owner, p.u);
 }
 
 ncclResult_t srdsim_progress(void* rmaCtx) {
@@ -4023,6 +4027,7 @@ ncclResult_t srdsim_progress(void* rmaCtx) {
         // The frozen-link impairment: after `freeze_after_units` units to `freeze_peer`, nothing more is released to
         // it for `freeze_ms`, as if the link had stalled.
         bool frozen(int peer) {
+            if (cc->impair.freeze_peer != peer or cc->impair.freeze_ms == 0) return false;   // no lock when unset
             std::lock_guard<std::mutex> g(cc->parked_mu);
             return frozen_until_locked(cc, peer) != std::chrono::steady_clock::time_point{};
         }
