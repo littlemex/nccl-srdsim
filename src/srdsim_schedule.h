@@ -304,7 +304,6 @@ public:
         fw_append();
         pending_ids_.insert(op.id);
         ++ live_count_;
-        peer_slots_[op.peer].insert(slot);
         key_slots_[std::make_pair(op.context, op.peer)].insert(slot);
         refresh(slot);
         return true;
@@ -409,7 +408,6 @@ public:
         size_t live = 0, dead = 0;
         std::map<int, int64_t> peer_w;
         std::map<int, std::multiset<size_t>> units;
-        std::map<int, std::set<size_t>> peers;
         std::map<std::pair<int, int>, std::set<size_t>> keys;
         int64_t total = 0;
         for (size_t i = 0; i < pending_.size(); ++ i) {
@@ -425,7 +423,6 @@ public:
                         if (q.live and q.op.peer == p.op.peer and q.op.context == p.op.context) sig = false;
                     }
                 w = p.remaining + (sig ? 1 : 0);
-                peers[p.op.peer].insert(i);
                 keys[std::make_pair(p.op.context, p.op.peer)].insert(i);
                 if (const size_t u = unit_of(p)) units[p.op.peer].insert(u);
                 if (w) peer_w[p.op.peer] += w;
@@ -444,7 +441,9 @@ public:
         }
         std::map<int, int64_t> kept_w;
         for (const auto& e : peer_weight_) if (e.second) kept_w.insert(e);
-        return peers == peer_slots_ and keys == key_slots_ and units == peer_units_ and peer_w == kept_w and ex_.empty() and
+        size_t first = 0;
+        while (first < pending_.size() and not pending_[first].live) ++ first;
+        return first == first_live_ and keys == key_slots_ and units == peer_units_ and peer_w == kept_w and ex_.empty() and
                excluded_.empty();
     }
 
@@ -598,7 +597,7 @@ private:
         // one found for them. `peer-seq` needs that per context and peer rather than globally.
         std::map<std::pair<int, int>, size_t> oldest_for_peer;
         if (opt_.mode == Mode::PeerSeq)
-            for (size_t i = 0; i < pending_.size(); ++ i)
+            for (size_t i = first_live_; i < pending_.size(); ++ i)
                 if (pending_[i].live) oldest_for_peer.emplace(std::make_pair(pending_[i].op.context, pending_[i].op.peer), i);
 
         // `defer-one` holds the oldest operation back. Which one is held has to be decided once and
@@ -628,7 +627,7 @@ private:
         std::vector<Avail>& avail = avail_scratch_;
         avail.clear();
         size_t total = 0;
-        for (size_t i = 0; i < pending_.size(); ++ i) {
+        for (size_t i = first_live_; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
             if (not p.live) continue;
             if (opt_.mode == Mode::PeerSeq and oldest_for_peer[std::make_pair(p.op.context, p.op.peer)] != i)
@@ -660,7 +659,7 @@ private:
             if (opt_.mode == Mode::DeferOne and have_deferred_ and not skipped_for_room) {
                 have_deferred_ = false;
                 deferred_id_ = 0;
-                for (size_t i = 0; i < pending_.size(); ++ i) {
+                for (size_t i = first_live_; i < pending_.size(); ++ i) {
                     const Pending& p = pending_[i];
                     if (not p.live or not has_room(p)) continue;
                     if (p.remaining > 0) return {static_cast<int>(i), p.kth_unplaced(0)};
@@ -707,7 +706,7 @@ private:
         // one found for them. `peer-seq` needs that per context and peer rather than globally.
         std::map<std::pair<int, int>, size_t> oldest_for_peer;
         if (opt_.mode == Mode::PeerSeq)
-            for (size_t i = 0; i < pending_.size(); ++ i)
+            for (size_t i = first_live_; i < pending_.size(); ++ i)
                 if (pending_[i].live) oldest_for_peer.emplace(std::make_pair(pending_[i].op.context, pending_[i].op.peer), i);
 
         // `defer-one` holds the oldest operation back. Which one is held has to be decided once and
@@ -730,7 +729,7 @@ private:
                 if (p.live and p.remaining != 0 and has_room(p)) { any_placement_left = true; break; }
         bool skipped_for_room = false;
 
-        for (size_t i = 0; i < pending_.size(); ++ i) {
+        for (size_t i = first_live_; i < pending_.size(); ++ i) {
             const Pending& p = pending_[i];
             if (not p.live) continue;
             if (opt_.mode == Mode::PeerSeq and oldest_for_peer[std::make_pair(p.op.context, p.op.peer)] != i)
@@ -760,7 +759,7 @@ private:
             if (opt_.mode == Mode::DeferOne and have_deferred_ and not skipped_for_room) {
                 have_deferred_ = false;
                 deferred_id_ = 0;
-                for (size_t i = 0; i < pending_.size(); ++ i) {
+                for (size_t i = first_live_; i < pending_.size(); ++ i) {
                     const Pending& p = pending_[i];
                     if (not p.live or not has_room(p)) continue;
                     for (int c = 0; c < p.chunk_count; ++ c)
@@ -813,7 +812,7 @@ private:
         -- live_count_;
         ++ dead_count_;
         refresh(i);
-        remove_slot(peer_slots_, p.op.peer, i);
+        while (first_live_ < pending_.size() and not pending_[first_live_].live) ++ first_live_;
         const auto key = std::make_pair(p.op.context, p.op.peer);
         auto ks = key_slots_.find(key);
         const bool was_oldest = ks != key_slots_.end() and *ks->second.begin() == i;
@@ -909,12 +908,6 @@ private:
             if (j <= w.size()) t[j] += t[i];
         }
     }
-    static void remove_slot(std::map<int, std::set<size_t>>& m, int k, size_t i) {
-        auto it = m.find(k);
-        if (it == m.end()) return;
-        it->second.erase(i);
-        if (it->second.empty()) m.erase(it);
-    }
     void clear_excluded() {
         excluded_.clear();
         ex_.clear();
@@ -931,14 +924,13 @@ private:
         for (Pending& p : pending_) if (p.live) kept.push_back(std::move(p));
         pending_ = std::move(kept);
         dead_count_ = 0;
-        peer_slots_.clear();
+        first_live_ = 0;
         key_slots_.clear();
         peer_units_.clear();
         peer_weight_.clear();
         for (size_t i = 0; i < pending_.size(); ++ i) {
             Pending& p = pending_[i];
             p.in_units = false;
-            peer_slots_[p.op.peer].insert(i);
             key_slots_[std::make_pair(p.op.context, p.op.peer)].insert(i);
         }
         weight_.assign(pending_.size(), 0);
@@ -1001,7 +993,7 @@ private:
     std::vector<Pending> pending_;               // in submission order; a slot no longer live waits for `compact`
     std::unordered_set<uint64_t> pending_ids_;   // the ids of the live operations, for `complete` and the duplicate check
     size_t live_count_ = 0, dead_count_ = 0;
-    std::map<int, std::set<size_t>> peer_slots_;                    // live slots per peer
+    size_t first_live_ = 0;                                         // no slot before it is live
     std::map<int, int64_t> peer_weight_;                            // per peer with any: the sum of its slots' weights
     std::map<int, std::multiset<size_t>> peer_units_;               // per peer: `unit_of` each live slot, where not 0
     std::map<std::pair<int, int>, std::set<size_t>> key_slots_;     // live slots per (context, peer), oldest first

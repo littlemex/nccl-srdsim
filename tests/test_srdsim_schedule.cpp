@@ -872,10 +872,10 @@ void test_pick_matches_reference() {
             expect(same and fast.idle() and ref.idle(),
                    ctx("S13 pick matches the reference: mode=%s seed=%llu after %zu units", srdsim::mode_name(m),
                        static_cast<unsigned long long>(seed), units));
-            compactions += fast.compactions();
+            if (m == srdsim::Mode::Srd) compactions += fast.compactions();
         }
     }
-    expect(compactions > 0, ctx("S13 the workloads compacted the release tree's slots (%llu times)",
+    expect(compactions > 0, ctx("S13 srd's workloads compacted the release tree's slots (%llu times)",
                                 static_cast<unsigned long long>(compactions)));
 }
 
@@ -932,6 +932,7 @@ void test_srd_byte_budget_room() {
             for (const auto& u : batch) f.apply(u);
             consistent = consistent and s.consistent();
         }
+        expect(s.compactions() > 0, ctx("S14 the release tree's slots were compacted: seed=%llu", static_cast<unsigned long long>(seed)));
         expect(room.violations == 0, ctx("S14 every unit fit when it was released: seed=%llu, %d did not",
                                          static_cast<unsigned long long>(seed), room.violations));
         expect(consistent, ctx("S14 the release tree's indices stay consistent: seed=%llu", static_cast<unsigned long long>(seed)));
