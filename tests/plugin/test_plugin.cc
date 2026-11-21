@@ -638,7 +638,9 @@ void signal_after_dropped_placement(Rank& R) {
     constexpr size_t n = (16 << 10) + 13, src = 4099, good = (512 << 10) + kGuard;
     if (g_rank == 0) {
         fill(R.at(src), n, 0, 24);
-        R.wait_retired(R.issue(put_signal(0, 1, src, n, kDataBytes - 100, 10, false)), "bad-put-with-signal");
+        Op bad = put_signal(0, 1, src, n, kDataBytes - 100, 10, false);
+        bad.keep_source = true;   // the good put after it reads the same source
+        R.wait_retired(R.issue(bad), "bad-put-with-signal");
         R.wait_retired(R.issue(put(0, 1, src, n, good)), "good-put");
     } else {
         R.wait_peer([&] { return mismatches(R.at(good), n, 0, 24) == 0; }, "good-put-data");
