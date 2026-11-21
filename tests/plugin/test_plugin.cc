@@ -650,6 +650,14 @@ void signal_after_dropped_placement(Rank& R) {
     }
 }
 
+// A negative count in the environment gives the default rather than wrapping to a very large number.
+void negative_count_is_default(Rank& R) {
+    (void)R;
+    std::lock_guard<std::mutex> g(g_log_mu);
+    if (g_init_line.find("chunk_bytes=8192 ") == std::string::npos)
+        fail("assert", "negative-count", "SRDSIM_CHUNK_BYTES=-4096 gave '%s'", g_init_line.c_str());
+}
+
 struct Scenario {
     const char* name;
     void (*run)(Rank&);
@@ -692,6 +700,9 @@ const std::vector<Scenario>& scenarios() {
         {"large_chunk", large_chunk, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=5242880"},
         {"get_refused_by_owner", get_refused_by_owner, 2, {"srd"}, {1}, nullptr},
         {"signal_after_dropped_placement", signal_after_dropped_placement, 2, {"inorder"}, {1}, nullptr},
+        {"negative_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=-4096"},
+        {"plus_sign_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=+4096"},
+        {"overflowing_count_is_default", negative_count_is_default, 2, {"srd"}, {1}, "SRDSIM_CHUNK_BYTES=99999999999999999999"},
         {"dry_run", dry_run, 2, {"srd"}, {1}, "SRDSIM_DRY_RUN=1"},
     };
     return s;

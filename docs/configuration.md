@@ -16,7 +16,7 @@ The plugin reads each setting at one of four moments, so a value set after that 
 
 | Type | Accepted | Anything else |
 |---|---|---|
-| count | A decimal integer greater than 0 | Empty, `0`, or anything that is not a whole decimal number (`8k`, `0x2000`, `true`, a trailing space) gives the default. A leading `-` is accepted by the parser and wraps to a very large number, so do not use negative values |
+| count | A decimal integer greater than 0 | Empty, `0`, a sign or a leading space (`-1`, `+8`), a value too large for 64 bits, or anything that is not a whole decimal number (`8k`, `0x2000`, `true`, a trailing space) gives the default |
 | flag | A count: on for any positive integer | As for a count, so `0` and the empty string mean off, and so do `true` and `yes` |
 | name | One of the names in the row | Any other value gives the default; the plugin logs it where the row says so |
 | address | An IPv4 address, published as given | Not validated |
