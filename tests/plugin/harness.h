@@ -160,6 +160,7 @@ inline void set_flag(int i) { g_shared->flag[i].store(1, std::memory_order_relea
 inline std::mutex g_log_mu;
 inline std::string g_init_line;
 inline std::string g_poison_line;
+inline std::string g_connect_line;   // the first line saying why a connect fails
 inline std::string g_unclean_line;    // the plugin logged a link that closed without a shutdown     // the plugin reported a CUDA error or stopped asynchronous delivery
 inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int, const char* fmt, ...) {
     char buf[512];
@@ -170,6 +171,7 @@ inline void plugin_log(ncclDebugLogLevel level, unsigned long, const char*, int,
     std::lock_guard<std::mutex> g(g_log_mu);
     if (std::strncmp(buf, "SRD simulator: ", 15) == 0) g_init_line = buf;
     if (g_unclean_line.empty() and std::strstr(buf, "closed without a shutdown")) g_unclean_line = buf;
+    if (g_connect_line.empty() and std::strstr(buf, "the connect fails")) g_connect_line = buf;
     if (g_poison_line.empty() and (std::strstr(buf, "FIRST CUDA ERROR") or std::strstr(buf, "asynchronous delivery stopped") or
                                    std::strstr(buf, "outbox room still reserved")))
         g_poison_line = buf;
@@ -370,22 +372,50 @@ struct Rank {
         barrier("handles published");
         void* handles[kMaxRanks];
         for (int r = 0; r < g_nranks; ++ r) handles[r] = g_shared->handles[r];
-        // HARNESS_CONNECT_ABSENT=r: rank r publishes its handle and listens but never calls connect, as a peer that
-        // stalls or dies during setup would. Every other rank's connect must then fail within the plugin's deadline
-        // (SRDSIM_CONNECT_TIMEOUT_MS) rather than wait for it; the case ends there.
+        // HARNESS_CONNECT_ABSENT=r: rank r publishes its handle but never calls connect, as a peer that stalls or dies
+        // during setup would; with HARNESS_CONNECT_ABSENT_CLOSED it also closes its listening socket first, so dialling
+        // it is refused. Every other rank's connect must then fail at the plugin's deadline (SRDSIM_CONNECT_TIMEOUT_MS,
+        // which the case sets): not before it, not much after it, and saying why. The case ends there.
         if (const char* absent = std::getenv("HARNESS_CONNECT_ABSENT")) {
             const int a = std::atoi(absent);
+            if (a < 0 or a >= g_nranks) fail("harness", "connect-absent", "rank %d is not a rank of the case", a);
+            const char* t = std::getenv("SRDSIM_CONNECT_TIMEOUT_MS");
+            const long long timeout = t ? std::atoll(t) : 0;
+            if (timeout <= 0 or timeout >= kRankWallMs) fail("harness", "connect-absent", "%s", "set SRDSIM_CONNECT_TIMEOUT_MS below 10 s");
             if (g_rank == a) {
                 g_shared->expected_dead[a].store(1);
+                if (std::getenv("HARNESS_CONNECT_ABSENT_CLOSED")) check(rma.closeListen(listenComm), "closeListen");
+                barrier("absent-ready");
                 set_where("absent");
                 pause_forever();
             }
+            barrier("absent-ready");
             const auto start = Clock::now();
             const ncclResult_t rc = rma.connect(ctx, handles, g_nranks, g_rank, listenComm, &coll);
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
             if (rc == ncclSuccess) fail("assert", "connect-absent", "connected although rank %d never called connect", a);
-            if (ms > kRankWallMs) fail("assert", "connect-absent", "the connect took %lld ms to fail", static_cast<long long>(ms));
-            kill(g_shared->pid[a], SIGKILL);
+            if (ms < timeout or ms > timeout + 1500)
+                fail("assert", "connect-absent", "the connect failed after %lld ms, against a deadline of %lld ms",
+                     static_cast<long long>(ms), timeout);
+            std::string why;
+            {
+                std::lock_guard<std::mutex> g(g_log_mu);
+                why = g_connect_line;
+            }
+            const std::string name = "rank " + std::to_string(a);
+            const std::string names = "rank(s) " + std::to_string(a) + " did";
+            if (why.find(names) == std::string::npos and why.find(name + " did not acknowledge") == std::string::npos and
+                why.find("could not reach " + name) == std::string::npos)
+                fail("assert", "connect-absent", "the failure did not name rank %d alone: '%s'", a, why.c_str());
+            // The other survivors may still be in their own connect; the absent rank goes once they are all done.
+            g_shared->flag[15].fetch_add(1);
+            if (g_rank == (a == 0 ? 1 : 0)) {
+                set_where("connects-failed");
+                const auto wait_start = Clock::now();
+                while (g_shared->flag[15].load() < g_nranks - 1 and Clock::now() - wait_start < std::chrono::milliseconds(kRankWallMs))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                kill(g_shared->pid[a], SIGKILL);
+            }
             finish("ok");
         }
         check(rma.connect(ctx, handles, g_nranks, g_rank, listenComm, &coll), "connect");
