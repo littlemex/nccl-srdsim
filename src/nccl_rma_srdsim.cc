@@ -1391,7 +1391,8 @@ bool srdsim_handle_get_request(const void* src, bool src_is_device, size_t lengt
                                uint64_t owner_token, void* user);
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, void* user);
 void srdsim_handle_get_refused(uint32_t requester_rank, uint64_t owner_token, void* user);
-void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, void* user);
+void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
+void srdsim_handle_link_lost(int peer_rank, void* user);
 
 #ifdef SRDSIM_WITH_CUDA
 // Creates `n` events into `out`, or none: a partly built ring would hand out null events later.
@@ -2654,6 +2655,8 @@ CrossOverlaps& g_cross = *new CrossOverlaps;
 // so a late reply for them is dropped and `test` finishes them without reporting their data as landed.
 struct GetRecord {
     RmaCtx* ctx;         // null once the context was destroyed with the reply outstanding
+    CollComm* coll = nullptr;   // the communicator the get was sent on
+    int peer = -1;              // the rank the get was sent to
     int64_t remaining;   // bytes of the reply that have not landed
     bool    failed = false;   // will not complete with its data; see `srdsim_handle_get_failed`
 };
@@ -3073,6 +3076,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     hooks.get_response_landed = srdsim_handle_get_response_landed;
     hooks.get_refused = srdsim_handle_get_refused;
     hooks.get_failed = srdsim_handle_get_failed;
+    hooks.link_lost = srdsim_handle_link_lost;
     // `device_copy`/`device_add` ignore `user`; the get hooks need it, to find which communicator (and
     // so which of its contexts) a request arrived on.
     hooks.user = cc;
@@ -3103,7 +3107,14 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                 const int fd = ::accept(lc->fd, nullptr, nullptr);
                 if (fd < 0) break;
                 srdsim::set_nodelay(fd);
-                if (not cc->agent->serve(fd)) {
+                // The dialler's first four bytes are its rank, so the agent can say where a frame came from.
+                int32_t from = -1;
+                if (not srdsim::read_all(fd, &from, sizeof(from)) or from < 0) {
+                    logf("an accepted connection did not say which rank it is; closing it");
+                    ::close(fd);
+                    continue;
+                }
+                if (not cc->agent->serve(fd, nullptr, from)) {
                     // Only happens if the comm is being torn down between the accept and here. The
                     // descriptor is ours to close in that case, and dropping it silently would leak
                     // one per teardown race.
@@ -3129,7 +3140,7 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
     {
         int sv[2] = {-1, -1};
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
-            if (cc->agent->serve(sv[1])) {
+            if (cc->agent->serve(sv[1], nullptr, rank)) {
                 cc->links.set(rank, sv[0]);
                 logf("rank %d has a loopback link to itself, as the rail team requires", rank);
             } else {
@@ -3165,6 +3176,15 @@ ncclResult_t srdsim_connect(void* /*ctx*/, void* handles[], int nranks, int rank
                 logf("could not set the send buffer of the link to rank %d (errno %d)", peer, errno);
             else if (peer == (rank + 1) % nranks)
                 lifecycle("send buffer impairment: asked for %d bytes, the kernel uses %d", bytes, effective);
+        }
+        const int32_t me = rank;
+        if (not srdsim::write_all(fd, &me, sizeof(me))) {
+            logf("could not tell rank %d which rank this is", peer);
+            ::close(fd);
+            if (acceptor.joinable()) acceptor.join();
+            g_stall_monitor.unwatch(cc);
+            delete cc;
+            return ncclSystemError;
         }
         cc->links.set(peer, fd);
     }
@@ -3548,7 +3568,10 @@ ncclResult_t srdsim_iget(void* rmaCtx, int context, uint64_t remoteOff, void* re
     {
         std::lock_guard<std::mutex> g(g_gets.mu);
         id = g_gets.next ++;
-        g_gets.gets.emplace(id, GetRecord{ctx, static_cast<int64_t>(size)});
+        GetRecord rec{ctx, static_cast<int64_t>(size)};
+        rec.coll = ctx->coll;
+        rec.peer = static_cast<int>(rank);
+        g_gets.gets.emplace(id, rec);
     }
     op.get_response_token = id;
     const ncclResult_t rc = submit(ctx, op, request);
@@ -3631,7 +3654,7 @@ void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, voi
 // owner sent GetError (every byte still to come). Those bytes are counted as arrived, so the get and a flush wait
 // only for the frames still on their way, which land and are counted as usual; `test` then finishes the get as
 // failed, and `queryLastError` reports it.
-void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, void* /*user*/) {
+void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* /*user*/) {
     std::lock_guard<std::mutex> g(g_gets.mu);
     auto it = g_gets.gets.find(owner_token);
     if (it == g_gets.gets.end()) {
@@ -3639,6 +3662,11 @@ void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, void* /*user
         return;
     }
     GetRecord& rec = it->second;
+    if (peer_rank >= 0 and rec.peer >= 0 and peer_rank != rec.peer) {
+        logf("a get failure for get %llu came from rank %d, but the get was sent to rank %d; ignoring",
+             static_cast<unsigned long long>(owner_token), peer_rank, rec.peer);
+        return;
+    }
     if (rec.remaining <= 0) return;   // already fully accounted for
     const int64_t gone = bytes == srdsim::kAllBytes ? rec.remaining
                        : std::min<int64_t>(rec.remaining, static_cast<int64_t>(bytes));
@@ -3646,6 +3674,21 @@ void srdsim_handle_get_failed(uint64_t owner_token, uint64_t bytes, void* /*user
     rec.failed = true;
     if (rec.ctx != nullptr) rec.ctx->pending_get_bytes.fetch_sub(gone, std::memory_order_relaxed);
     rec.remaining -= gone;
+}
+
+// The link from `peer_rank` closed without a Shutdown: that rank went away, and no reply from it will come. Every
+// get this communicator sent it that has bytes still to land fails, as on a GetError.
+void srdsim_handle_link_lost(int peer_rank, void* user) {
+    auto* cc = static_cast<CollComm*>(user);
+    if (cc == nullptr or peer_rank < 0) return;
+    lifecycle("the link from rank %d closed without a shutdown; its outstanding gets fail", peer_rank);
+    std::vector<uint64_t> lost;
+    {
+        std::lock_guard<std::mutex> g(g_gets.mu);
+        for (const auto& [id, rec] : g_gets.gets)
+            if (rec.coll == cc and rec.peer == peer_rank and rec.remaining > 0) lost.push_back(id);
+    }
+    for (uint64_t id : lost) srdsim_handle_get_failed(id, srdsim::kAllBytes, peer_rank, user);
 }
 
 // On the owner: a get request could not be served. The requester is told, through the responder so that the error

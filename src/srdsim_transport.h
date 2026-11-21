@@ -156,7 +156,10 @@ using GetRefusedFn = void (*)(uint32_t requester_rank, uint64_t owner_token, voi
 // On the requester: a get will not complete with its data. `bytes` is the length of a reply frame that could not be
 // written here, or kAllBytes for a GetError, which stands for every byte of the reply still to come.
 constexpr uint64_t kAllBytes = ~uint64_t{0};
-using GetFailedFn = void (*)(uint64_t owner_token, uint64_t bytes, void* user);
+// `peer_rank` is the rank the frame came from (-1 when the link does not know it).
+using GetFailedFn = void (*)(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user);
+// A link closed without a Shutdown frame while this rank was not stopping: the peer went away. `peer_rank` as above.
+using LinkLostFn = void (*)(int peer_rank, void* user);
 
 class WindowTable {
 public:
@@ -452,6 +455,7 @@ public:
         GetResponseLandedFn get_response_landed = nullptr;
         GetRefusedFn get_refused = nullptr;
         GetFailedFn  get_failed = nullptr;
+        LinkLostFn   link_lost = nullptr;
         void*        user = nullptr;
         void (*log)(const char*) = nullptr;
         // Called when the next frame has not arrived yet and the agent is about to wait for it. A writer
@@ -480,7 +484,8 @@ public:
     // not on which link, so nothing that behaves differently per link -- a freeze on one path, a
     // throttle on one path -- can be expressed at all. `Hooks::user` remains the fallback for callers
     // that do not care, which is the plugin.
-    bool serve(int fd, void* user = nullptr) {
+    // `peer_rank`: the rank on the other end, when the caller knows it, so hooks can say where a frame came from.
+    bool serve(int fd, void* user = nullptr, int peer_rank = -1) {
         ignore_sigpipe_once();
         std::lock_guard<std::mutex> g(mu_);
         if (stopping_.load(std::memory_order_acquire))
@@ -490,6 +495,7 @@ public:
         Conn* c = conns_.back().get();
         c->fd = fd;
         c->user = user;
+        c->peer_rank = peer_rank;
         threads_.emplace_back([this, fd, c] { loop(fd, c); });
         return true;
     }
@@ -661,12 +667,14 @@ private:
         // Touched only by this connection's receive thread, which applies its frames in order. A link is one
         // connection for its lifetime; it is not re-established.
         std::unordered_set<uint64_t> dropped_ops;
+        int peer_rank = -1;     // the rank on the other end, or -1 when it is not known
     };
     static constexpr size_t kMaxDroppedOps = 65536;
 
     void loop(int fd, Conn* conn) {
         std::vector<char> buf;
         bool link_failed = false;   // set when this link cannot keep its promises; the loop then closes it
+        bool clean_shutdown = false;   // the peer said Shutdown before closing
         // The exit condition is the peer closing or sending Shutdown. `stopping_` is only an abort
         // for teardown, checked after each message rather than before the first one, so that a
         // caller which tears down immediately after serving still processes what already arrived.
@@ -684,8 +692,10 @@ private:
             // wire but parked in the device copy looks, from the applied counters alone, identical to a
             // reader that has stopped receiving.
             last_header_at_.store(mono_ms(), std::memory_order_relaxed);
-            if (h.kind == static_cast<uint32_t>(WireKind::Shutdown))
+            if (h.kind == static_cast<uint32_t>(WireKind::Shutdown)) {
+                clean_shutdown = true;
                 break;
+            }
             if (h.kind == static_cast<uint32_t>(WireKind::GetError)) {
                 // Header only, and it names no window of this rank's: the get it fails is found by its token.
                 if (h.length != 0) {
@@ -693,7 +703,7 @@ private:
                     refused_.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
-                if (hooks_.get_failed) hooks_.get_failed(h.op_id, kAllBytes, conn->user ? conn->user : hooks_.user);
+                if (hooks_.get_failed) hooks_.get_failed(h.op_id, kAllBytes, conn->peer_rank, conn->user ? conn->user : hooks_.user);
                 continue;
             }
             // The slow-receiver impairment: a wait before each frame that writes this rank's memory.
@@ -717,7 +727,7 @@ private:
                 if (h.kind == static_cast<uint32_t>(WireKind::GetRequest) and hooks_.get_refused)
                     hooks_.get_refused(h.requester_rank, h.op_id, hook_user);
                 if (h.kind == static_cast<uint32_t>(WireKind::GetResponse) and hooks_.get_failed)
-                    hooks_.get_failed(h.op_id, h.length, hook_user);
+                    hooks_.get_failed(h.op_id, h.length, conn->peer_rank, hook_user);
             };
 
             Window w{};
@@ -944,6 +954,8 @@ private:
             if (stopping_.load(std::memory_order_acquire))
                 break;
         }
+        if (not clean_shutdown and not stopping_.load(std::memory_order_acquire) and hooks_.link_lost)
+            hooks_.link_lost(conn->peer_rank, conn->user ? conn->user : hooks_.user);
         if (conn) conn->finished.store(true, std::memory_order_release);
         // Out of the table before it is closed. Without this, `fds_` keeps a number the loop has already
         // closed, and a later `stop()` calls `::shutdown` on whatever the operating system has since
