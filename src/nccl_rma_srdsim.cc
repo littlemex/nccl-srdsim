@@ -3710,14 +3710,14 @@ void fail_get_locked(GetRecord& rec, uint64_t bytes);   // below
 // none, since nothing completes before the last. A wait that fails fails the get rather than counting it. Every frame is
 // then counted by the one path below.
 void srdsim_handle_get_response_landed(uint64_t owner_token, uint64_t bytes, int peer_rank, void* user) {
+    bool settled = true;
+#ifdef SRDSIM_WITH_CUDA
     bool last = false;   // whether this frame completes its get, so the copies must be waited for first
     {
         std::lock_guard<std::mutex> g(g_gets.mu);
         auto it = g_gets.gets.find(owner_token);
         last = it != g_gets.gets.end() and bytes >= static_cast<uint64_t>(std::max<int64_t>(it->second.remaining, 0));
     }
-    bool settled = true;
-#ifdef SRDSIM_WITH_CUDA
     if (not last) {
     } else if (g_negative.get_landed_early) {
         if (not g_negative.get_early_announced.exchange(true))
