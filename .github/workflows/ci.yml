@@ -400,8 +400,13 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
           cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DCMAKE_CXX_FLAGS=-Werror \
             -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so"
-          cmake --build build -j --target test_fi_provider
-          ctest --test-dir build -R fi_provider --output-on-failure --verbose
+          cmake --build build -j --target test_fi_provider test_fi_transfer
+          ctest --test-dir build -R '^fi_' --output-on-failure --verbose
+          # The negative control fails for the reason it exists: a remote completion found its write incomplete.
+          SRDSIM_FI_CQ_DATA_EARLY=1 ./build/test_fi_transfer "$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so" writedata \
+            > early.log 2>&1 && { echo "the negative control passed"; exit 1; }
+          grep -q 'FAIL every remote completion with CQ data found its whole 1 MiB write landed' early.log \
+            || { echo "the negative control failed for another reason:"; cat early.log; exit 1; }
       - name: The provider is loaded only when it is named
         run: |
           export LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
