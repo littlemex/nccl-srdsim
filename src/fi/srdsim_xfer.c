@@ -19,6 +19,10 @@
  *   - A write's remote completion with CQ data (fi_writedata) is raised only once every byte of that write
  *     has landed, as on EFA. SRDSIM_FI_CQ_DATA_EARLY=1 raises it on the first chunk instead, which breaks that
  *     guarantee on purpose, so a test can show it would see the break.
+ *   - Under srd, each chunk of a write also waits at the target for a random time of up to
+ *     SRDSIM_FI_JITTER_US (default 200) before it is applied, as packets that take different paths through the
+ *     fabric arrive at different times. Without it, a consumer polling the target would see every chunk the
+ *     sender had released at once.
  * A transmit completion is reported once the target has applied the whole operation.
  *
  * Completions are queued by the agent and written to the CQs by the endpoint's progress, on the consumer's
@@ -33,6 +37,7 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "srdsim.h"
@@ -163,6 +168,15 @@ struct srdsim_event {
 	struct srdsim_addr src;
 };
 
+/* A write chunk waiting at the target until `due`. */
+struct srdsim_delayed {
+	struct dlist_entry entry;
+	struct srdsim_conn *conn;
+	uint64_t due_ns;
+	struct srdsim_frame f;
+	char payload[];
+};
+
 struct srdsim_xfer {
 	struct srdsim_ep *ep;
 	pthread_mutex_t mu;
@@ -174,6 +188,8 @@ struct srdsim_xfer {
 	enum srdsim_mode mode;
 	size_t chunk;
 	bool cq_data_early;
+	size_t jitter_us;
+	struct dlist_entry delayed;	/* in order of `due` */
 	uint64_t rng;
 	uint64_t next_op_id;
 	struct dlist_entry conns;
@@ -713,6 +729,55 @@ static void srdsim_on_msg(struct srdsim_xfer *x, struct srdsim_conn *c, const st
 	m->active = false;
 }
 
+static uint64_t srdsim_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static void srdsim_delay(struct srdsim_xfer *x, struct srdsim_conn *c, const struct srdsim_frame *f,
+			 const char *payload)
+{
+	struct srdsim_delayed *d = malloc(sizeof(*d) + f->len), *cur;
+	struct dlist_entry *it;
+
+	if (!d) {
+		srdsim_on_write(x, c, f, payload);
+		return;
+	}
+	d->conn = c;
+	d->f = *f;
+	memcpy(d->payload, payload, f->len);
+	d->due_ns = srdsim_now_ns() + (srdsim_rand(x) % (x->jitter_us + 1)) * 1000;
+	for (it = x->delayed.prev; it != &x->delayed; it = it->prev) {
+		cur = container_of(it, struct srdsim_delayed, entry);
+		if (cur->due_ns <= d->due_ns) {
+			dlist_insert_after(&d->entry, it);
+			return;
+		}
+	}
+	dlist_insert_head(&d->entry, &x->delayed);
+}
+
+/* Applies the delayed chunks that are due; returns the milliseconds until the next one, or -1. */
+static int srdsim_apply_due(struct srdsim_xfer *x)
+{
+	struct srdsim_delayed *d;
+	uint64_t now = srdsim_now_ns();
+
+	while (!dlist_empty(&x->delayed)) {
+		d = container_of(x->delayed.next, struct srdsim_delayed, entry);
+		if (d->due_ns > now)
+			return (int) ((d->due_ns - now + 999999) / 1000000);
+		dlist_remove(&d->entry);
+		srdsim_on_write(x, d->conn, &d->f, d->payload);
+		free(d);
+	}
+	return -1;
+}
+
 static void srdsim_on_frame(struct srdsim_xfer *x, struct srdsim_conn *c, const struct srdsim_frame *f,
 			    const char *payload)
 {
@@ -727,7 +792,10 @@ static void srdsim_on_frame(struct srdsim_xfer *x, struct srdsim_conn *c, const 
 		srdsim_on_msg(x, c, f, payload);
 		break;
 	case SRDSIM_F_WRITE:
-		srdsim_on_write(x, c, f, payload);
+		if (x->jitter_us)
+			srdsim_delay(x, c, f, payload);
+		else
+			srdsim_on_write(x, c, f, payload);
 		break;
 	case SRDSIM_F_READ_REQ:
 		srdsim_on_read_req(x, c, f);
@@ -810,6 +878,13 @@ static void srdsim_conn_lost(struct srdsim_xfer *x, struct srdsim_conn *c)
 		dlist_foreach_container_safe(lists[i], struct srdsim_op, op, entry, otmp)
 			if (op->conn == c)
 				srdsim_op_done(x, op, -FI_EIO);
+	struct srdsim_delayed *d, *dtmp;
+
+	dlist_foreach_container_safe(&x->delayed, struct srdsim_delayed, d, entry, dtmp)
+		if (d->conn == c) {
+			dlist_remove(&d->entry);
+			free(d);
+		}
 	dlist_foreach_container_safe(&x->inwrites, struct srdsim_inwrite, w, entry, wtmp)
 		if (w->conn == c) {
 			dlist_remove(&w->entry);
@@ -829,7 +904,7 @@ static void *srdsim_agent(void *arg)
 	struct srdsim_conn **who = NULL, *c, *tmp;
 	size_t n, cap = 0, i;
 	uint64_t drain;
-	int fd;
+	int fd, timeout;
 
 	pthread_mutex_lock(&x->mu);
 	while (!x->stop) {
@@ -850,9 +925,11 @@ static void *srdsim_agent(void *arg)
 			pfd[i] = (struct pollfd) { .fd = c->fd, .events = POLLIN | (c->out.len > c->out.off ? POLLOUT : 0) };
 			who[i++] = c;
 		}
+		timeout = srdsim_apply_due(x);
 		pthread_mutex_unlock(&x->mu);
-		(void) poll(pfd, n, 100);
+		(void) poll(pfd, n, timeout < 0 || timeout > 100 ? 100 : timeout);
 		pthread_mutex_lock(&x->mu);
+		(void) srdsim_apply_due(x);
 		if (pfd[0].revents & POLLIN)
 			(void) !read(x->wake_fd, &drain, sizeof(drain));
 		if (pfd[1].revents & POLLIN) {
@@ -1439,6 +1516,7 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 	dlist_init(&x->tunexp);
 	dlist_init(&x->inwrites);
 	dlist_init(&x->events);
+	dlist_init(&x->delayed);
 	pthread_mutex_init(&x->mu, NULL);
 
 	x->mode = SRDSIM_MODE_SRD;
@@ -1449,6 +1527,7 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 	x->chunk = srdsim_env_size("SRDSIM_CHUNK_BYTES", SRDSIM_DEFAULT_CHUNK, 128, 64u << 20);
 	x->rng = srdsim_env_size("SRDSIM_SEED", 1, 0, SIZE_MAX) ^ ep->addr.nonce;
 	x->cq_data_early = early && !strcmp(early, "1");
+	x->jitter_us = x->mode == SRDSIM_MODE_SRD ? srdsim_env_size("SRDSIM_FI_JITTER_US", 200, 0, 1000000) : 0;
 	if (x->cq_data_early)
 		SRDSIM_WARN(FI_LOG_EP_CTRL, "SRDSIM_FI_CQ_DATA_EARLY=1: remote CQ data is raised before its write "
 			    "has landed, which breaks EFA's guarantee on purpose\n");
@@ -1533,6 +1612,12 @@ void srdsim_xfer_close(struct srdsim_ep *ep)
 	while (!dlist_empty(&x->events)) {
 		dlist_pop_front(&x->events, struct srdsim_event, e, entry);
 		free(e);
+	}
+	while (!dlist_empty(&x->delayed)) {
+		struct srdsim_delayed *d = container_of(x->delayed.next, struct srdsim_delayed, entry);
+
+		dlist_remove(&d->entry);
+		free(d);
 	}
 	if (x->listen_fd >= 0)
 		close(x->listen_fd);
