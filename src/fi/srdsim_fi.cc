@@ -173,8 +173,9 @@ const char* mismatch(const fi_info* hints) {
         if (d->mr_key_size > kMrKeySize) return "a larger memory key";
         if (d->control_progress == FI_PROGRESS_AUTO or d->data_progress == FI_PROGRESS_AUTO)
             return "automatic progress";
+        // 0 leaves the modes to the provider, as libfabric's own check (ofi_check_mr_mode) reads it.
         const uint64_t need = kMrModeRequired | ((hints->caps & FI_HMEM) ? FI_MR_HMEM : 0);
-        if ((d->mr_mode & need) != need) return "registration modes the provider requires";
+        if (d->mr_mode != 0 and (d->mr_mode & need) != need) return "registration modes the provider requires";
     }
     const uint64_t order_needed = (hints->tx_attr ? hints->tx_attr->msg_order : 0) |
                                   (hints->rx_attr ? hints->rx_attr->msg_order : 0);
