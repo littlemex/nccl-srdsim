@@ -134,7 +134,6 @@ static int srdsim_get(void *optval, size_t *optlen, const void *value, size_t si
 static int srdsim_ep_getopt(fid_t fid, int level, int optname, void *optval, size_t *optlen)
 {
 	struct srdsim_ep *ep = container_of(fid, struct srdsim_ep, util_ep.ep_fid.fid);
-	const struct fi_info *info = ep->util_ep.info ? ep->util_ep.info : &srdsim_info;
 	size_t size;
 	bool no = false;
 
@@ -151,12 +150,12 @@ static int srdsim_ep_getopt(fid_t fid, int level, int optname, void *optval, siz
 	case FI_OPT_MAX_MSG_SIZE:
 	case FI_OPT_MAX_TAGGED_SIZE:
 	case FI_OPT_MAX_RMA_SIZE:
-		size = info->ep_attr->max_msg_size;
+		size = ep->max_msg_size;
 		return srdsim_get(optval, optlen, &size, sizeof(size));
 	case FI_OPT_INJECT_MSG_SIZE:
 	case FI_OPT_INJECT_TAGGED_SIZE:
 	case FI_OPT_INJECT_RMA_SIZE:
-		size = info->tx_attr->inject_size;
+		size = ep->inject_size;
 		return srdsim_get(optval, optlen, &size, sizeof(size));
 	/* Reads and writes are carried as such, not emulated with sends. */
 	case FI_OPT_EFA_EMULATED_READ:
@@ -291,6 +290,8 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 		free(ep);
 		return -FI_EOTHER;
 	}
+	ep->max_msg_size = info->ep_attr->max_msg_size;
+	ep->inject_size = info->tx_attr->inject_size;
 	/* The real endpoint's defaults. */
 	ep->rnr_retry = 7;
 	ep->hmem_p2p = FI_HMEM_P2P_ENABLED;

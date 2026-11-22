@@ -52,6 +52,8 @@ struct srdsim_ep {
 	struct util_ep util_ep;
 	struct srdsim_addr addr;
 	bool enabled;
+	size_t max_msg_size;	/* from the fi_info it was opened with */
+	size_t inject_size;
 	/* The EFA endpoint options, as the consumer set them. */
 	size_t rnr_retry;
 	size_t min_multi_recv;
