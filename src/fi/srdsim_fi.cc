@@ -51,6 +51,8 @@ constexpr size_t kMrKeySize = 4;                // as the real provider: an ibv 
 constexpr size_t kIovLimit = 4;
 constexpr size_t kInjectSize = 4096;
 constexpr size_t kQueueSize = 8192;
+// libfabric's FI_TAG_GENERIC (include/ofi.h, not installed): every tag bit available to the application.
+constexpr uint64_t kTagGeneric = 0xAAAAAAAAAAAAAAAAull;
 
 // Two-sided operations keep their order (the real provider reorders them back in software); RMA reports no
 // ordering, which is what SRD gives.
@@ -217,7 +219,7 @@ fi_info* make_info(const fi_info* hints) {
     e->protocol = FI_PROTO_EFA;
     e->protocol_version = 1;
     e->max_msg_size = UINT64_MAX;
-    e->mem_tag_format = FI_TAG_GENERIC;
+    e->mem_tag_format = kTagGeneric;
     e->tx_ctx_cnt = 1;
     e->rx_ctx_cnt = 1;
 
