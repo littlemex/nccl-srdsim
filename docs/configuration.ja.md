@@ -90,3 +90,11 @@ NCCL が RMA コンテキストを作るたびに読む。
 | `SRDSIM_FREEZE_PEER` | 個数、なし | 止める接続の相手。`0` も相手を指す |
 | `SRDSIM_FREEZE_AFTER_UNITS`、`SRDSIM_FREEZE_MS` | 個数、`0` | 止める相手にこの個数のユニットをリリースした後、この時間だけ、その相手には何もリリースしない (送る側で、背圧と同じ空きの確かめを通して行う) |
 | `SRDSIM_SIGNAL_LAG_US` | 個数、`0` | シグナルごとに足す遅れ |
+
+## libfabric プロバイダ
+
+libfabric プロバイダ (`libsrdsim-fi.so`、[プロバイダの説明](libfabric-provider.ja.md)) が、対応するオプションを設定されるたびに読む。
+
+| 変数 | 型と既定値 | 効果 |
+|---|---|---|
+| `SRDSIM_FI_WRITE_IN_ORDER` | `0` か `1`、`1` | `1` は、対応する EFA デバイスと同じく `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` を受け付ける。`0` は、対応しないデバイスと同じく `-FI_EOPNOTSUPP` で断る。ほかの値はログに書いて `1` として扱う |

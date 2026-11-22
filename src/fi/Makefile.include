@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+if HAVE_SRDSIM
+_srdsim_files = \
+	prov/srdsim/srdsim.h		\
+	prov/srdsim/srdsim_attr.c	\
+	prov/srdsim/srdsim_init.c	\
+	prov/srdsim/srdsim_fabric.c	\
+	prov/srdsim/srdsim_cq_av.c	\
+	prov/srdsim/srdsim_ep.c
+
+if HAVE_SRDSIM_DL
+pkglib_LTLIBRARIES += libsrdsim-fi.la
+libsrdsim_fi_la_SOURCES = $(_srdsim_files) $(common_srcs)
+libsrdsim_fi_la_LIBADD = $(linkback)
+libsrdsim_fi_la_LDFLAGS = -module -avoid-version -shared -export-dynamic
+libsrdsim_fi_la_DEPENDENCIES = $(linkback)
+endif HAVE_SRDSIM_DL
+endif HAVE_SRDSIM

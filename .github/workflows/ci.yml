@@ -20,6 +20,8 @@ jobs:
       cuda_keyring_sha256: ${{ steps.read.outputs.cuda_keyring_sha256 }}
       gdrcopy_tag: ${{ steps.read.outputs.gdrcopy_tag }}
       gdrcopy_commit: ${{ steps.read.outputs.gdrcopy_commit }}
+      libfabric_tag: ${{ steps.read.outputs.libfabric_tag }}
+      libfabric_commit: ${{ steps.read.outputs.libfabric_commit }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - id: read
@@ -372,3 +374,55 @@ jobs:
               -I "$RUNNER_TEMP/inc/nccl" -I "$RUNNER_TEMP/devinc" \
               -c "tests/gpu/$t.cu" -o "$RUNNER_TEMP/$t.o"
           done
+
+  # The libfabric provider, built inside a pinned libfabric that also builds its own efa provider, so the
+  # preferred form of FI_PROVIDER_PATH is shown to win over the built-in provider of the same name.
+  fi-provider:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: versions
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build libfabric with the provider
+        env:
+          LIBFABRIC_TAG: ${{ needs.versions.outputs.libfabric_tag }}
+          LIBFABRIC_COMMIT: ${{ needs.versions.outputs.libfabric_commit }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libibverbs-dev librdmacm-dev libnuma-dev
+          git clone --quiet --depth 1 --branch "$LIBFABRIC_TAG" https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-src"
+          test "$(git -C "$RUNNER_TEMP/libfabric-src" rev-parse HEAD)" = "$LIBFABRIC_COMMIT"
+          ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/libfabric" \
+            --enable-efa=yes --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp
+          "$RUNNER_TEMP/libfabric/bin/fi_info" -l | grep -q '^efa:' || { echo "libfabric was built without its efa provider"; exit 1; }
+      - name: Test the provider
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
+          cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DCMAKE_CXX_FLAGS=-Werror \
+            -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so"
+          cmake --build build -j --target test_fi_provider
+          ctest --test-dir build -R fi_provider --output-on-failure --verbose
+      - name: The provider is loaded only when it is named
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
+          FI=$RUNNER_TEMP/libfabric/bin/fi_info
+          if ls "$RUNNER_TEMP/libfabric/lib/libfabric/" | grep -q srdsim; then
+            echo "the provider is in libfabric's default provider directory"; exit 1
+          fi
+          FI_LOG_LEVEL=info "$FI" -p efa > unnamed.out 2> unnamed.log || true
+          if grep -q 'srdsim' unnamed.out unnamed.log; then echo "the provider was loaded without being named"; exit 1; fi
+          FI_LOG_LEVEL=info FI_PROVIDER_PATH="+$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so" "$FI" -p efa > named.out 2> named.log
+          grep -q 'loading preferred provider' named.log || { echo "the named provider was not loaded as preferred"; exit 1; }
+          grep -q 'domain: srdsim0-rdm' named.out || { echo "fi_info does not list the provider when it is named"; cat named.out; exit 1; }
+      - name: The test fails when the provider claims an ordering SRD does not give
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
+          sed -i 's/^#define SRDSIM_MSG_ORDER FI_ORDER_SAS$/#define SRDSIM_MSG_ORDER (FI_ORDER_SAS | FI_ORDER_RMA_WAW)/' src/fi/srdsim_attr.c
+          git diff --quiet -- src/fi/srdsim_attr.c && { echo "the mutation did not apply"; exit 1; }
+          ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/libfabric-mutated" \
+            --enable-efa=no --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp
+          if "$PWD/build/test_fi_provider" "$RUNNER_TEMP/libfabric-mutated/lib/srdsim/libsrdsim-fi.so" > mutated.log 2>&1; then
+            echo "the test passed against a provider that claims write-after-write ordering"; exit 1
+          fi
+          grep -q '^FAIL write-after-write ordering is refused$' mutated.log \
+            || { echo "the test failed for another reason:"; cat mutated.log; exit 1; }

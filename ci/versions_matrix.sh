@@ -4,7 +4,7 @@
 #   nccl=<JSON list of {tag, commit, version_code}>   one entry per NCCL release
 #   cuda=<JSON list of toolkit package suffixes>
 #   nccl_default_tag, nccl_default_commit, cuda_default, cuda_keyring_deb, cuda_keyring_sha256, gdrcopy_tag,
-#   gdrcopy_commit
+#   gdrcopy_commit, libfabric_tag, libfabric_commit
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck disable=SC1091
@@ -30,3 +30,5 @@ echo "cuda_keyring_deb=$CUDA_KEYRING_DEB"
 echo "cuda_keyring_sha256=$CUDA_KEYRING_SHA256"
 echo "gdrcopy_tag=$GDRCOPY_TAG"
 echo "gdrcopy_commit=$GDRCOPY_COMMIT"
+echo "libfabric_tag=$LIBFABRIC_TAG"
+echo "libfabric_commit=$LIBFABRIC_COMMIT"

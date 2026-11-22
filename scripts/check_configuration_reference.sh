@@ -4,7 +4,7 @@
 # (and its Japanese translation, docs/configuration.ja.md) disagree, in either direction. Compares names only.
 #
 # A variable counts as read when its name is the literal first argument of one of the read helpers
-# below, in a .cc or .h file under src/ (the only place the plugin and its headers live). A read whose
+# below, in a .cc, .c or .h file under src/ (the only place the plugin and its headers live). A read whose
 # name is not such a literal, a name assembled from an "SRDSIM_" prefix, and a quoted full name that no
 # known helper takes all fail the check instead of being guessed at. A variable counts as listed when it
 # is the first cell of a row of one of a document's tables.
@@ -17,7 +17,7 @@ LITERAL='"SRDSIM_[A-Z0-9_]+"'
 
 fail=0
 # Every call of a read helper outside comments, as file:line:text.
-calls=$(grep -rnE --include='*.cc' --include='*.h' "\\b($READERS)[[:space:]]*\\(" "$ROOT/src" \
+calls=$(grep -rnE --include='*.cc' --include='*.c' --include='*.h' "\\b($READERS)[[:space:]]*\\(" "$ROOT/src" \
         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*)' || true)
 read_vars=$(grep -oE "\\b($READERS)[[:space:]]*\\([[:space:]]*$LITERAL" <<<"$calls" \
             | grep -oE 'SRDSIM_[A-Z0-9_]+' | sort -u || true)
@@ -26,11 +26,11 @@ read_vars=$(grep -oE "\\b($READERS)[[:space:]]*\\([[:space:]]*$LITERAL" <<<"$cal
 opaque=$(grep -vE "\\b($READERS)[[:space:]]*\\([[:space:]]*(\"SRDSIM_[A-Z0-9_]+\"[[:space:]]*[,)]|\"[^S\"][^\"]*\")" <<<"$calls" \
          | grep -vE "\\b(env_str|env_size|impair_env)\\(const char[[:space:]]*\\*[[:space:]]*name" \
          | grep -vE 'std::getenv\(name\)' || true)
-built=$(grep -rnE --include='*.cc' --include='*.h' '"SRDSIM_"|"SRDSIM_[A-Z0-9_]*%' "$ROOT/src" \
+built=$(grep -rnE --include='*.cc' --include='*.c' --include='*.h' '"SRDSIM_"|"SRDSIM_[A-Z0-9_]*%' "$ROOT/src" \
         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*)' || true)
 # A full name in quotes that no read helper takes, for instance one passed to a helper this script does
 # not know.
-quoted=$(grep -rhE --include='*.cc' --include='*.h' '"SRDSIM_[A-Z0-9_]+"' "$ROOT/src" \
+quoted=$(grep -rhE --include='*.cc' --include='*.c' --include='*.h' '"SRDSIM_[A-Z0-9_]+"' "$ROOT/src" \
          | grep -vE '^[[:space:]]*(//|\*)' | grep -oE '"SRDSIM_[A-Z0-9_]+"' | tr -d '"' | sort -u || true)
 if [ -z "$read_vars" ]; then
     echo "found no variables read; the patterns in this script no longer match" >&2
