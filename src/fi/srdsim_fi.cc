@@ -190,9 +190,9 @@ fi_info* make_info(const fi_info* hints) {
     i->mode = 0;
     i->addr_format = FI_ADDR_EFA;
 
+    // prov_name and prov_version are left to libfabric, which fills them from the provider; a core provider
+    // that sets prov_name is read as a utility provider layered over one of that name.
     i->fabric_attr->name = strdup(kName);
-    i->fabric_attr->prov_name = strdup(kName);
-    i->fabric_attr->prov_version = kProviderVersion;
 
     auto* d = i->domain_attr;
     d->name = strdup(kDomain);
@@ -237,7 +237,7 @@ fi_info* make_info(const fi_info* hints) {
     i->rx_attr->size = kQueueSize;
     i->rx_attr->iov_limit = kIovLimit;
     i->rx_attr->op_flags = FI_COMPLETION;
-    if (i->fabric_attr->name == nullptr or i->fabric_attr->prov_name == nullptr or d->name == nullptr) {
+    if (i->fabric_attr->name == nullptr or d->name == nullptr) {
         fi_freeinfo(i);
         return nullptr;
     }
