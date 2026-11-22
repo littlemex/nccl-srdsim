@@ -214,8 +214,12 @@ static struct fi_info *srdsim_nic_info(size_t index, const struct srdsim_pci *pc
 		fi_freeinfo(info);
 		return NULL;
 	}
+	/*
+	 * No device name: aws-ofi-nccl reads /sys/class/infiniband/<name>/node_guid for any NIC that has one and
+	 * fails when the file does not exist, which it cannot for an emulated device. Without a name it numbers
+	 * the NIC itself, as it does for EFA devices 0xefa0 to 0xefa2 in any case.
+	 */
 	snprintf(name, sizeof(name), "srdsim%zu", index);
-	nic->device_attr->name = strdup(name);
 	nic->device_attr->vendor_id = strdup("0x1d0f");	/* Amazon, as EFA reports */
 	nic->device_attr->device_id = strdup("0xefa1");
 	nic->device_attr->driver = strdup("srdsim");
