@@ -16,21 +16,23 @@
 
 ## ビルド
 
-プロバイダには libfabric のヘッダとライブラリが要り、`pkg-config` で見つける。CI は `versions.env` で固定した libfabric のリリースに対してビルドする。EFA インスタンスでは、使う側が使っている libfabric (たいていは `/opt/amazon/efa` のもの) に対してビルドする。
+プロバイダは、libfabric が自分のプロバイダを読み込み可能なライブラリとしてビルドするのと同じ方法でビルドする。`scripts/build_fi_provider.sh` が `src/fi` を libfabric のソースツリーに `prov/srdsim` として加え、プロバイダを DSO にしてその libfabric をビルドし、prefix の下にインストールする。プロバイダは hints の照合、fabric、domain、completion queue、address vector の各オブジェクト、メモリ登録に libfabric 自身のユーティリティ層を使うので、これらの呼び出しには libfabric のほかのプロバイダとまったく同じように答える。プロバイダは libfabric の既定のプロバイダのディレクトリの外、`PREFIX/lib/srdsim/` に移す。CI は `versions.env` で固定した libfabric のリリースに対してビルドする。
 
 ```bash
-export PKG_CONFIG_PATH=/opt/amazon/efa/lib/pkgconfig
-cmake -S . -B build -DSRDSIM_BUILD_FI_PROVIDER=ON
-cmake --build build -j --target srdsim-fi
+git clone --quiet --depth 1 --branch v2.7.0 https://github.com/ofiwg/libfabric.git libfabric-src
+./scripts/build_fi_provider.sh libfabric-src "$HOME/srdsim-libfabric"
 ```
+
+スクリプトには autoconf、automake、libtool、C コンパイラが要る。prefix の後ろに書いた configure のオプションは libfabric の `configure` に渡す。プロバイダは、一緒にビルドした libfabric とでしか動かしたことがない。
 
 ## 選び方
 
 プロバイダを使うのは、`FI_PROVIDER_PATH` の優先指定の形 (`+` に続けてライブラリのパス) でこれを名指ししたプロセスだけである。libfabric はそのとき、本物を含む `efa` という名前のほかのプロバイダより、これを優先する。このため EFA インスタンスでも、そのプロセスにはエミュレートしたデバイスだけが見える。libfabric の既定のプロバイダのディレクトリには置かないので、名指ししないプロセスは本物のプロバイダを使う。
 
 ```bash
-export FI_PROVIDER_PATH="+$PWD/build/libsrdsim-fi.so"
-fi_info -p efa
+export LD_LIBRARY_PATH="$HOME/srdsim-libfabric/lib"
+export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
+"$HOME/srdsim-libfabric/bin/fi_info" -p efa
 ```
 
 `fi_info` は domain `srdsim0-rdm` を 1 つ表示する。
@@ -41,7 +43,8 @@ fi_info -p efa
 |---|---|---|
 | endpoint | `FI_EP_RDM`、プロトコル `FI_PROTO_EFA`、アドレス形式 `FI_ADDR_EFA`、32 バイトのアドレス | 本物の RDM endpoint と同じ |
 | 順序 | send と receive は `FI_ORDER_SAS`、RMA は無し | 本物のプロバイダは両側通信のメッセージをソフトウェアで並べ直す。SRD 自体は何も順序づけないので、RMA の順序を求める hints は断る |
-| メモリ登録 | `FI_MR_VIRT_ADDR`、`FI_MR_ALLOCATED`、`FI_MR_PROV_KEY`、`FI_HMEM` のときは `FI_MR_HMEM`。`FI_MR_LOCAL` は求めない | 本物の RDM endpoint と同じ |
+| メモリ登録 | RMA には `FI_MR_VIRT_ADDR`、`FI_MR_ALLOCATED`、`FI_MR_PROV_KEY`。`FI_HMEM` のときは `FI_MR_HMEM`。hints が `FI_MR_LOCAL` を出したときはそれも返す。キーは 4 バイト | 本物の RDM endpoint と同じ。使う側が登録を出せるときはそれを使う |
+| 能力 | メッセージ、タグつきメッセージ、RMA。`FI_HMEM` は求められたときだけ。atomic は無し | 本物のプロバイダは atomic をソフトウェアで模していて、このプロバイダが対象にするものはどれも atomic を使わない |
 | CQ データ | 4 バイト | EFA で `fi_writedata` が運ぶ大きさ |
 | 進行 | データも制御も手動 | 本物のプロバイダと同じ。自動進行を求める hints は断る |
 
@@ -49,8 +52,12 @@ endpoint のオプションには、libfabric の `prov/efa/src/rdm/efa_rdm_ep_f
 
 ## テスト
 
-`tests/fi/test_fi_provider.cc` は、aws-ofi-nccl と NIXL が組む hints を使って、libfabric を通してプロバイダに届く。CI は、自前の efa プロバイダつきでビルドした libfabric に対してこれを流す。あわせて、名指ししたときだけ `fi_info` がプロバイダを表示すること、write-after-write の順序を名乗るように壊したプロバイダに対してテストが失敗することを確かめる。
+`tests/fi/test_fi_provider.cc` は、aws-ofi-nccl と NIXL が組む hints を使って libfabric を通してプロバイダに届き、libfabric の efa プロバイダが RDM endpoint について返すのと同じ答えを期待する。CI は、自前の efa プロバイダつきでビルドした libfabric に対してこれを流す。あわせて、名指ししたときだけプロバイダが読み込まれること、write-after-write の順序を名乗るように壊したプロバイダに対してテストが失敗することを確かめる。
 
 ```bash
+export PKG_CONFIG_PATH="$HOME/srdsim-libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$HOME/srdsim-libfabric/lib"
+cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON \
+  -DSRDSIM_FI_PROVIDER="$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
+cmake --build build -j --target test_fi_provider
 ctest --test-dir build -R fi_provider --output-on-failure
 ```
