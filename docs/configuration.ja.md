@@ -93,8 +93,10 @@ NCCL が RMA コンテキストを作るたびに読む。
 
 ## libfabric プロバイダ
 
-libfabric プロバイダ (`libsrdsim-fi.so`、[プロバイダの説明](libfabric-provider.ja.md)) が、対応するオプションを設定されるたびに読む。
+libfabric プロバイダ (`libsrdsim-fi.so`、[プロバイダの説明](libfabric-provider.ja.md)) が読む。`SRDSIM_FI_WRITE_IN_ORDER` は対応するオプションを設定されるたびに、ほかは endpoint を開くときに読む。プロバイダは `SRDSIM_MODE` (`srd` と `inorder` だけ)、`SRDSIM_SEED`、`SRDSIM_CHUNK_BYTES` も、上と同じ意味で読む。
 
 | 変数 | 型と既定値 | 効果 |
 |---|---|---|
 | `SRDSIM_FI_WRITE_IN_ORDER` | `0` か `1`、`1` | `1` は、対応する EFA デバイスと同じく `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` を受け付ける。`0` は、対応しないデバイスと同じく `-FI_EOPNOTSUPP` で断る。ほかの値はログに書いて `1` として扱う |
+| `SRDSIM_FI_JITTER_US` | 個数、`200` | `srd` のとき、書き込みのチャンクが相手側で適用されるまでに待つ時間の最大値 (マイクロ秒)。各チャンクはこれ以下の乱数の時間だけ待つ。`0` は届いた順にすぐ適用する。`inorder` では使わない |
+| `SRDSIM_FI_CQ_DATA_EARLY` | `0` か `1`、`0` | `1` は、CQ データつき書き込みの相手側の完了を最後ではなく最初のチャンクで出す。EFA の保証をわざと破る、それに頼るコードのための陰性対照 |

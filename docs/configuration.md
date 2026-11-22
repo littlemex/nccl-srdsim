@@ -93,8 +93,10 @@ Each makes the fabric slow, bursty or partly stalled on purpose, never lossy, to
 
 ## libfabric provider
 
-Read by the libfabric provider (`libsrdsim-fi.so`, see [the provider's documentation](libfabric-provider.md)) each time the option it governs is set.
+Read by the libfabric provider (`libsrdsim-fi.so`, see [the provider's documentation](libfabric-provider.md)): `SRDSIM_FI_WRITE_IN_ORDER` each time the option it governs is set, the others when an endpoint is opened. The provider also reads `SRDSIM_MODE` (`srd` or `inorder` only), `SRDSIM_SEED` and `SRDSIM_CHUNK_BYTES`, with the meanings above.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `SRDSIM_FI_WRITE_IN_ORDER` | `0` or `1` | `1` | `1` accepts `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES`, as an EFA device that supports it does; `0` refuses it with `-FI_EOPNOTSUPP`, as one that does not. Any other value is logged and `1` is used |
+| `SRDSIM_FI_JITTER_US` | count | `200` | Under `srd`, the longest time, in microseconds, a write chunk waits at the target before it is applied; each waits a random time up to this. `0` applies chunks as they arrive. Not used under `inorder` |
+| `SRDSIM_FI_CQ_DATA_EARLY` | `0` or `1` | `0` | `1` raises a write's remote completion with CQ data on its first chunk instead of its last, which breaks EFA's guarantee on purpose: the negative control for code that relies on it |

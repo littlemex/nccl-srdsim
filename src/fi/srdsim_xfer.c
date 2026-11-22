@@ -203,7 +203,7 @@ struct srdsim_xfer {
 
 /* ---- Configuration and helpers ---------------------------------------------------------------------- */
 
-static size_t srdsim_env_size(const char *name, size_t dflt, size_t lo, size_t hi)
+static size_t env_size(const char *name, size_t dflt, size_t lo, size_t hi)
 {
 	const char *v = getenv(name);
 	char *end = NULL;
@@ -1524,10 +1524,10 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 		x->mode = SRDSIM_MODE_INORDER;
 	else if (mode && *mode && strcmp(mode, "srd"))
 		SRDSIM_WARN(FI_LOG_EP_CTRL, "SRDSIM_MODE=%s: the provider knows srd and inorder; using srd\n", mode);
-	x->chunk = srdsim_env_size("SRDSIM_CHUNK_BYTES", SRDSIM_DEFAULT_CHUNK, 128, 64u << 20);
-	x->rng = srdsim_env_size("SRDSIM_SEED", 1, 0, SIZE_MAX) ^ ep->addr.nonce;
+	x->chunk = env_size("SRDSIM_CHUNK_BYTES", SRDSIM_DEFAULT_CHUNK, 128, 64u << 20);
+	x->rng = env_size("SRDSIM_SEED", 1, 0, SIZE_MAX) ^ ep->addr.nonce;
 	x->cq_data_early = early && !strcmp(early, "1");
-	x->jitter_us = x->mode == SRDSIM_MODE_SRD ? srdsim_env_size("SRDSIM_FI_JITTER_US", 200, 0, 1000000) : 0;
+	x->jitter_us = x->mode == SRDSIM_MODE_SRD ? env_size("SRDSIM_FI_JITTER_US", 200, 0, 1000000) : 0;
 	if (x->cq_data_early)
 		SRDSIM_WARN(FI_LOG_EP_CTRL, "SRDSIM_FI_CQ_DATA_EARLY=1: remote CQ data is raised before its write "
 			    "has landed, which breaks EFA's guarantee on purpose\n");
