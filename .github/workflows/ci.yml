@@ -375,15 +375,15 @@ jobs:
               -c "tests/gpu/$t.cu" -o "$RUNNER_TEMP/$t.o"
           done
 
-  # The libfabric provider, against a pinned libfabric built with its own efa provider, so the preferred form
-  # of FI_PROVIDER_PATH is shown to hide the built-in provider of the same name.
+  # The libfabric provider, built inside a pinned libfabric that also builds its own efa provider, so the
+  # preferred form of FI_PROVIDER_PATH is shown to win over the built-in provider of the same name.
   fi-provider:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: versions
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Build libfabric
+      - name: Build libfabric with the provider
         env:
           LIBFABRIC_TAG: ${{ needs.versions.outputs.libfabric_tag }}
           LIBFABRIC_COMMIT: ${{ needs.versions.outputs.libfabric_commit }}
@@ -392,35 +392,37 @@ jobs:
           sudo apt-get install -y -q libibverbs-dev librdmacm-dev libnuma-dev
           git clone --quiet --depth 1 --branch "$LIBFABRIC_TAG" https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-src"
           test "$(git -C "$RUNNER_TEMP/libfabric-src" rev-parse HEAD)" = "$LIBFABRIC_COMMIT"
-          cd "$RUNNER_TEMP/libfabric-src"
-          ./autogen.sh > /dev/null
-          ./configure --quiet --prefix="$RUNNER_TEMP/libfabric" --enable-efa=yes --enable-tcp=yes --disable-psm3 \
-            --disable-opx --disable-usnic --disable-verbs --disable-lpp
-          make -s -j"$(nproc)" install > /dev/null
+          ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/libfabric" \
+            --enable-efa=yes --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp
           "$RUNNER_TEMP/libfabric/bin/fi_info" -l | grep -q '^efa:' || { echo "libfabric was built without its efa provider"; exit 1; }
-      - name: Build and test the provider
+      - name: Test the provider
         run: |
           export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
-          cmake -S . -B build -DSRDSIM_BUILD_TESTS=ON -DSRDSIM_BUILD_FI_PROVIDER=ON -DCMAKE_CXX_FLAGS=-Werror
-          cmake --build build -j --target srdsim-fi test_fi_provider
+          cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DCMAKE_CXX_FLAGS=-Werror \
+            -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so"
+          cmake --build build -j --target test_fi_provider
           ctest --test-dir build -R fi_provider --output-on-failure --verbose
-          nm -D --defined-only build/libsrdsim-fi.so | awk '$2 == "T" {print $3}' > exports
-          test "$(cat exports)" = fi_prov_ini || { echo "the provider exports more than fi_prov_ini:"; cat exports; exit 1; }
-      - name: The provider is used only when it is named
+      - name: The provider is loaded only when it is named
         run: |
           export LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
           FI=$RUNNER_TEMP/libfabric/bin/fi_info
-          FI_PROVIDER_PATH="+$PWD/build/libsrdsim-fi.so" "$FI" -p efa | grep -q 'domain: srdsim0-rdm' \
-            || { echo "fi_info does not list the provider when it is named"; exit 1; }
-          if "$FI" -p efa 2>/dev/null | grep -q srdsim; then echo "the provider is listed without being named"; exit 1; fi
+          if ls "$RUNNER_TEMP/libfabric/lib/libfabric/" | grep -q srdsim; then
+            echo "the provider is in libfabric's default provider directory"; exit 1
+          fi
+          FI_LOG_LEVEL=info "$FI" -l > /dev/null 2> unnamed.log
+          if grep -q 'registering provider: efa (0\.' unnamed.log; then echo "the provider was loaded without being named"; exit 1; fi
+          FI_LOG_LEVEL=info FI_PROVIDER_PATH="+$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so" "$FI" -p efa > named.out 2> named.log
+          grep -q 'loading preferred provider' named.log || { echo "the named provider was not loaded as preferred"; exit 1; }
+          grep -q 'domain: srdsim0-rdm' named.out || { echo "fi_info does not list the provider when it is named"; cat named.out; exit 1; }
       - name: The test fails when the provider claims an ordering SRD does not give
         run: |
           export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
-          sed -i 's/^constexpr uint64_t kMsgOrder = FI_ORDER_SAS;/constexpr uint64_t kMsgOrder = FI_ORDER_SAS | FI_ORDER_RMA_WAW;/' src/fi/srdsim_fi.cc
-          git diff --quiet -- src/fi/srdsim_fi.cc && { echo "the mutation did not apply"; exit 1; }
-          cmake --build build -j --target srdsim-fi
-          if ctest --test-dir build -R fi_provider > "$RUNNER_TEMP/mutated.log" 2>&1; then
+          sed -i 's/^#define SRDSIM_MSG_ORDER FI_ORDER_SAS$/#define SRDSIM_MSG_ORDER (FI_ORDER_SAS | FI_ORDER_RMA_WAW)/' src/fi/srdsim_attr.c
+          git diff --quiet -- src/fi/srdsim_attr.c && { echo "the mutation did not apply"; exit 1; }
+          ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/libfabric-mutated" \
+            --enable-efa=no --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp
+          if "$PWD/build/test_fi_provider" "$RUNNER_TEMP/libfabric-mutated/lib/srdsim/libsrdsim-fi.so" > mutated.log 2>&1; then
             echo "the test passed against a provider that claims write-after-write ordering"; exit 1
           fi
-          grep -q 'FAIL write-after-write ordering is refused' build/Testing/Temporary/LastTest.log \
-            || { echo "the test failed for another reason:"; cat build/Testing/Temporary/LastTest.log; exit 1; }
+          grep -q '^FAIL write-after-write ordering is refused$' mutated.log \
+            || { echo "the test failed for another reason:"; cat mutated.log; exit 1; }

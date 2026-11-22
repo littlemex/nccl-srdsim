@@ -5,8 +5,10 @@
 //
 //   test_fi_provider PROVIDER_SO
 //
-// The hints are those aws-ofi-nccl and NIXL's libfabric backend build, at the commits named in
-// docs/libfabric-provider.md. Each check prints one line; the program exits 1 if any fails.
+// The hints are those aws-ofi-nccl (src/nccl_ofi_rdma.cpp and src/nccl_ofi_sendrecv.cpp at the commit
+// AWS_OFI_NCCL_COMMIT in versions.env) and NIXL's libfabric backend (src/utils/libfabric/libfabric_rail.cpp)
+// build. The expected answers are those of libfabric's own efa provider for its RDM endpoint. Each check
+// prints one line; the program exits 1 if any fails.
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -94,8 +96,16 @@ void getinfo_checks() {
         check(a->ep_attr->type == FI_EP_RDM and a->ep_attr->protocol == FI_PROTO_EFA, "an RDM endpoint, protocol EFA");
         check(a->addr_format == FI_ADDR_EFA, "address format FI_ADDR_EFA");
         check(a->domain_attr->cq_data_size == 4, "4 bytes of CQ data, as fi_writedata needs");
-        check((a->domain_attr->mr_mode & FI_MR_LOCAL) == 0, "FI_MR_LOCAL is not required");
-        check(a->domain_attr->mr_key_size == 2, "the memory key size asked for");
+        check((a->domain_attr->mr_mode & FI_MR_LOCAL) != 0, "FI_MR_LOCAL is echoed when the hints offer it");
+        check((a->domain_attr->mr_mode & (FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM)) ==
+                  (FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM),
+              "virtual addresses, allocated memory, provider keys and FI_MR_HMEM are required");
+        check(a->domain_attr->mr_key_size == 4, "4-byte memory keys, whatever smaller size the hints allow");
+        check((a->tx_attr->caps & (FI_REMOTE_WRITE | FI_RECV)) == 0 and (a->rx_attr->caps & (FI_WRITE | FI_SEND)) == 0,
+              "transmit and receive capabilities are split");
+        check((a->tx_attr->caps & (FI_WRITE | FI_READ)) == (FI_WRITE | FI_READ), "FI_RMA brings reads and writes");
+        check(a->tx_attr->iov_limit == 4 and a->tx_attr->rma_iov_limit == 1, "4 iovs per message, 1 per RMA");
+        check(a->ep_attr->protocol_version == 4, "the EFA RDM protocol version");
         check(a->domain_attr->data_progress == FI_PROGRESS_MANUAL, "manual progress");
         check((a->caps & FI_HMEM) != 0, "FI_HMEM");
         constexpr uint64_t rma_orders = FI_ORDER_RAR | FI_ORDER_RAW | FI_ORDER_WAR | FI_ORDER_WAW |
@@ -104,8 +114,28 @@ void getinfo_checks() {
         fi_freeinfo(a);
     }
     fi_info* s = ours(aws_ofi_nccl_sendrecv);
-    check(s != nullptr, "aws-ofi-nccl's send/recv hints, which need FI_ORDER_SAS, select the provider");
+    check(s != nullptr and s->tx_attr->msg_order == FI_ORDER_SAS,
+          "aws-ofi-nccl's send/recv hints select the provider, with FI_ORDER_SAS");
     fi_freeinfo(s);
+    fi_info* h = ours([](fi_info* x) {
+        aws_ofi_nccl_sendrecv(x);
+        x->caps = FI_LOCAL_COMM | FI_REMOTE_COMM | FI_TAGGED | FI_MSG;
+        x->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ENDPOINT;
+    });
+    check(h != nullptr and (h->caps & FI_HMEM) == 0 and (h->domain_attr->mr_mode & FI_MR_HMEM) == 0,
+          "aws-ofi-nccl's send/recv hints for host buffers select it without FI_HMEM or RMA registration modes");
+    fi_freeinfo(h);
+    fi_info* g = ours([](fi_info* x) { aws_ofi_nccl_rdma(x); x->domain_attr->mr_mode &= ~FI_MR_HMEM; });
+    check(g == nullptr, "FI_HMEM without FI_MR_HMEM is refused");
+    fi_freeinfo(g);
+    fi_info* e = ours([](fi_info* x) { aws_ofi_nccl_rdma(x); x->fabric_attr->prov_name = strdup("efa"); });
+    check(e != nullptr, "hints naming the provider efa select it");
+    fi_freeinfo(e);
+    fi_info* list = nullptr;
+    check(fi_getinfo(FI_VERSION(1, 18), "127.0.0.1", nullptr, 0, nullptr, &list) != 0 or
+              [&] { for (fi_info* i = list; i; i = i->next) if (std::strcmp(i->domain_attr->name, kDomain) == 0) return false; return true; }(),
+          "a node address is not served");
+    fi_freeinfo(list);
     fi_info* n = ours(nixl, FI_VERSION(1, 20));
     check(n != nullptr, "NIXL's hints, with the domain named, select the provider");
     fi_freeinfo(n);
@@ -129,9 +159,12 @@ void getinfo_checks() {
     fi_info* d = ours([](fi_info* h) { aws_ofi_nccl_rdma(h); h->domain_attr->cq_data_size = 8; });
     check(d == nullptr, "8 bytes of CQ data are refused");
     fi_freeinfo(d);
-    fi_info* any = ours([](fi_info*) {});
-    check(any != nullptr and (any->caps & FI_RMA) != 0, "empty hints select the provider");
+    fi_info* any = ours([](fi_info* x) { x->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM; });
+    check(any != nullptr and (any->caps & FI_RMA) != 0, "hints that name only registration modes select the provider");
     fi_freeinfo(any);
+    fi_info* none = ours([](fi_info*) {});
+    check(none != nullptr and (none->caps & FI_HMEM) == 0, "empty hints select the provider, without FI_HMEM");
+    fi_freeinfo(none);
 }
 
 struct Opened {
@@ -203,6 +236,8 @@ void object_checks() {
         check(fi_getname(&o.ep->fid, addr, &small) == -FI_ETOOSMALL and small == 32, "too small a buffer is reported");
         fi_addr_t fa = FI_ADDR_NOTAVAIL;
         check(fi_av_insert(o.av, addr, 1, &fa, 0, nullptr) == 1 and fa == 0, "the address inserts as fi_addr 0");
+        fi_addr_t again = FI_ADDR_NOTAVAIL;
+        check(fi_av_insert(o.av, addr, 1, &again, 0, nullptr) == 1 and again == fa, "inserting it again gives the same fi_addr");
         char back[32];
         size_t backlen = sizeof back;
         check(fi_av_lookup(o.av, fa, back, &backlen) == 0 and std::memcmp(back, addr, 32) == 0, "and looks up the same");
@@ -215,11 +250,19 @@ void object_checks() {
         check(fi_send(o.ep, buf, sizeof buf, nullptr, fa, nullptr) == -FI_ENOSYS, "a send reports -FI_ENOSYS");
         fi_cq_data_entry e;
         check(fi_cq_read(o.cq, &e, 1) == -FI_EAGAIN, "an empty CQ reads -FI_EAGAIN");
+        check(fi_close(&o.domain->fid) == -FI_EBUSY, "a domain with objects open on it does not close");
+        check(fi_close(&o.cq->fid) == -FI_EBUSY, "a CQ an endpoint is bound to does not close");
     }
     {
         Opened o;
         check(open_all(info, &o, false) == 0 and fi_enable(o.ep) == -FI_ENOCQ,
               "an endpoint without completion queues does not enable");
+    }
+    {
+        Opened o;
+        check(fi_fabric(info->fabric_attr, &o.fabric, nullptr) == 0 and fi_domain(o.fabric, info, &o.domain, nullptr) == 0 and
+                  fi_endpoint(o.domain, info, &o.ep, nullptr) == 0 and fi_enable(o.ep) == -FI_ENOAV,
+              "an endpoint without an address vector does not enable");
     }
     fi_freeinfo(info);
 }
