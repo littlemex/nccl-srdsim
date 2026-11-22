@@ -26,6 +26,8 @@
 #define SRDSIM_FABRIC_NAME "efa"
 /* The real provider names its RDM domain "<device>-rdm". */
 #define SRDSIM_DOMAIN_NAME "srdsim0-rdm"
+/* As EFA_RDM_IOV_LIMIT. */
+#define SRDSIM_IOV_MAX 4
 
 extern struct fi_provider srdsim_prov;
 extern struct util_prov srdsim_util_prov;
@@ -36,21 +38,27 @@ extern struct fi_info srdsim_info;
 
 /*
  * The address an endpoint reports from fi_getname and a peer inserts into its address vector: 32 bytes, the
- * size of the real provider's raw address, so buffers a consumer sizes for EFA hold it.
+ * size of the real provider's raw address, so buffers a consumer sizes for EFA hold it. The endpoint listens on
+ * the loopback interface at `port`.
  */
 struct srdsim_addr {
 	char magic[8];		/* SRDSIM_ADDR_MAGIC */
 	uint32_t version;	/* SRDSIM_ADDR_VERSION */
-	uint32_t reserved;
+	uint16_t port;		/* network byte order */
+	uint16_t reserved;
 	uint64_t nonce;		/* unique per endpoint */
-	uint64_t reserved2;
+	uint32_t ipv4;		/* network byte order */
+	uint32_t reserved2;
 };
 #define SRDSIM_ADDR_MAGIC "SRDSIMFI"
 #define SRDSIM_ADDR_VERSION 1
 
+struct srdsim_xfer;	/* the transfer engine of one endpoint, srdsim_xfer.c */
+
 struct srdsim_ep {
 	struct util_ep util_ep;
 	struct srdsim_addr addr;
+	struct srdsim_xfer *xfer;
 	bool enabled;
 	size_t max_msg_size;	/* from the fi_info it was opened with */
 	size_t inject_size;
@@ -65,6 +73,15 @@ struct srdsim_ep {
 	bool homogeneous_peers;
 	bool use_unsolicited_write_recv;
 };
+
+/* srdsim_xfer.c */
+int srdsim_xfer_open(struct srdsim_ep *ep);
+int srdsim_xfer_start(struct srdsim_ep *ep);
+void srdsim_xfer_close(struct srdsim_ep *ep);
+void srdsim_xfer_progress(struct util_ep *util_ep);
+extern struct fi_ops_msg srdsim_msg_ops;
+extern struct fi_ops_tagged srdsim_tagged_ops;
+extern struct fi_ops_rma srdsim_rma_ops;
 
 int srdsim_getinfo_alter(uint32_t version, const struct fi_info *hints, struct fi_info *info);
 int srdsim_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric, void *context);

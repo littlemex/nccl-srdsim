@@ -126,4 +126,18 @@ if(SRDSIM_BUILD_FI_TEST)
   enable_testing()
   add_test(NAME fi_provider COMMAND test_fi_provider ${SRDSIM_FI_PROVIDER})
   set_tests_properties(fi_provider PROPERTIES TIMEOUT 120)
+  add_executable(test_fi_transfer tests/fi/test_fi_transfer.cc)
+  target_link_libraries(test_fi_transfer PRIVATE PkgConfig::LIBFABRIC)
+  target_compile_options(test_fi_transfer PRIVATE ${SRDSIM_WARNINGS})
+  foreach(s IN ITEMS sendrecv tagged truncate read badkey writedata reorder)
+    add_test(NAME fi_transfer_${s} COMMAND test_fi_transfer ${SRDSIM_FI_PROVIDER} ${s})
+    set_tests_properties(fi_transfer_${s} PROPERTIES TIMEOUT 180)
+  endforeach()
+  # The same reordering never shows when everything is released in submission order.
+  add_test(NAME fi_transfer_reorder_inorder COMMAND test_fi_transfer ${SRDSIM_FI_PROVIDER} reorder)
+  set_tests_properties(fi_transfer_reorder_inorder PROPERTIES TIMEOUT 180 ENVIRONMENT SRDSIM_MODE=inorder)
+  # Negative control: a remote completion raised before its write has landed must be caught.
+  add_test(NAME fi_transfer_writedata_early COMMAND test_fi_transfer ${SRDSIM_FI_PROVIDER} writedata)
+  set_tests_properties(fi_transfer_writedata_early PROPERTIES TIMEOUT 180 ENVIRONMENT SRDSIM_FI_CQ_DATA_EARLY=1
+                       WILL_FAIL TRUE)
 endif()

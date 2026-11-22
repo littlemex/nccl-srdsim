@@ -271,9 +271,6 @@ void object_checks() {
             if (mr2) fi_close(&mr2->fid);
             fi_close(&mr->fid);
         }
-        // Transfers are not carried yet, and say so rather than succeed.
-        char buf[8] = {};
-        check(fi_send(o.ep, buf, sizeof buf, nullptr, fa, nullptr) == -FI_ENOSYS, "a send reports -FI_ENOSYS");
         fi_cq_data_entry e;
         check(fi_cq_read(o.cq, &e, 1) == -FI_EAGAIN, "an empty CQ reads -FI_EAGAIN");
         check(fi_close(&o.domain->fid) == -FI_EBUSY, "a domain with objects open on it does not close");

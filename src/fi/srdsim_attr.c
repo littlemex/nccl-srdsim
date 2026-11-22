@@ -6,8 +6,6 @@
  */
 #include "srdsim.h"
 
-/* As EFA_RDM_IOV_LIMIT. */
-#define SRDSIM_IOV_LIMIT 4
 /* Queue depths and the inject size are not those of any one device; they bound nothing yet. */
 #define SRDSIM_QUEUE_SIZE 4096
 #define SRDSIM_INJECT_SIZE 4096
@@ -32,7 +30,7 @@ static struct fi_tx_attr srdsim_tx_attr = {
 	.msg_order = SRDSIM_MSG_ORDER,
 	.inject_size = SRDSIM_INJECT_SIZE,
 	.size = SRDSIM_QUEUE_SIZE,
-	.iov_limit = SRDSIM_IOV_LIMIT,
+	.iov_limit = SRDSIM_IOV_MAX,
 	.rma_iov_limit = 1,
 };
 
@@ -41,7 +39,7 @@ static struct fi_rx_attr srdsim_rx_attr = {
 	.op_flags = FI_COMPLETION,
 	.msg_order = SRDSIM_MSG_ORDER,
 	.size = SRDSIM_QUEUE_SIZE,
-	.iov_limit = SRDSIM_IOV_LIMIT,
+	.iov_limit = SRDSIM_IOV_MAX,
 };
 
 static struct fi_ep_attr srdsim_ep_attr = {
