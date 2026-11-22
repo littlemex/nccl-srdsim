@@ -10,10 +10,10 @@
 |---|---|
 | `efa` としての登録、選び方、`fi_getinfo` | 済み |
 | fabric、domain、address vector、completion queue、endpoint の各オブジェクトと、EFA の endpoint オプション | 済み |
-| プロセス間の send、receive、RMA write (RMA プラグインと同じ fabric モデルの上で) | まだ。転送の呼び出しはすべて `-FI_ENOSYS` を返す |
-| ホストメモリの登録 (プロバイダが決めるキーつき) | 済み。libfabric の登録マップを使う |
-| immediate data つきの write、read、CUDA メモリの登録 | まだ |
-| 1 台での aws-ofi-nccl と nccl-tests、NIXL の libfabric 転送テスト | まだ |
+| プロセス間の send と receive (タグなしとタグつき)、RMA write、CQ データつき write、read を SRD の順序規則で運ぶ | 済み (`src/fi/srdsim_xfer.c`) |
+| ホストメモリと CUDA メモリの登録 (プロバイダが決めるキーつき) | 済み。libfabric の登録マップを使う。CUDA には libfabric を `--with-cuda` で configure する必要がある |
+| 1 台の GPU ホストで aws-ofi-nccl を通した NCCL (send/recv と RDMA の両プロトコル) | 動く。1 枚の GPU に 2 ランクで `all_reduce` が `srd` でも `inorder` でも正しい |
+| 1 台での NIXL の libfabric 転送テスト | まだ |
 
 ## ビルド
 

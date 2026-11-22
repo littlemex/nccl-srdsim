@@ -10,10 +10,10 @@
 |---|---|
 | Registration as `efa`, selection, `fi_getinfo` | Done |
 | Fabric, domain, address vector, completion queue and endpoint objects; the EFA endpoint options | Done |
-| Send, receive and RMA write between processes, over the fabric model the RMA plugin uses | Not yet: every transfer call returns `-FI_ENOSYS` |
-| Memory registration of host memory, with provider keys | Done, through libfabric's registration map |
-| Write with immediate data, read, registration of CUDA memory | Not yet |
-| aws-ofi-nccl with nccl-tests, NIXL's libfabric transfer tests, on one host | Not yet |
+| Sends and receives (untagged and tagged), RMA writes, writes with CQ data and reads between processes, with SRD's orderings | Done (`src/fi/srdsim_xfer.c`) |
+| Memory registration of host and CUDA memory, with provider keys | Done, through libfabric's registration map; CUDA needs libfabric configured `--with-cuda` |
+| NCCL over aws-ofi-nccl on one GPU host, with its send/recv and RDMA protocols | Runs: two ranks on one GPU, `all_reduce` correct under `srd` and `inorder` |
+| NIXL's libfabric transfer tests on one host | Not yet |
 
 ## Building
 
