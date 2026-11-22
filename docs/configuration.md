@@ -90,3 +90,11 @@ Each makes the fabric slow, bursty or partly stalled on purpose, never lossy, to
 | `SRDSIM_FREEZE_PEER` | count | none | The peer whose link is frozen; `0` is a peer |
 | `SRDSIM_FREEZE_AFTER_UNITS`, `SRDSIM_FREEZE_MS` | count | `0` | After this many units released to the frozen peer, release nothing more to it for this long (on the sending side, through the same room check as backpressure) |
 | `SRDSIM_SIGNAL_LAG_US` | count | `0` | An extra delay before each signal |
+
+## libfabric provider
+
+Read by the libfabric provider (`libsrdsim-fi.so`, see [the provider's documentation](libfabric-provider.md)) each time the option it governs is set.
+
+| Variable | Type | Default | Effect |
+|---|---|---|---|
+| `SRDSIM_FI_WRITE_IN_ORDER` | `0` or `1` | `1` | `1` accepts `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES`, as an EFA device that supports it does; `0` refuses it with `-FI_EOPNOTSUPP`, as one that does not. Any other value is logged and `1` is used |

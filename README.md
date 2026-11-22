@@ -20,6 +20,8 @@ NCCL's GIN proxy backend (`NCCL_GIN_TYPE=2`) routes every device-initiated put, 
 | Contract violations injected on purpose, to show a test can fail | Libraries built on NVSHMEM |
 | | Wire encoding, doorbells, PCIe ordering, and anything measured in seconds |
 
+Code that reaches EFA through libfabric rather than NCCL's RMA interface, such as aws-ofi-nccl and NIXL's libfabric backend, is served by a second front end, a libfabric provider named `efa`. It is being built; what it does so far is in [docs/libfabric-provider.md](docs/libfabric-provider.md).
+
 ## Delivery modes
 
 The default mode keeps the weak-signal guarantee of NCCL's [RMA plugin specification](https://github.com/NVIDIA/nccl/blob/ad2d192c1f279aefcaf340f67e07880b65a1116b/plugins/rma/README.md#L92-L97), which is what an unordered fabric can provide: a signal becomes visible only after every byte of its own put has landed, with no guarantee about earlier puts or signals. This documentation calls that rule invariant I1. Nothing else is ordered: puts complete in any order relative to each other, and the chunks of one put land in any order.
