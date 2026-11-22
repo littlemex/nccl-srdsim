@@ -11,7 +11,8 @@
 | `efa` としての登録、選び方、`fi_getinfo` | 済み |
 | fabric、domain、address vector、completion queue、endpoint の各オブジェクトと、EFA の endpoint オプション | 済み |
 | プロセス間の send、receive、RMA write (RMA プラグインと同じ fabric モデルの上で) | まだ。転送の呼び出しはすべて `-FI_ENOSYS` を返す |
-| immediate data つきの write、read、メモリ登録 (ホストと CUDA) | まだ |
+| ホストメモリの登録 (プロバイダが決めるキーつき) | 済み。libfabric の登録マップを使う |
+| immediate data つきの write、read、CUDA メモリの登録 | まだ |
 | 1 台での aws-ofi-nccl と nccl-tests、NIXL の libfabric 転送テスト | まだ |
 
 ## ビルド
@@ -48,7 +49,7 @@ export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
 | CQ データ | 4 バイト | EFA で `fi_writedata` が運ぶ大きさ |
 | 進行 | データも制御も手動 | 本物のプロバイダと同じ。自動進行を求める hints は断る |
 
-endpoint のオプションには、libfabric の `prov/efa/src/rdm/efa_rdm_ep_fiops.c` と同じように答える。`FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` は、本物の RDM endpoint と同じく断る。`FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` は受け付け、`SRDSIM_FI_WRITE_IN_ORDER=0` ([設定](configuration.ja.md#libfabric-プロバイダ)) のときは断る。これで、使う側の「これを持たないデバイス」向けの経路も試せる。`FI_OPT_EFA_EMULATED_READ` と `FI_OPT_EFA_EMULATED_WRITE` は false を返す。
+endpoint のオプションには、libfabric の `prov/efa/src/rdm/efa_rdm_ep_fiops.c` と同じように答える。`FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` は、本物の RDM endpoint と同じく断る。`FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` は受け付け、`SRDSIM_FI_WRITE_IN_ORDER=0` ([設定](configuration.ja.md#libfabric-プロバイダ)) のときは断る。これで、使う側の「これを持たないデバイス」向けの経路も試せる。`FI_OPT_EFA_EMULATED_READ` と `FI_OPT_EFA_EMULATED_WRITE` は false を返し、`FI_OPT_EFA_USE_DEVICE_RDMA` を false にした後は true を返す。`FI_OPT_EFA_EMULATED_ATOMICS` は true を返す。`FI_HMEM` は、デバイスメモリを運べるようになるまでは、GPU の有無にかかわらず提供する。
 
 ## テスト
 

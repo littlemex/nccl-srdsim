@@ -135,7 +135,7 @@ static int srdsim_ep_getopt(fid_t fid, int level, int optname, void *optval, siz
 {
 	struct srdsim_ep *ep = container_of(fid, struct srdsim_ep, util_ep.ep_fid.fid);
 	size_t size;
-	bool no = false;
+	bool emulated, yes = true;
 
 	if (level != FI_OPT_ENDPOINT)
 		return -FI_ENOPROTOOPT;
@@ -157,10 +157,16 @@ static int srdsim_ep_getopt(fid_t fid, int level, int optname, void *optval, siz
 	case FI_OPT_INJECT_RMA_SIZE:
 		size = ep->inject_size;
 		return srdsim_get(optval, optlen, &size, sizeof(size));
-	/* Reads and writes are carried as such, not emulated with sends. */
+	/*
+	 * Reads and writes are carried as such unless the consumer turned device RDMA off; atomics, which are not
+	 * offered, read as emulated, as on the real endpoint.
+	 */
 	case FI_OPT_EFA_EMULATED_READ:
 	case FI_OPT_EFA_EMULATED_WRITE:
-		return srdsim_get(optval, optlen, &no, sizeof(no));
+		emulated = !ep->use_device_rdma;
+		return srdsim_get(optval, optlen, &emulated, sizeof(emulated));
+	case FI_OPT_EFA_EMULATED_ATOMICS:
+		return srdsim_get(optval, optlen, &yes, sizeof(yes));
 	default:
 		return -FI_ENOPROTOOPT;
 	}
@@ -293,7 +299,7 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 	ep->max_msg_size = info->ep_attr->max_msg_size;
 	ep->inject_size = info->tx_attr->inject_size;
 	/* The real endpoint's defaults. */
-	ep->rnr_retry = 7;
+	ep->rnr_retry = 3;	/* EFA_RDM_DEFAULT_RNR_RETRY */
 	ep->hmem_p2p = FI_HMEM_P2P_ENABLED;
 	ep->cuda_api_permitted = true;
 	ep->shared_memory_permitted = true;

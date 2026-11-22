@@ -225,6 +225,17 @@ void object_checks() {
         check(fi_getopt(&o.ep->fid, FI_OPT_ENDPOINT, FI_OPT_EFA_EMULATED_WRITE, &emulated, &len) == 0 and
                   len == sizeof(bool) and not emulated,
               "FI_OPT_EFA_EMULATED_WRITE reads false, as aws-ofi-nccl's RDMA protocol requires");
+        size_t rnr = 0, rnrlen = sizeof rnr;
+        check(fi_getopt(&o.ep->fid, FI_OPT_ENDPOINT, FI_OPT_EFA_RNR_RETRY, &rnr, &rnrlen) == 0 and rnr == 7,
+              "FI_OPT_EFA_RNR_RETRY reads back what was set");
+        {
+            Opened d;
+            bool off = false, em = false;
+            size_t emlen = sizeof em;
+            check(open_all(info, &d) == 0 and setopt(d.ep, FI_OPT_EFA_USE_DEVICE_RDMA, off) == 0 and
+                      fi_getopt(&d.ep->fid, FI_OPT_ENDPOINT, FI_OPT_EFA_EMULATED_READ, &em, &emlen) == 0 and em,
+                  "with device RDMA off, reads read as emulated");
+        }
 
         check(fi_enable(o.ep) == 0, "the endpoint enables");
         check(setopt(o.ep, FI_OPT_EFA_RNR_RETRY, size_t(3)) == -FI_EINVAL, "FI_OPT_EFA_RNR_RETRY after enabling is refused");
@@ -245,6 +256,21 @@ void object_checks() {
         fi_addr_t bad = 0;
         check(fi_av_insert(o.av, garbage, 1, &bad, 0, nullptr) == 0 and bad == FI_ADDR_NOTAVAIL,
               "an address that is not the provider's does not insert");
+        check(fi_av_remove(o.av, &bad, 1, 0) == -FI_EINVAL, "removing an address that was never inserted is refused");
+        // Host memory registers through libfabric's registration map, with a provider key.
+        static char region[4096];
+        fid_mr* mr = nullptr;
+        check(fi_mr_reg(o.domain, region, sizeof region, FI_REMOTE_WRITE | FI_REMOTE_READ, 0, 0, 0, &mr, nullptr) == 0 and
+                  mr != nullptr,
+              "host memory registers");
+        if (mr) {
+            fid_mr* mr2 = nullptr;
+            check(fi_mr_reg(o.domain, region + 64, 64, FI_REMOTE_WRITE, 0, 0, 0, &mr2, nullptr) == 0 and
+                      fi_mr_key(mr) != fi_mr_key(mr2),
+                  "two registrations get different provider keys");
+            if (mr2) fi_close(&mr2->fid);
+            fi_close(&mr->fid);
+        }
         // Transfers are not carried yet, and say so rather than succeed.
         char buf[8] = {};
         check(fi_send(o.ep, buf, sizeof buf, nullptr, fa, nullptr) == -FI_ENOSYS, "a send reports -FI_ENOSYS");

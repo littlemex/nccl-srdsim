@@ -92,7 +92,8 @@ static int srdsim_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr, size_t co
 
 	ofi_genlock_lock(&av->lock);
 	for (i = 0; i < count && ret == 0; i++)
-		ret = ofi_av_remove_addr(av, fi_addr[i]);
+		ret = ofi_bufpool_ibuf_is_valid(av->av_entry_pool, fi_addr[i]) ?
+		      ofi_av_remove_addr(av, fi_addr[i]) : -FI_EINVAL;
 	ofi_genlock_unlock(&av->lock);
 	return ret;
 }

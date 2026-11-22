@@ -409,8 +409,8 @@ jobs:
           if ls "$RUNNER_TEMP/libfabric/lib/libfabric/" | grep -q srdsim; then
             echo "the provider is in libfabric's default provider directory"; exit 1
           fi
-          FI_LOG_LEVEL=info "$FI" -l > /dev/null 2> unnamed.log
-          if grep -q 'registering provider: efa (0\.' unnamed.log; then echo "the provider was loaded without being named"; exit 1; fi
+          FI_LOG_LEVEL=info "$FI" -p efa > unnamed.out 2> unnamed.log || true
+          if grep -q 'srdsim' unnamed.out unnamed.log; then echo "the provider was loaded without being named"; exit 1; fi
           FI_LOG_LEVEL=info FI_PROVIDER_PATH="+$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so" "$FI" -p efa > named.out 2> named.log
           grep -q 'loading preferred provider' named.log || { echo "the named provider was not loaded as preferred"; exit 1; }
           grep -q 'domain: srdsim0-rdm' named.out || { echo "fi_info does not list the provider when it is named"; cat named.out; exit 1; }

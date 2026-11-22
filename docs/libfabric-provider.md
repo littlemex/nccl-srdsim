@@ -11,7 +11,8 @@
 | Registration as `efa`, selection, `fi_getinfo` | Done |
 | Fabric, domain, address vector, completion queue and endpoint objects; the EFA endpoint options | Done |
 | Send, receive and RMA write between processes, over the fabric model the RMA plugin uses | Not yet: every transfer call returns `-FI_ENOSYS` |
-| Write with immediate data, read, memory registration (host and CUDA) | Not yet |
+| Memory registration of host memory, with provider keys | Done, through libfabric's registration map |
+| Write with immediate data, read, registration of CUDA memory | Not yet |
 | aws-ofi-nccl with nccl-tests, NIXL's libfabric transfer tests, on one host | Not yet |
 
 ## Building
@@ -48,7 +49,7 @@ export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
 | CQ data | 4 bytes | What `fi_writedata` carries on EFA |
 | Progress | Manual, for data and control | As the real provider; hints asking for automatic progress are refused |
 
-The endpoint options are answered as in libfabric's `prov/efa/src/rdm/efa_rdm_ep_fiops.c`. `FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` is refused, as by the real RDM endpoint. `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` is accepted, and refused with `SRDSIM_FI_WRITE_IN_ORDER=0` ([configuration](configuration.md#libfabric-provider)), so a consumer's path for a device without it can be tested. `FI_OPT_EFA_EMULATED_READ` and `FI_OPT_EFA_EMULATED_WRITE` read false.
+The endpoint options are answered as in libfabric's `prov/efa/src/rdm/efa_rdm_ep_fiops.c`. `FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` is refused, as by the real RDM endpoint. `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` is accepted, and refused with `SRDSIM_FI_WRITE_IN_ORDER=0` ([configuration](configuration.md#libfabric-provider)), so a consumer's path for a device without it can be tested. `FI_OPT_EFA_EMULATED_READ` and `FI_OPT_EFA_EMULATED_WRITE` read false, and true once `FI_OPT_EFA_USE_DEVICE_RDMA` is set false; `FI_OPT_EFA_EMULATED_ATOMICS` reads true. `FI_HMEM` is offered whether or not a GPU is present, until device memory is carried.
 
 ## Testing
 
