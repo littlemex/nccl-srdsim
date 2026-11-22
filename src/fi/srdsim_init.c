@@ -35,6 +35,7 @@ static int srdsim_getinfo(uint32_t version, const char *node, const char *servic
 
 static void srdsim_fini(void)
 {
+	srdsim_free_infos();
 	ofi_monitors_cleanup();
 	ofi_hmem_cleanup();
 	ofi_mem_fini();
@@ -55,5 +56,7 @@ FI_EXT_INI
 	ofi_mem_init();
 	ofi_hmem_init();
 	ofi_monitors_init();
+	if (srdsim_build_infos())
+		return NULL;
 	return &srdsim_prov;
 }

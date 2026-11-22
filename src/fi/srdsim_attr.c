@@ -4,6 +4,9 @@
  * provider's RDM endpoint in libfabric's prov/efa/src/efa_prov_info.c and efa_user_info.c, except where a
  * comment says otherwise.
  */
+#include <dirent.h>
+#include <stdio.h>
+
 #include "srdsim.h"
 
 /* Queue depths and the inject size are not those of any one device; they bound nothing yet. */
@@ -129,4 +132,131 @@ int srdsim_getinfo_alter(uint32_t version, const struct fi_info *hints, struct f
 	if (!hints || !hints->domain_attr || hints->domain_attr->resource_mgmt == FI_RM_UNSPEC)
 		info->domain_attr->resource_mgmt = FI_RM_ENABLED;
 	return 0;
+}
+
+/*
+ * The NICs the provider reports: one per NVIDIA GPU on the host, each named srdsim<N>-rdm and placed at that
+ * GPU's PCI address, as an EFA instance has a NIC next to each GPU. Consumers that pair GPUs with NICs by
+ * their place in the PCI topology (aws-ofi-nccl does) then pair each GPU with its own emulated NIC. A host
+ * without NVIDIA GPUs gets one NIC with no bus address.
+ */
+#define SRDSIM_MAX_NICS 64
+
+struct srdsim_pci { unsigned domain, bus, dev, func; };
+
+static int srdsim_pci_cmp(const void *a, const void *b)
+{
+	const struct srdsim_pci *x = a, *y = b;
+
+	if (x->domain != y->domain)
+		return x->domain < y->domain ? -1 : 1;
+	if (x->bus != y->bus)
+		return x->bus < y->bus ? -1 : 1;
+	if (x->dev != y->dev)
+		return x->dev < y->dev ? -1 : 1;
+	return x->func < y->func ? -1 : x->func > y->func;
+}
+
+static bool srdsim_read_hex(const char *dir, const char *file, unsigned long *out)
+{
+	char path[512], buf[32];
+	FILE *f;
+	bool ok;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, file);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+	ok = fgets(buf, sizeof(buf), f) && sscanf(buf, "%lx", out) == 1;
+	fclose(f);
+	return ok;
+}
+
+static size_t srdsim_find_gpus(struct srdsim_pci *out, size_t max)
+{
+	const char *root = "/sys/bus/pci/devices";
+	struct srdsim_pci p;
+	struct dirent *d;
+	unsigned long vendor, cls;
+	char dir[512];
+	size_t n = 0;
+	DIR *dp = opendir(root);
+
+	if (!dp)
+		return 0;
+	while ((d = readdir(dp)) && n < max) {
+		if (sscanf(d->d_name, "%x:%x:%x.%x", &p.domain, &p.bus, &p.dev, &p.func) != 4)
+			continue;
+		snprintf(dir, sizeof(dir), "%s/%s", root, d->d_name);
+		/* NVIDIA's vendor id, and the display (0x03xx) device classes GPUs report. */
+		if (srdsim_read_hex(dir, "vendor", &vendor) && vendor == 0x10de &&
+		    srdsim_read_hex(dir, "class", &cls) && (cls >> 16) == 0x03)
+			out[n++] = p;
+	}
+	closedir(dp);
+	qsort(out, n, sizeof(*out), srdsim_pci_cmp);
+	return n;
+}
+
+static struct fi_info *srdsim_nic_info(size_t index, const struct srdsim_pci *pci)
+{
+	struct fi_info *info = fi_dupinfo(&srdsim_info);
+	struct fid_nic *nic;
+	char name[64];
+
+	if (!info)
+		return NULL;
+	snprintf(name, sizeof(name), "srdsim%zu-rdm", index);
+	free(info->domain_attr->name);
+	info->domain_attr->name = strdup(name);
+	nic = ofi_nic_dup(NULL);
+	if (!info->domain_attr->name || !nic) {
+		fi_freeinfo(info);
+		return NULL;
+	}
+	snprintf(name, sizeof(name), "srdsim%zu", index);
+	nic->device_attr->name = strdup(name);
+	nic->device_attr->vendor_id = strdup("0x1d0f");	/* Amazon, as EFA reports */
+	nic->device_attr->device_id = strdup("0xefa1");
+	nic->device_attr->driver = strdup("srdsim");
+	nic->link_attr->address = strdup(name);
+	nic->link_attr->network_type = strdup("Ethernet");
+	nic->link_attr->mtu = 8192;
+	nic->link_attr->speed = 100000000000ull;
+	nic->link_attr->state = FI_LINK_UP;
+	if (pci) {
+		nic->bus_attr->bus_type = FI_BUS_PCI;
+		nic->bus_attr->attr.pci.domain_id = (uint16_t) pci->domain;
+		nic->bus_attr->attr.pci.bus_id = (uint8_t) pci->bus;
+		nic->bus_attr->attr.pci.device_id = (uint8_t) pci->dev;
+		nic->bus_attr->attr.pci.function_id = (uint8_t) pci->func;
+	}
+	info->nic = nic;
+	return info;
+}
+
+int srdsim_build_infos(void)
+{
+	struct srdsim_pci gpus[SRDSIM_MAX_NICS];
+	struct fi_info *head = NULL, **tail = &head, *info;
+	size_t n = srdsim_find_gpus(gpus, SRDSIM_MAX_NICS), i;
+
+	for (i = 0; i < (n ? n : 1); i++) {
+		info = srdsim_nic_info(i, n ? &gpus[i] : NULL);
+		if (!info) {
+			fi_freeinfo(head);
+			return -FI_ENOMEM;
+		}
+		*tail = info;
+		tail = &info->next;
+	}
+	srdsim_util_prov.info = head;
+	return 0;
+}
+
+void srdsim_free_infos(void)
+{
+	if (srdsim_util_prov.info != &srdsim_info)
+		fi_freeinfo(srdsim_util_prov.info);
+	srdsim_util_prov.info = &srdsim_info;
 }

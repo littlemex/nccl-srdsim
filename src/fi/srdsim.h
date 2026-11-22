@@ -83,6 +83,8 @@ extern struct fi_ops_msg srdsim_msg_ops;
 extern struct fi_ops_tagged srdsim_tagged_ops;
 extern struct fi_ops_rma srdsim_rma_ops;
 
+int srdsim_build_infos(void);
+void srdsim_free_infos(void);
 int srdsim_getinfo_alter(uint32_t version, const struct fi_info *hints, struct fi_info *info);
 int srdsim_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric, void *context);
 int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct fid_domain **domain,
