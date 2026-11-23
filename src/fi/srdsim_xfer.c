@@ -189,6 +189,9 @@ struct srdsim_xfer {
 	size_t chunk;
 	bool cq_data_early;
 	size_t jitter_us;
+	bool direct;			/* the efa-direct fabric: sends are not ordered either */
+	bool rx_cq_data;		/* FI_RX_CQ_DATA: remote CQ data consumes a posted receive */
+	struct dlist_entry cq_data_waiting;	/* remote CQ data that found no receive posted yet */
 	struct dlist_entry delayed;	/* in order of `due` */
 	uint64_t rng;			/* the consumer thread's choices: release order */
 	uint64_t agent_rng;		/* the agent's: delays, the order of a read's answer */
@@ -525,6 +528,48 @@ static int srdsim_store(struct ofi_mr *mr, void *dst, const char *src, size_t le
 	return 0;
 }
 
+/* Remote CQ data waiting, under FI_RX_CQ_DATA, for a receive to consume. */
+struct srdsim_cq_data {
+	struct dlist_entry entry;
+	uint64_t data;
+	bool has_src;
+	struct srdsim_addr src;
+};
+
+/*
+ * A write with CQ data has landed. Under FI_RX_CQ_DATA it consumes the oldest posted receive, whose context
+ * its completion carries, and waits for one if none is posted, as the device retries a receiver that is not
+ * ready; otherwise it completes on its own. Called with x->mu held.
+ */
+static void srdsim_raise_cq_data(struct srdsim_xfer *x, uint64_t data, const struct srdsim_addr *src)
+{
+	const uint64_t flags = FI_RMA | FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA;
+	struct srdsim_recv *r;
+	struct srdsim_cq_data *d;
+
+	if (!x->rx_cq_data) {
+		srdsim_event(x, SRDSIM_EV_RX, NULL, flags, 0, NULL, data, 0, 0, 0, src);
+		return;
+	}
+	if (!dlist_empty(&x->recvs) && dlist_empty(&x->cq_data_waiting)) {
+		dlist_pop_front(&x->recvs, struct srdsim_recv, r, entry);
+		srdsim_event(x, SRDSIM_EV_RX, r->context, flags, 0, NULL, data, 0, 0, 0, src);
+		free(r);
+		return;
+	}
+	d = calloc(1, sizeof(*d));
+	if (!d) {
+		SRDSIM_WARN(FI_LOG_EP_DATA, "out of memory: remote CQ data is lost\n");
+		return;
+	}
+	d->data = data;
+	if (src) {
+		d->has_src = true;
+		d->src = *src;
+	}
+	dlist_insert_tail(&d->entry, &x->cq_data_waiting);
+}
+
 static void srdsim_on_write(struct srdsim_xfer *x, struct srdsim_conn *c, const struct srdsim_frame *f,
 			    const char *payload)
 {
@@ -563,8 +608,7 @@ static void srdsim_on_write(struct srdsim_xfer *x, struct srdsim_conn *c, const 
 
 	if ((w->flags & SRDSIM_FR_CQ_DATA) && !w->cq_data_raised && !w->status &&
 	    (w->landed == w->total || x->cq_data_early)) {
-		srdsim_event(x, SRDSIM_EV_RX, NULL, FI_RMA | FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA, 0, NULL, w->data, 0,
-			     0, 0, c->peer_known ? &c->peer : NULL);
+		srdsim_raise_cq_data(x, w->data, c->peer_known ? &c->peer : NULL);
 		w->cq_data_raised = true;
 	}
 	if (w->landed >= w->total) {
@@ -1202,7 +1246,7 @@ static bool srdsim_eligible(struct srdsim_xfer *x, struct srdsim_op *op)
 {
 	struct srdsim_op *e;
 
-	if (op->kind != SRDSIM_OP_SEND)
+	if (op->kind != SRDSIM_OP_SEND || x->direct)
 		return true;
 	dlist_foreach_container(&x->pending, struct srdsim_op, e, entry) {
 		if (e == op)
@@ -1334,6 +1378,17 @@ static ssize_t srdsim_post_recv(struct fid_ep *ep_fid, bool tagged, const struct
 	}
 
 	pthread_mutex_lock(&x->mu);
+	if (!tagged && !dlist_empty(&x->cq_data_waiting)) {
+		struct srdsim_cq_data *d;
+
+		dlist_pop_front(&x->cq_data_waiting, struct srdsim_cq_data, d, entry);
+		srdsim_event(x, SRDSIM_EV_RX, r->context, FI_RMA | FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA, 0, NULL,
+			     d->data, 0, 0, 0, d->has_src ? &d->src : NULL);
+		free(d);
+		free(r);
+		pthread_mutex_unlock(&x->mu);
+		return 0;
+	}
 	dlist_foreach_container(tagged ? &x->tunexp : &x->unexp, struct srdsim_unexp, u, entry)
 		if (!u->claimed && srdsim_recv_matches(r, tagged, u->tag, &u->src)) {
 			found = u;
@@ -1626,6 +1681,7 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 	dlist_init(&x->inwrites);
 	dlist_init(&x->events);
 	dlist_init(&x->delayed);
+	dlist_init(&x->cq_data_waiting);
 	pthread_mutex_init(&x->mu, NULL);
 
 	x->mode = SRDSIM_MODE_SRD;
@@ -1643,6 +1699,8 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 	x->rng = seed * 0x9E3779B97F4A7C15ull + index;
 	x->agent_rng = ~x->rng;
 	x->tx_size = ep->tx_size;
+	x->direct = ep->direct;
+	x->rx_cq_data = ep->rx_cq_data;
 	x->scratch = malloc(x->chunk);
 	if (!x->scratch) {
 		ep->xfer = x;
@@ -1751,6 +1809,12 @@ void srdsim_xfer_close(struct srdsim_ep *ep)
 	while (!dlist_empty(&x->events)) {
 		dlist_pop_front(&x->events, struct srdsim_event, e, entry);
 		free(e);
+	}
+	while (!dlist_empty(&x->cq_data_waiting)) {
+		struct srdsim_cq_data *q = container_of(x->cq_data_waiting.next, struct srdsim_cq_data, entry);
+
+		dlist_remove(&q->entry);
+		free(q);
 	}
 	while (!dlist_empty(&x->delayed)) {
 		struct srdsim_delayed *d = container_of(x->delayed.next, struct srdsim_delayed, entry);

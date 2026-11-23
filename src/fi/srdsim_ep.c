@@ -265,6 +265,8 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 		return -FI_EOTHER;
 	}
 	ep->tx_size = info->tx_attr->size;
+	ep->direct = srdsim_info_is_direct(info);
+	ep->rx_cq_data = info->mode & FI_RX_CQ_DATA;
 	ep->inject_size = info->tx_attr->inject_size;
 	ret = srdsim_xfer_open(ep);
 	if (ret) {
