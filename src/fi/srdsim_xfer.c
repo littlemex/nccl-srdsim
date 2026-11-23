@@ -940,6 +940,7 @@ static void srdsim_out_compact(struct srdsim_buf *b)
 		b->len -= b->off;
 		b->off = 0;
 	}
+}
 
 static bool srdsim_conn_write(struct srdsim_conn *c)
 {
@@ -961,8 +962,6 @@ static bool srdsim_conn_write(struct srdsim_conn *c)
 	}
 	c->out.len = c->out.off = 0;
 	return true;
-}
-
 }
 
 /* A connection broke: what was travelling on it fails, and it is closed. Called with x->mu held. */
