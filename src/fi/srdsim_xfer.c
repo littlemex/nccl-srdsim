@@ -91,6 +91,7 @@ struct srdsim_conn {
 	struct dlist_entry entry;
 	int fd;
 	bool dialed;			/* by this endpoint, to send on */
+	bool connecting;		/* dialled, the connect not yet finished: nothing is read or written */
 	bool peer_known;
 	struct srdsim_addr peer;
 	struct srdsim_buf in, out;
@@ -433,24 +434,25 @@ static struct srdsim_conn *srdsim_conn_to(struct srdsim_xfer *x, const struct sr
 	struct srdsim_frame hello = { .type = SRDSIM_F_HELLO, .len = sizeof(struct srdsim_addr) };
 	struct sockaddr_in sin = { .sin_family = AF_INET };
 	struct srdsim_conn *c;
+	bool connecting;
 	int fd;
 
 	dlist_foreach_container(&x->conns, struct srdsim_conn, c, entry)
 		if (c->dialed && srdsim_addr_equal(&c->peer, peer))
 			return c;
 
-	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0)
 		return NULL;
 	sin.sin_port = peer->port;
 	sin.sin_addr.s_addr = peer->ipv4;
-	/* A blocking connect to the loopback interface completes or fails at once. */
-	if (connect(fd, (struct sockaddr *) &sin, sizeof(sin))) {
+	/*
+	 * The connect never blocks this thread, which holds the endpoint's lock: it finishes in the agent, and what
+	 * is queued meanwhile goes out once it has. A refused or failed connect fails the operations queued on it.
+	 */
+	connecting = connect(fd, (struct sockaddr *) &sin, sizeof(sin)) != 0;
+	if (connecting && errno != EINPROGRESS) {
 		SRDSIM_WARN(FI_LOG_EP_DATA, "cannot connect to port %u: %s\n", ntohs(peer->port), strerror(errno));
-		close(fd);
-		return NULL;
-	}
-	if (fcntl(fd, F_SETFL, O_NONBLOCK)) {
 		close(fd);
 		return NULL;
 	}
@@ -459,6 +461,7 @@ static struct srdsim_conn *srdsim_conn_to(struct srdsim_xfer *x, const struct sr
 		close(fd);
 		return NULL;
 	}
+	c->connecting = connecting;
 	c->peer = *peer;
 	c->peer_known = true;
 	if (srdsim_send_frame(c, &hello, &x->ep->addr)) {
@@ -1055,7 +1058,7 @@ static void srdsim_conn_lost(struct srdsim_xfer *x, struct srdsim_conn *c)
 	for (i = 0; i < 2; i++)
 		dlist_foreach_container_safe(lists[i], struct srdsim_op, op, entry, otmp)
 			if (op->conn == c)
-				srdsim_op_done(x, op, -FI_EIO);
+				srdsim_op_done(x, op, c->connecting ? -FI_EHOSTUNREACH : -FI_EIO);
 	struct srdsim_delayed *d, *dtmp;
 
 	dlist_foreach_container_safe(&x->delayed, struct srdsim_delayed, d, entry, dtmp)
@@ -1071,6 +1074,23 @@ static void srdsim_conn_lost(struct srdsim_xfer *x, struct srdsim_conn *c)
 	if (c->inmsg.active)
 		srdsim_inmsg_abort(x, &c->inmsg, c->inmsg.flags & SRDSIM_FR_TAGGED);
 	srdsim_conn_free(c);
+}
+
+/* A dialled connection's connect has finished, or failed. False when it failed. */
+static bool srdsim_conn_finish_connect(struct srdsim_conn *c, short revents)
+{
+	int err = 0;
+	socklen_t len = sizeof(err);
+
+	if (!(revents & (POLLOUT | POLLERR | POLLHUP)))
+		return true;
+	if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) || err) {
+		SRDSIM_WARN(FI_LOG_EP_DATA, "cannot connect to port %u: %s\n", ntohs(c->peer.port),
+			    strerror(err ? err : errno));
+		return false;
+	}
+	c->connecting = false;
+	return true;
 }
 
 static void *srdsim_agent(void *arg)
@@ -1100,7 +1120,8 @@ static void *srdsim_agent(void *arg)
 		pfd[1] = (struct pollfd) { .fd = x->listen_fd, .events = POLLIN };
 		i = 2;
 		dlist_foreach_container(&x->conns, struct srdsim_conn, c, entry) {
-			pfd[i] = (struct pollfd) { .fd = c->fd, .events = POLLIN | (c->out.len > c->out.off ? POLLOUT : 0) };
+			pfd[i] = (struct pollfd) { .fd = c->fd, .events = c->connecting ? POLLOUT :
+						   POLLIN | (c->out.len > c->out.off ? POLLOUT : 0) };
 			who[i++] = c;
 		}
 		pthread_mutex_unlock(&x->mu);
@@ -1116,6 +1137,11 @@ static void *srdsim_agent(void *arg)
 		}
 		for (i = 2; i < n; i++) {
 			c = who[i];
+			if (c->connecting) {
+				if (!srdsim_conn_finish_connect(c, pfd[i].revents))
+					srdsim_conn_lost(x, c);
+				continue;
+			}
 			if ((pfd[i].revents & (POLLIN | POLLHUP | POLLERR)) && !srdsim_conn_read(x, c)) {
 				srdsim_conn_lost(x, c);
 				continue;
@@ -1125,7 +1151,7 @@ static void *srdsim_agent(void *arg)
 		}
 		/* Frames queued while handling the ones above go out now, not after the next poll. */
 		dlist_foreach_container_safe(&x->conns, struct srdsim_conn, c, entry, tmp)
-			if (c->out.len > c->out.off && !srdsim_conn_write(c))
+			if (!c->connecting && c->out.len > c->out.off && !srdsim_conn_write(c))
 				srdsim_conn_lost(x, c);
 	}
 	pthread_mutex_unlock(&x->mu);

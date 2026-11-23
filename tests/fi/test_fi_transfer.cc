@@ -5,7 +5,7 @@
 //
 //   test_fi_transfer PROVIDER_SO SCENARIO
 //
-// SCENARIO is one of sendrecv, tagged, inject, truncate, read, badkey, writedata, reorder. The program exits 0 when
+// SCENARIO is one of sendrecv, tagged, inject, unreachable, truncate, read, badkey, writedata, reorder. The program exits 0 when
 // the scenario's checks pass and 1 when one fails; each check prints one line.
 //
 // writedata checks EFA's guarantee that a write's remote completion with CQ data comes only after every byte
@@ -22,6 +22,7 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_tagged.h>
 
+#include <arpa/inet.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -270,6 +271,35 @@ void inject(Endpoint* e) {
     barrier();
 }
 
+// A send to an endpoint that is not listening fails with FI_EHOSTUNREACH on the sender's CQ, and the sender goes on.
+void unreachable(Endpoint* e) {
+    if (g_rank == 0) {
+        char mine[32];
+        size_t len = sizeof mine;
+        if (int rc = fi_getname(&e->ep->fid, mine, &len)) die("fi_getname", rc);
+        char other[32];
+        std::memcpy(other, mine, sizeof other);
+        const uint16_t closed_port = htons(1);            // nothing listens on port 1
+        std::memcpy(other + 12, &closed_port, sizeof closed_port);
+        other[16] ^= 0x5a;                                // a different endpoint, by nonce
+        fi_addr_t dead = FI_ADDR_NOTAVAIL;
+        if (fi_av_insert(e->av, other, 1, &dead, 0, nullptr) != 1) die("fi_av_insert", -FI_EINVAL);
+        char m[16] = "to nobody";
+        if (int rc = int(fi_send(e->ep, m, sizeof m, nullptr, dead, nullptr))) die("fi_send", rc);
+        fi_cq_tagged_entry c;
+        fi_cq_err_entry err = {};
+        check(wait_cq(e, &c, &err) == FI_EHOSTUNREACH, "a send to an endpoint nobody listens on completes with FI_EHOSTUNREACH");
+        if (int rc = int(fi_send(e->ep, m, sizeof m, nullptr, e->peer, nullptr))) die("fi_send", rc);
+        check(wait_cq(e, &c) == 0, "and the endpoint still sends to a live peer");
+    } else {
+        char b[16];
+        if (int rc = int(fi_recv(e->ep, b, sizeof b, nullptr, FI_ADDR_UNSPEC, nullptr))) die("fi_recv", rc);
+        fi_cq_tagged_entry c;
+        if (wait_cq(e, &c)) die("recv completion", -FI_EIO);
+    }
+    barrier();
+}
+
 // A message larger than its receive is truncated and reported as such.
 void truncate(Endpoint* e) {
     if (g_rank == 0) {
@@ -434,6 +464,7 @@ int main(int argc, char** argv) {
     else if (scenario == "tagged") tagged(&e);
     else if (scenario == "truncate") truncate(&e);
     else if (scenario == "inject") inject(&e);
+    else if (scenario == "unreachable") unreachable(&e);
     else if (scenario == "read") read_region(&e);
     else if (scenario == "badkey") badkey(&e);
     else if (scenario == "writedata") writedata(&e);
