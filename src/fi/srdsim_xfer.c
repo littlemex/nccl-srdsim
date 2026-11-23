@@ -932,6 +932,15 @@ static bool srdsim_conn_read(struct srdsim_xfer *x, struct srdsim_conn *c)
 	return true;
 }
 
+/* Drops what has been written from the front of an outbound buffer that is never fully drained. */
+static void srdsim_out_compact(struct srdsim_buf *b)
+{
+	if (b->off > (1u << 20) && b->off * 2 > b->len) {
+		memmove(b->p, b->p + b->off, b->len - b->off);
+		b->len -= b->off;
+		b->off = 0;
+	}
+
 static bool srdsim_conn_write(struct srdsim_conn *c)
 {
 	ssize_t n;
@@ -954,14 +963,6 @@ static bool srdsim_conn_write(struct srdsim_conn *c)
 	return true;
 }
 
-/* Drops what has been written from the front of an outbound buffer that is never fully drained. */
-static void srdsim_out_compact(struct srdsim_buf *b)
-{
-	if (b->off > (1u << 20) && b->off * 2 > b->len) {
-		memmove(b->p, b->p + b->off, b->len - b->off);
-		b->len -= b->off;
-		b->off = 0;
-	}
 }
 
 /* A connection broke: what was travelling on it fails, and it is closed. Called with x->mu held. */
