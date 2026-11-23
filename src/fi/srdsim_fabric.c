@@ -65,6 +65,13 @@ int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct f
 		return ret;
 	}
 
+	/*
+	 * Every CQ of the domain keeps completion sources, as the efa provider's CQs do: a consumer may open the
+	 * domain with an info without FI_SOURCE and an endpoint on it with one, as aws-ofi-nccl's GIN does, and
+	 * then reads sources with fi_cq_readfrom.
+	 */
+	domain->info_domain_caps |= FI_SOURCE;
+
 	*domain_fid = &domain->domain_fid;
 	(*domain_fid)->fid.ops = &srdsim_domain_fi_ops;
 	(*domain_fid)->ops = &srdsim_domain_ops;
