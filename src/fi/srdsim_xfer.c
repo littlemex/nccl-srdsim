@@ -208,6 +208,10 @@ struct srdsim_xfer {
 	struct dlist_entry events;
 };
 
+/* SRDSIM_FI_TRACE=1 writes one line to stderr per operation submitted, frame applied and completion written. */
+static bool srdsim_trace_on = false;
+#define SRDSIM_TRACE(...) do { if (srdsim_trace_on) fprintf(stderr, "srdsim-fi: " __VA_ARGS__); } while (0)
+
 /* ---- Configuration and helpers ---------------------------------------------------------------------- */
 
 static size_t env_size(const char *name, size_t dflt, size_t lo, size_t hi)
@@ -879,6 +883,8 @@ static int srdsim_apply_due(struct srdsim_xfer *x)
 static void srdsim_on_frame(struct srdsim_xfer *x, struct srdsim_conn *c, const struct srdsim_frame *f,
 			    const char *payload)
 {
+	SRDSIM_TRACE("ep %p frame type %u op %lu off %lu len %lu total %lu flags %#x data %#lx\n", (void *) x->ep,
+		     f->type, f->op_id, f->offset, f->len, f->total, f->flags, f->data);
 	switch (f->type) {
 	case SRDSIM_F_HELLO:
 		if (f->len == sizeof(struct srdsim_addr)) {
@@ -1206,6 +1212,8 @@ static ssize_t srdsim_submit(struct fid_ep *ep_fid, enum srdsim_op_kind kind, co
 	}
 	x->outstanding++;
 	op->id = ++x->next_op_id;
+	SRDSIM_TRACE("ep %p submit op %lu kind %d len %zu flags %#lx frame %#x to port %u\n", (void *) ep, op->id,
+		     kind, op->len, op_flags, op->frame_flags, ntohs(peer.port));
 	dlist_insert_tail(&op->entry, &x->pending);
 	pthread_mutex_unlock(&x->mu);
 	return 0;
@@ -1304,6 +1312,8 @@ static void srdsim_drain_events(struct srdsim_xfer *x)
 	while (!dlist_empty(&x->events)) {
 		dlist_pop_front(&x->events, struct srdsim_event, e, entry);
 		cq = e->kind == SRDSIM_EV_TX ? uep->tx_cq : uep->rx_cq;
+		SRDSIM_TRACE("ep %p completion %s ctx %p flags %#lx len %zu data %#lx err %d\n", (void *) x->ep,
+			     e->kind == SRDSIM_EV_TX ? "tx" : "rx", e->context, e->flags, e->len, e->data, e->err);
 		src = FI_ADDR_NOTAVAIL;
 		if (e->has_src && uep->av && (uep->caps & FI_SOURCE))
 			src = ofi_av_lookup_fi_addr(uep->av, &e->src);
@@ -1710,6 +1720,7 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 		return -FI_ENOMEM;
 	}
 	x->cq_data_early = early && !strcmp(early, "1");
+	srdsim_trace_on = env_size("SRDSIM_FI_TRACE", 0, 0, 1) == 1;
 	x->jitter_us = x->mode == SRDSIM_MODE_SRD ? env_size("SRDSIM_FI_JITTER_US", 200, 0, 1000000) : 0;
 	if (x->cq_data_early)
 		SRDSIM_WARN(FI_LOG_EP_CTRL, "SRDSIM_FI_CQ_DATA_EARLY=1: remote CQ data is raised before its write "
