@@ -1318,7 +1318,8 @@ static void srdsim_drain_events(struct srdsim_xfer *x)
 			err.prov_errno = -e->err;
 			err.src_addr = src;
 			(void) ofi_cq_write_error(cq, &err);
-		} else if (uep->caps & FI_SOURCE) {
+		} else if ((uep->caps & FI_SOURCE) && cq->src) {
+			/* cq->src exists only when the CQ's domain was opened with FI_SOURCE. */
 			(void) ofi_cq_write_src(cq, e->context, e->flags, e->len, e->buf, e->data, e->tag, src);
 		} else {
 			(void) ofi_cq_write(cq, e->context, e->flags, e->len, e->buf, e->data, e->tag);
