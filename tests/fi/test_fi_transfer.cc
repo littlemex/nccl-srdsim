@@ -5,7 +5,7 @@
 //
 //   test_fi_transfer PROVIDER_SO SCENARIO
 //
-// SCENARIO is one of sendrecv, tagged, truncate, read, badkey, writedata, reorder. The program exits 0 when
+// SCENARIO is one of sendrecv, tagged, inject, truncate, read, badkey, writedata, reorder. The program exits 0 when
 // the scenario's checks pass and 1 when one fails; each check prints one line.
 //
 // writedata checks EFA's guarantee that a write's remote completion with CQ data comes only after every byte
@@ -205,7 +205,8 @@ void tagged(Endpoint* e) {
             if (int rc = int(fi_tsend(e->ep, m[i], sizeof m[i], nullptr, e->peer, tags[i], nullptr))) die("fi_tsend", rc);
         }
         fi_cq_tagged_entry c;
-        for (int i = 0; i < 3; ++i) wait_cq(e, &c);
+        for (int i = 0; i < 3; ++i)
+            if (wait_cq(e, &c)) die("tsend completion", -FI_EIO);
         barrier();
         return;
     }
@@ -215,12 +216,57 @@ void tagged(Endpoint* e) {
         char b[8] = {};
         if (int rc = int(fi_trecv(e->ep, b, sizeof b, nullptr, FI_ADDR_UNSPEC, want, 0, nullptr))) die("fi_trecv", rc);
         fi_cq_tagged_entry c;
-        wait_cq(e, &c);
+        if (wait_cq(e, &c)) die("trecv completion", -FI_EIO);
         char expect[8];
         std::snprintf(expect, sizeof expect, "tag%llx", (unsigned long long) want);
         if (c.tag != want or std::memcmp(b, expect, sizeof b) != 0) ok = false;
     }
     check(ok, "three tagged messages are matched by tag, received in another order than sent");
+    barrier();
+}
+
+// Injected sends complete nothing, unless sent with FI_COMPLETION; iovecs gather and scatter.
+void inject(Endpoint* e) {
+    if (g_rank == 0) {
+        char a[16] = "first", b[16] = "second";
+        if (int rc = int(fi_inject(e->ep, a, sizeof a, e->peer))) die("fi_inject", rc);
+        std::memset(a, 0, sizeof a);   // reusable on return
+        iovec iov[3] = {{b, 4}, {b + 4, 4}, {b + 8, 8}};
+        if (int rc = int(fi_sendv(e->ep, iov, nullptr, 3, e->peer, &iov))) die("fi_sendv", rc);
+        char c3[16] = "third";
+        iovec one = {c3, sizeof c3};
+        fi_msg m = {};
+        m.msg_iov = &one;
+        m.iov_count = 1;
+        m.addr = e->peer;
+        m.context = c3;
+        if (int rc = int(fi_sendmsg(e->ep, &m, FI_INJECT | FI_COMPLETION))) die("fi_sendmsg", rc);
+        fi_cq_tagged_entry c;
+        void* seen[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            if (wait_cq(e, &c)) die("send completion", -FI_EIO);
+            seen[i] = c.op_context;
+        }
+        check((seen[0] == &iov or seen[1] == &iov) and (seen[0] == c3 or seen[1] == c3),
+              "the sendv and the FI_INJECT | FI_COMPLETION sendmsg complete; the fi_inject does not");
+        barrier();
+        fi_cq_tagged_entry extra;
+        check(fi_cq_read(e->cq, &extra, 1) == -FI_EAGAIN, "no completion for the fi_inject");
+        return;
+    }
+    char r1[16], r2a[6], r2b[10], r3[16];
+    if (int rc = int(fi_recv(e->ep, r1, sizeof r1, nullptr, FI_ADDR_UNSPEC, nullptr))) die("fi_recv", rc);
+    iovec iov[2] = {{r2a, sizeof r2a}, {r2b, sizeof r2b}};
+    if (int rc = int(fi_recvv(e->ep, iov, nullptr, 2, FI_ADDR_UNSPEC, nullptr))) die("fi_recvv", rc);
+    if (int rc = int(fi_recv(e->ep, r3, sizeof r3, nullptr, FI_ADDR_UNSPEC, nullptr))) die("fi_recv", rc);
+    fi_cq_tagged_entry c;
+    for (int i = 0; i < 3; ++i)
+        if (wait_cq(e, &c)) die("recv completion", -FI_EIO);
+    char joined[16];
+    std::memcpy(joined, r2a, 6);
+    std::memcpy(joined + 6, r2b, 10);
+    check(std::strcmp(r1, "first") == 0 and std::strcmp(joined, "second") == 0 and std::strcmp(r3, "third") == 0,
+          "an injected message, a gathered one scattered over two buffers, and an injected one with a completion arrive");
     barrier();
 }
 
@@ -387,6 +433,7 @@ int main(int argc, char** argv) {
     if (scenario == "sendrecv") sendrecv(&e);
     else if (scenario == "tagged") tagged(&e);
     else if (scenario == "truncate") truncate(&e);
+    else if (scenario == "inject") inject(&e);
     else if (scenario == "read") read_region(&e);
     else if (scenario == "badkey") badkey(&e);
     else if (scenario == "writedata") writedata(&e);
