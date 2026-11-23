@@ -80,10 +80,6 @@ struct srdsim_ep {
 	bool use_unsolicited_write_recv;
 };
 
-/* srdsim_gpu.c: -FI_ENOSYS means the own CUDA context cannot be used and the caller falls back */
-int srdsim_gpu_copy_to(uint64_t device, void *dst, const void *src, size_t len);
-int srdsim_gpu_copy_from(uint64_t device, void *dst, const void *src, size_t len);
-
 /* srdsim_xfer.c */
 int srdsim_xfer_open(struct srdsim_ep *ep);
 int srdsim_xfer_start(struct srdsim_ep *ep);
