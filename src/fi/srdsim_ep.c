@@ -29,10 +29,11 @@ static int srdsim_ep_close(struct fid *fid)
 	struct srdsim_ep *ep = container_of(fid, struct srdsim_ep, util_ep.ep_fid.fid);
 	int ret;
 
-	srdsim_xfer_close(ep);
+	/* Off the CQs first, so no other thread's fi_cq_read progresses it while it is torn down. */
 	ret = ofi_endpoint_close(&ep->util_ep);
 	if (ret)
 		return ret;
+	srdsim_xfer_close(ep);
 	free(ep);
 	return 0;
 }
@@ -263,6 +264,8 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 		free(ep);
 		return -FI_EOTHER;
 	}
+	ep->tx_size = info->tx_attr->size;
+	ep->inject_size = info->tx_attr->inject_size;
 	ret = srdsim_xfer_open(ep);
 	if (ret) {
 		ofi_endpoint_close(&ep->util_ep);

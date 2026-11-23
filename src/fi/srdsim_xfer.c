@@ -190,7 +190,11 @@ struct srdsim_xfer {
 	bool cq_data_early;
 	size_t jitter_us;
 	struct dlist_entry delayed;	/* in order of `due` */
-	uint64_t rng;
+	uint64_t rng;			/* the consumer thread's choices: release order */
+	uint64_t agent_rng;		/* the agent's: delays, the order of a read's answer */
+	char *scratch;			/* one chunk, for the consumer thread */
+	size_t outstanding;		/* operations submitted and not yet complete */
+	size_t tx_size;
 	uint64_t next_op_id;
 	struct dlist_entry conns;
 	struct dlist_entry pending;	/* ops with units still to release, in submission order */
@@ -220,10 +224,10 @@ static size_t env_size(const char *name, size_t dflt, size_t lo, size_t hi)
 	return (size_t) n;
 }
 
-static uint64_t srdsim_rand(struct srdsim_xfer *x)
+static uint64_t srdsim_rand(uint64_t *state)
 {
-	/* splitmix64: the same seed gives the same choices. */
-	uint64_t z = (x->rng += 0x9E3779B97F4A7C15ull);
+	/* splitmix64: the same seed gives the same sequence. */
+	uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
 
 	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
 	z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
@@ -463,7 +467,11 @@ static void srdsim_ack(struct srdsim_conn *c, uint64_t op_id, int status)
 		SRDSIM_WARN(FI_LOG_EP_DATA, "out of memory: an acknowledgement is lost\n");
 }
 
-/* Resolves a remote access to [addr, addr + len) under key into a local address and its registration. */
+/*
+ * Resolves a remote access to [addr, addr + len) under key into a local address and its registration. On
+ * success the domain lock is held, so the registration cannot be closed while the caller copies; the caller
+ * releases it with srdsim_verify_done().
+ */
 static int srdsim_verify(struct srdsim_xfer *x, uint64_t addr, uint64_t len, uint64_t key, uint64_t access,
 			 void **local, struct ofi_mr **mr)
 {
@@ -474,12 +482,18 @@ static int srdsim_verify(struct srdsim_xfer *x, uint64_t addr, uint64_t len, uin
 
 	ofi_genlock_lock(&domain->lock);
 	ret = ofi_mr_map_verify(&domain->mr_map, &io, len, key, access, &ctx);
-	ofi_genlock_unlock(&domain->lock);
-	if (ret)
+	if (ret) {
+		ofi_genlock_unlock(&domain->lock);
 		return ret;
+	}
 	*local = (void *) io;
 	*mr = ctx;
 	return 0;
+}
+
+static void srdsim_verify_done(struct srdsim_xfer *x)
+{
+	ofi_genlock_unlock(&x->ep->util_ep.domain->lock);
 }
 
 static int srdsim_store(struct ofi_mr *mr, void *dst, const char *src, size_t len, bool in_order)
@@ -489,7 +503,15 @@ static int srdsim_store(struct ofi_mr *mr, void *dst, const char *src, size_t le
 	if (mr && mr->iface != FI_HMEM_SYSTEM)
 		return ofi_copy_to_hmem(mr->iface, mr->device, dst, src, len);
 	if (in_order) {
-		memcpy(dst, src, len);
+		/* Front to back, a block at a time, each visible before the next is written. */
+		while (len) {
+			n = MIN(len, step);
+			memcpy(dst, src, n);
+			__atomic_thread_fence(__ATOMIC_RELEASE);
+			dst = (char *) dst + n;
+			src += n;
+			len -= n;
+		}
 		return 0;
 	}
 	/* Back to front, a block at a time: the end of the chunk lands first. */
@@ -531,8 +553,10 @@ static void srdsim_on_write(struct srdsim_xfer *x, struct srdsim_conn *c, const 
 	}
 
 	ret = srdsim_verify(x, f->addr, f->len, f->key, FI_REMOTE_WRITE, &dst, &mr);
-	if (!ret)
+	if (!ret) {
 		ret = srdsim_store(mr, dst, payload, f->len, f->flags & SRDSIM_FR_IN_ORDER);
+		srdsim_verify_done(x);
+	}
 	if (ret && !w->status)
 		w->status = ret;
 	w->landed += f->len;
@@ -560,7 +584,7 @@ static void srdsim_on_read_req(struct srdsim_xfer *x, struct srdsim_conn *c, con
 	void *src;
 	int ret;
 
-	ret = srdsim_verify(x, f->addr, f->total, f->key, FI_REMOTE_READ, &src, &mr);
+	ret = f->total ? srdsim_verify(x, f->addr, f->total, f->key, FI_REMOTE_READ, &src, &mr) : 0;
 	if (ret || f->total == 0) {
 		r.data = (uint64_t) (int64_t) ret;
 		(void) srdsim_send_frame(c, &r, NULL);
@@ -570,6 +594,7 @@ static void srdsim_on_read_req(struct srdsim_xfer *x, struct srdsim_conn *c, con
 	order = malloc(nchunks * sizeof(*order));
 	tmp = malloc(x->chunk);
 	if (!order || !tmp) {
+		srdsim_verify_done(x);
 		r.data = (uint64_t) (int64_t) -FI_ENOMEM;
 		(void) srdsim_send_frame(c, &r, NULL);
 		free(order);
@@ -580,7 +605,7 @@ static void srdsim_on_read_req(struct srdsim_xfer *x, struct srdsim_conn *c, con
 		order[i] = (uint32_t) i;
 	if (x->mode == SRDSIM_MODE_SRD)
 		for (i = nchunks; i > 1; i--) {
-			j = srdsim_rand(x) % i;
+			j = srdsim_rand(&x->agent_rng) % i;
 			t = order[i - 1];
 			order[i - 1] = order[j];
 			order[j] = t;
@@ -598,6 +623,7 @@ static void srdsim_on_read_req(struct srdsim_xfer *x, struct srdsim_conn *c, con
 		if (srdsim_send_frame(c, &r, tmp))
 			break;
 	}
+	srdsim_verify_done(x);
 	free(order);
 	free(tmp);
 }
@@ -623,6 +649,7 @@ static void srdsim_op_free(struct srdsim_op *op)
 static void srdsim_op_done(struct srdsim_xfer *x, struct srdsim_op *op, int status)
 {
 	dlist_remove(&op->entry);
+	x->outstanding--;
 	if (status)
 		srdsim_event(x, SRDSIM_EV_TX, op->context, op->cq_flags, 0, NULL, 0, 0,
 			     status == -FI_EACCES || status == -FI_EINVAL ? FI_EACCES : -status, 0, NULL);
@@ -653,6 +680,28 @@ static void srdsim_on_ack(struct srdsim_xfer *x, const struct srdsim_frame *f)
 		srdsim_op_done(x, op, (int) (int64_t) f->data);
 }
 
+/*
+ * Abandons a message whose pieces stopped coming (the sender failed to release the rest): its receive, if it
+ * had one, completes with FI_EIO, and an unexpected copy is dropped. Called with x->mu held.
+ */
+static void srdsim_inmsg_abort(struct srdsim_xfer *x, struct srdsim_inmsg *m, bool tagged)
+{
+	struct srdsim_recv *r = m->recv;
+
+	OFI_UNUSED(tagged);
+	if (m->unexp) {
+		r = m->unexp->claimed;
+		dlist_remove(&m->unexp->entry);
+		free(m->unexp->buf);
+		free(m->unexp);
+	}
+	if (r) {
+		srdsim_event(x, SRDSIM_EV_RX, r->context, FI_RECV, 0, NULL, 0, 0, FI_EIO, 0, NULL);
+		free(r);
+	}
+	memset(m, 0, sizeof(*m));
+}
+
 /* A piece of a send. Pieces of one connection arrive in order, one message after another. */
 static void srdsim_on_msg(struct srdsim_xfer *x, struct srdsim_conn *c, const struct srdsim_frame *f,
 			  const char *payload)
@@ -666,7 +715,11 @@ static void srdsim_on_msg(struct srdsim_xfer *x, struct srdsim_conn *c, const st
 
 	if (!c->peer_known)
 		return;
+	if (m->active && (f->op_id != m->op_id || f->offset != m->received))
+		srdsim_inmsg_abort(x, m, tagged);
 	if (!m->active) {
+		if (f->offset != 0)
+			return;	/* the rest of a message whose start was not received */
 		memset(m, 0, sizeof(*m));
 		m->active = true;
 		m->op_id = f->op_id;
@@ -750,7 +803,7 @@ static void srdsim_delay(struct srdsim_xfer *x, struct srdsim_conn *c, const str
 	d->conn = c;
 	d->f = *f;
 	memcpy(d->payload, payload, f->len);
-	d->due_ns = srdsim_now_ns() + (srdsim_rand(x) % (x->jitter_us + 1)) * 1000;
+	d->due_ns = srdsim_now_ns() + (srdsim_rand(&x->agent_rng) % (x->jitter_us + 1)) * 1000;
 	for (it = x->delayed.prev; it != &x->delayed; it = it->prev) {
 		cur = container_of(it, struct srdsim_delayed, entry);
 		if (cur->due_ns <= d->due_ns) {
@@ -811,31 +864,38 @@ static void srdsim_on_frame(struct srdsim_xfer *x, struct srdsim_conn *c, const 
 	}
 }
 
-/* Reads what a connection has, and applies every whole frame. False when the peer closed it. */
-static bool srdsim_conn_read(struct srdsim_xfer *x, struct srdsim_conn *c)
+/* Whether a frame's sizes are consistent, so that applying it stays inside what it describes. */
+static bool srdsim_frame_valid(const struct srdsim_frame *f)
 {
-	char tmp[65536];
-	struct srdsim_frame f;
-	size_t used = 0;
-	ssize_t n;
-
-	for (;;) {
-		n = recv(c->fd, tmp, sizeof(tmp), 0);
-		if (n > 0) {
-			if (srdsim_buf_append(&c->in, tmp, (size_t) n))
-				return false;
-			continue;
-		}
-		if (n == 0)
-			return false;
-		if (errno == EINTR)
-			continue;
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
-			break;
+	switch (f->type) {
+	case SRDSIM_F_HELLO:
+		return f->len == sizeof(struct srdsim_addr);
+	case SRDSIM_F_MSG:
+	case SRDSIM_F_WRITE:
+	case SRDSIM_F_READ_RESP:
+		return f->len <= f->total && f->offset <= f->total - f->len;
+	case SRDSIM_F_READ_REQ:
+	case SRDSIM_F_ACK:
+		return f->len == 0;
+	default:
 		return false;
 	}
+}
+
+/* Applies every whole frame buffered on a connection. False when one is malformed. */
+static bool srdsim_conn_parse(struct srdsim_xfer *x, struct srdsim_conn *c)
+{
+	struct srdsim_frame f;
+	size_t used = 0;
+	bool ok = true;
+
 	while (c->in.len - used >= sizeof(f)) {
 		memcpy(&f, c->in.p + used, sizeof(f));
+		if (!srdsim_frame_valid(&f)) {
+			SRDSIM_WARN(FI_LOG_EP_DATA, "a malformed frame (type %u); closing the connection\n", f.type);
+			ok = false;
+			break;
+		}
 		if (c->in.len - used - sizeof(f) < f.len)
 			break;
 		srdsim_on_frame(x, c, &f, c->in.p + used + sizeof(f));
@@ -843,6 +903,32 @@ static bool srdsim_conn_read(struct srdsim_xfer *x, struct srdsim_conn *c)
 	}
 	memmove(c->in.p, c->in.p + used, c->in.len - used);
 	c->in.len -= used;
+	return ok;
+}
+
+/*
+ * Reads what a connection has, applying frames as they complete, so a fast sender cannot make the agent
+ * buffer without bound. False when the peer closed it or sent something malformed.
+ */
+static bool srdsim_conn_read(struct srdsim_xfer *x, struct srdsim_conn *c)
+{
+	char tmp[65536];
+	ssize_t n;
+	int rounds;
+
+	for (rounds = 0; rounds < 64; rounds++) {
+		n = recv(c->fd, tmp, sizeof(tmp), 0);
+		if (n > 0) {
+			if (srdsim_buf_append(&c->in, tmp, (size_t) n) || !srdsim_conn_parse(x, c))
+				return false;
+			continue;
+		}
+		if (n == 0)
+			return false;
+		if (errno == EINTR)
+			continue;
+		return errno == EAGAIN || errno == EWOULDBLOCK;
+	}
 	return true;
 }
 
@@ -858,12 +944,24 @@ static bool srdsim_conn_write(struct srdsim_conn *c)
 		}
 		if (n < 0 && errno == EINTR)
 			continue;
-		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			srdsim_out_compact(&c->out);
 			return true;
+		}
 		return false;
 	}
 	c->out.len = c->out.off = 0;
 	return true;
+}
+
+/* Drops what has been written from the front of an outbound buffer that is never fully drained. */
+static void srdsim_out_compact(struct srdsim_buf *b)
+{
+	if (b->off > (1u << 20) && b->off * 2 > b->len) {
+		memmove(b->p, b->p + b->off, b->len - b->off);
+		b->len -= b->off;
+		b->off = 0;
+	}
 }
 
 /* A connection broke: what was travelling on it fails, and it is closed. Called with x->mu held. */
@@ -890,10 +988,8 @@ static void srdsim_conn_lost(struct srdsim_xfer *x, struct srdsim_conn *c)
 			dlist_remove(&w->entry);
 			free(w);
 		}
-	if (c->inmsg.active && c->inmsg.recv) {
-		srdsim_event(x, SRDSIM_EV_RX, c->inmsg.recv->context, FI_RECV, 0, NULL, 0, 0, FI_EIO, 0, NULL);
-		free(c->inmsg.recv);
-	}
+	if (c->inmsg.active)
+		srdsim_inmsg_abort(x, &c->inmsg, c->inmsg.flags & SRDSIM_FR_TAGGED);
 	srdsim_conn_free(c);
 }
 
@@ -908,6 +1004,8 @@ static void *srdsim_agent(void *arg)
 
 	pthread_mutex_lock(&x->mu);
 	while (!x->stop) {
+		/* Delayed chunks due now are applied first, so what they queue is written out in this round. */
+		timeout = srdsim_apply_due(x);
 		n = 2;
 		dlist_foreach_container(&x->conns, struct srdsim_conn, c, entry)
 			n++;
@@ -925,7 +1023,6 @@ static void *srdsim_agent(void *arg)
 			pfd[i] = (struct pollfd) { .fd = c->fd, .events = POLLIN | (c->out.len > c->out.off ? POLLOUT : 0) };
 			who[i++] = c;
 		}
-		timeout = srdsim_apply_due(x);
 		pthread_mutex_unlock(&x->mu);
 		(void) poll(pfd, n, timeout < 0 || timeout > 100 ? 100 : timeout);
 		pthread_mutex_lock(&x->mu);
@@ -1019,7 +1116,11 @@ static ssize_t srdsim_submit(struct fid_ep *ep_fid, enum srdsim_op_kind kind, co
 	op->frame_flags = frame_flags | (ep->write_in_order_128 ? SRDSIM_FR_IN_ORDER : 0);
 	op->context = context;
 	op->cq_flags = cq_flags;
-	op->completion = (op_flags & FI_COMPLETION) && !(op_flags & FI_INJECT);
+	op->completion = op_flags & FI_COMPLETION;
+	if ((op_flags & FI_INJECT) && op->len > ep->inject_size) {
+		srdsim_op_free(op);
+		return -FI_EINVAL;
+	}
 	if (op_flags & FI_INJECT) {
 		/* The source may be reused on return: take a copy now. */
 		op->staged = malloc(op->len ? op->len : 1);
@@ -1041,7 +1142,7 @@ static ssize_t srdsim_submit(struct fid_ep *ep_fid, enum srdsim_op_kind kind, co
 	/* The chunks of a write are released in a random order; a send's pieces always in order. */
 	if (kind == SRDSIM_OP_WRITE && x->mode == SRDSIM_MODE_SRD)
 		for (i = op->nchunks; i > 1; i--) {
-			j = srdsim_rand(x) % i;
+			j = srdsim_rand(&x->rng) % i;
 			t = op->order[i - 1];
 			op->order[i - 1] = op->order[j];
 			op->order[j] = t;
@@ -1052,6 +1153,13 @@ static ssize_t srdsim_submit(struct fid_ep *ep_fid, enum srdsim_op_kind kind, co
 		srdsim_op_free(op);
 		return -FI_EHOSTUNREACH;
 	}
+	/* As a full send queue does: the consumer retries after reading completions. */
+	if (x->outstanding >= x->tx_size) {
+		pthread_mutex_unlock(&x->mu);
+		srdsim_op_free(op);
+		return -FI_EAGAIN;
+	}
+	x->outstanding++;
 	op->id = ++x->next_op_id;
 	dlist_insert_tail(&op->entry, &x->pending);
 	pthread_mutex_unlock(&x->mu);
@@ -1109,11 +1217,9 @@ static void srdsim_release(struct srdsim_xfer *x)
 {
 	struct srdsim_op *op, *pick, *cand[64];
 	size_t budget, ncand;
-	char *tmp = malloc(x->chunk);
+	char *tmp = x->scratch;
 	int ret;
 
-	if (!tmp)
-		return;
 	for (budget = 0; budget < SRDSIM_RELEASE_BUDGET && !dlist_empty(&x->pending); budget++) {
 		ncand = 0;
 		dlist_foreach_container(&x->pending, struct srdsim_op, op, entry) {
@@ -1126,7 +1232,7 @@ static void srdsim_release(struct srdsim_xfer *x)
 		}
 		if (!ncand)
 			break;
-		pick = cand[x->mode == SRDSIM_MODE_SRD ? srdsim_rand(x) % ncand : 0];
+		pick = cand[x->mode == SRDSIM_MODE_SRD ? srdsim_rand(&x->rng) % ncand : 0];
 		ret = srdsim_release_one(x, pick, tmp);
 		if (ret) {
 			srdsim_op_done(x, pick, ret);
@@ -1137,8 +1243,8 @@ static void srdsim_release(struct srdsim_xfer *x)
 			dlist_insert_tail(&pick->entry, &x->inflight);
 		}
 	}
-	free(tmp);
-	srdsim_wake(x);
+	if (budget)
+		srdsim_wake(x);
 }
 
 /* Writes the completions the agent queued, on the consumer's thread. */
@@ -1494,8 +1600,11 @@ struct fi_ops_rma srdsim_rma_ops = {
 /* ---- Lifetime -------------------------------------------------------------------------------------- */
 
 /* Opens the listening socket, so the endpoint has its address before it is enabled. */
+static uint64_t srdsim_endpoints_opened;
+
 int srdsim_xfer_open(struct srdsim_ep *ep)
 {
+	uint64_t seed, index;
 	struct sockaddr_in sin = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
 	socklen_t len = sizeof(sin);
 	struct srdsim_xfer *x;
@@ -1525,7 +1634,21 @@ int srdsim_xfer_open(struct srdsim_ep *ep)
 	else if (mode && *mode && strcmp(mode, "srd"))
 		SRDSIM_WARN(FI_LOG_EP_CTRL, "SRDSIM_MODE=%s: the provider knows srd and inorder; using srd\n", mode);
 	x->chunk = env_size("SRDSIM_CHUNK_BYTES", SRDSIM_DEFAULT_CHUNK, 128, 64u << 20);
-	x->rng = env_size("SRDSIM_SEED", 1, 0, SIZE_MAX) ^ ep->addr.nonce;
+	/*
+	 * Seeded from SRDSIM_SEED and the order in which the process opens endpoints, not from anything random,
+	 * so the same program with the same seed makes the same choices where its calls arrive in the same order.
+	 */
+	seed = env_size("SRDSIM_SEED", 1, 0, SIZE_MAX);
+	index = __atomic_fetch_add(&srdsim_endpoints_opened, 1, __ATOMIC_RELAXED);
+	x->rng = seed * 0x9E3779B97F4A7C15ull + index;
+	x->agent_rng = ~x->rng;
+	x->tx_size = ep->tx_size;
+	x->scratch = malloc(x->chunk);
+	if (!x->scratch) {
+		ep->xfer = x;
+		srdsim_xfer_close(ep);
+		return -FI_ENOMEM;
+	}
 	x->cq_data_early = early && !strcmp(early, "1");
 	x->jitter_us = x->mode == SRDSIM_MODE_SRD ? env_size("SRDSIM_FI_JITTER_US", 200, 0, 1000000) : 0;
 	if (x->cq_data_early)
@@ -1567,11 +1690,27 @@ void srdsim_xfer_close(struct srdsim_ep *ep)
 	struct srdsim_inwrite *w;
 	struct srdsim_event *e;
 	struct dlist_entry *lists[2];
+	bool pending;
 	size_t i;
 
 	if (!x)
 		return;
 	if (x->agent_running) {
+		/*
+		 * What is queued (acknowledgements, injected sends) goes out before the sockets close, for up to a
+		 * second, so peers do not see the close as the loss of operations that had been delivered.
+		 */
+		for (i = 0; i < 1000; i++) {
+			pthread_mutex_lock(&x->mu);
+			pending = false;
+			dlist_foreach_container(&x->conns, struct srdsim_conn, c, entry)
+				pending = pending || c->out.len > c->out.off;
+			pthread_mutex_unlock(&x->mu);
+			if (!pending)
+				break;
+			srdsim_wake(x);
+			usleep(1000);
+		}
 		pthread_mutex_lock(&x->mu);
 		x->stop = true;
 		pthread_mutex_unlock(&x->mu);
@@ -1624,6 +1763,7 @@ void srdsim_xfer_close(struct srdsim_ep *ep)
 	if (x->wake_fd >= 0)
 		close(x->wake_fd);
 	pthread_mutex_destroy(&x->mu);
+	free(x->scratch);
 	free(x);
 	ep->xfer = NULL;
 }
