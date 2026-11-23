@@ -90,6 +90,104 @@ struct fi_info srdsim_info = {
 	.fabric_attr = &srdsim_fabric_attr,
 };
 
+/*
+ * The efa-direct fabric: the device's own path, without the software protocol of the efa fabric. As in
+ * efa_prov_info.c it offers sends, receives and RMA but no tagged messages, orders nothing, needs the
+ * consumer's registrations (FI_MR_LOCAL), and is listed before the efa fabric for each device. Sizes are those
+ * of no particular device.
+ */
+static struct fi_tx_attr srdsim_direct_tx_attr = {
+	.caps = OFI_TX_MSG_CAPS | OFI_TX_RMA_CAPS | FI_HMEM,
+	.op_flags = FI_TRANSMIT_COMPLETE,
+	.msg_order = 0,
+	.inject_size = 32,
+	.size = 4096,
+	.iov_limit = 2,
+	.rma_iov_limit = 1,
+};
+
+static struct fi_rx_attr srdsim_direct_rx_attr = {
+	.caps = OFI_RX_MSG_CAPS | OFI_RX_RMA_CAPS | FI_SOURCE | FI_HMEM,
+	.msg_order = 0,
+	.size = 4096,
+	.iov_limit = 2,
+};
+
+static struct fi_ep_attr srdsim_direct_ep_attr = {
+	.type = FI_EP_RDM,
+	.protocol = FI_PROTO_EFA,
+	.protocol_version = 1,
+	.max_msg_size = 1ul << 30,
+	.tx_ctx_cnt = 1,
+	.rx_ctx_cnt = 1,
+};
+
+static struct fi_domain_attr srdsim_direct_domain_attr = {
+	.name = SRDSIM_DOMAIN_NAME,
+	.caps = SRDSIM_DOMAIN_CAPS,
+	.threading = FI_THREAD_SAFE,
+	.control_progress = FI_PROGRESS_MANUAL,
+	.progress = FI_PROGRESS_MANUAL,
+	.resource_mgmt = FI_RM_ENABLED,
+	.av_type = FI_AV_UNSPEC,
+	.mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM,
+	.mr_key_size = 4,
+	.cq_data_size = 4,
+	.cq_cnt = 1024,
+	.ep_cnt = 1024,
+	.tx_ctx_cnt = 1024,
+	.rx_ctx_cnt = 1024,
+	.max_ep_tx_ctx = 1,
+	.max_ep_rx_ctx = 1,
+	.mr_iov_limit = 1,
+};
+
+static struct fi_fabric_attr srdsim_direct_fabric_attr = {
+	.name = SRDSIM_DIRECT_FABRIC_NAME,
+	.prov_version = OFI_VERSION_DEF_PROV,
+};
+
+struct fi_info srdsim_direct_info = {
+	.caps = OFI_TX_MSG_CAPS | OFI_TX_RMA_CAPS | OFI_RX_MSG_CAPS | OFI_RX_RMA_CAPS | FI_SOURCE | FI_HMEM |
+		SRDSIM_DOMAIN_CAPS,
+	.addr_format = FI_ADDR_EFA,
+	.tx_attr = &srdsim_direct_tx_attr,
+	.rx_attr = &srdsim_direct_rx_attr,
+	.ep_attr = &srdsim_direct_ep_attr,
+	.domain_attr = &srdsim_direct_domain_attr,
+	.fabric_attr = &srdsim_direct_fabric_attr,
+};
+
+bool srdsim_info_is_direct(const struct fi_info *info)
+{
+	return info && info->fabric_attr && info->fabric_attr->name &&
+	       !strcmp(info->fabric_attr->name, SRDSIM_DIRECT_FABRIC_NAME);
+}
+
+/*
+ * What the real provider changes for efa-direct, in efa_user_info_alter_direct(): FI_CONTEXT2 only when the
+ * consumer offers it (and then no inject without it), FI_RX_CQ_DATA when it asks for it, so that each write
+ * with CQ data consumes one posted receive, and FI_HMEM only when asked for. The emulated device supports
+ * unsolicited write receive, so RMA is offered without FI_RX_CQ_DATA too.
+ */
+static int srdsim_getinfo_alter_direct(const struct fi_info *hints, struct fi_info *info)
+{
+	if (!hints || (hints->mode & FI_CONTEXT2)) {
+		info->mode |= FI_CONTEXT2;
+		info->tx_attr->mode |= FI_CONTEXT2;
+		info->rx_attr->mode |= FI_CONTEXT2;
+	} else {
+		if (hints->tx_attr && hints->tx_attr->inject_size)
+			return -FI_ENODATA;
+		info->tx_attr->inject_size = 0;
+	}
+	if (!hints || (hints->mode & FI_RX_CQ_DATA)) {
+		info->mode |= FI_RX_CQ_DATA;
+		info->rx_attr->mode |= FI_RX_CQ_DATA;
+	}
+	return 0;
+}
+
 struct util_prov srdsim_util_prov = {
 	.prov = &srdsim_prov,
 	.info = &srdsim_info,
@@ -103,7 +201,11 @@ struct util_prov srdsim_util_prov = {
  */
 int srdsim_getinfo_alter(uint32_t version, const struct fi_info *hints, struct fi_info *info)
 {
+	int ret;
+
 	OFI_UNUSED(version);
+	if (srdsim_info_is_direct(info) && (ret = srdsim_getinfo_alter_direct(hints, info)))
+		return ret;
 
 	if (hints && !(hints->caps & FI_HMEM)) {
 		info->caps &= ~FI_HMEM;
@@ -198,9 +300,9 @@ static size_t srdsim_find_gpus(struct srdsim_pci *out, size_t max)
 	return n;
 }
 
-static struct fi_info *srdsim_nic_info(size_t index, const struct srdsim_pci *pci)
+static struct fi_info *srdsim_nic_info(const struct fi_info *base, size_t index, const struct srdsim_pci *pci)
 {
-	struct fi_info *info = fi_dupinfo(&srdsim_info);
+	struct fi_info *info = fi_dupinfo(base);
 	struct fid_nic *nic;
 	char name[64];
 
@@ -245,15 +347,19 @@ int srdsim_build_infos(void)
 	struct fi_info *head = NULL, **tail = &head, *info;
 	size_t n = srdsim_find_gpus(gpus, SRDSIM_MAX_NICS), i;
 
-	for (i = 0; i < (n ? n : 1); i++) {
-		info = srdsim_nic_info(i, n ? &gpus[i] : NULL);
-		if (!info) {
-			fi_freeinfo(head);
-			return -FI_ENOMEM;
+	const struct fi_info *bases[2] = { &srdsim_direct_info, &srdsim_info };	/* efa-direct first, as EFA */
+	size_t b;
+
+	for (i = 0; i < (n ? n : 1); i++)
+		for (b = 0; b < 2; b++) {
+			info = srdsim_nic_info(bases[b], i, n ? &gpus[i] : NULL);
+			if (!info) {
+				fi_freeinfo(head);
+				return -FI_ENOMEM;
+			}
+			*tail = info;
+			tail = &info->next;
 		}
-		*tail = info;
-		tail = &info->next;
-	}
 	srdsim_util_prov.info = head;
 	return 0;
 }

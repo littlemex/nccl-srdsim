@@ -24,6 +24,7 @@
 
 #define SRDSIM_PROV_NAME "efa"
 #define SRDSIM_FABRIC_NAME "efa"
+#define SRDSIM_DIRECT_FABRIC_NAME "efa-direct"
 /* The real provider names its RDM domain "<device>-rdm". */
 #define SRDSIM_DOMAIN_NAME "srdsim0-rdm"
 /* As EFA_RDM_IOV_LIMIT. */
@@ -32,6 +33,8 @@
 extern struct fi_provider srdsim_prov;
 extern struct util_prov srdsim_util_prov;
 extern struct fi_info srdsim_info;
+extern struct fi_info srdsim_direct_info;
+bool srdsim_info_is_direct(const struct fi_info *info);
 
 #define SRDSIM_WARN(subsys, ...) FI_WARN(&srdsim_prov, subsys, __VA_ARGS__)
 #define SRDSIM_INFO(subsys, ...) FI_INFO(&srdsim_prov, subsys, __VA_ARGS__)

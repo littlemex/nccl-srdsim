@@ -112,7 +112,10 @@ int srdsim_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric_fid, v
 	if (!fabric)
 		return -FI_ENOMEM;
 
-	ret = ofi_fabric_init(&srdsim_prov, srdsim_info.fabric_attr, attr, fabric, context);
+	ret = ofi_fabric_init(&srdsim_prov,
+			      attr && attr->name && !strcmp(attr->name, SRDSIM_DIRECT_FABRIC_NAME) ?
+			      srdsim_direct_info.fabric_attr : srdsim_info.fabric_attr,
+			      attr, fabric, context);
 	if (ret) {
 		free(fabric);
 		return ret;
