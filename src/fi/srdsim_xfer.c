@@ -282,6 +282,35 @@ static int srdsim_send_frame(struct srdsim_conn *c, const struct srdsim_frame *f
 	return ret;
 }
 
+/*
+ * GPU memory is read and written from the provider's own CUDA context (srdsim_gpu.c): libfabric's copy runs in the
+ * application's primary context and waits for any kernel resident there, which in DeepEP is waiting for these bytes.
+ * Every other kind of memory, and a GPU window the own context cannot address, takes libfabric's copy.
+ */
+static int srdsim_hmem_to(enum fi_hmem_iface iface, uint64_t device, void *dst, const void *src, size_t len)
+{
+	int ret;
+
+	if (iface == FI_HMEM_CUDA) {
+		ret = srdsim_gpu_copy_to(device, dst, src, len);
+		if (ret != -FI_ENOSYS)
+			return ret;
+	}
+	return ofi_copy_to_hmem(iface, device, dst, src, len);
+}
+
+static int srdsim_hmem_from(enum fi_hmem_iface iface, uint64_t device, void *dst, const void *src, size_t len)
+{
+	int ret;
+
+	if (iface == FI_HMEM_CUDA) {
+		ret = srdsim_gpu_copy_from(device, dst, src, len);
+		if (ret != -FI_ENOSYS)
+			return ret;
+	}
+	return ofi_copy_from_hmem(iface, device, dst, src, len);
+}
+
 /* Copies between a buffer of any memory kind (host or device, by its descriptor) and host memory. */
 static int srdsim_copy_from(void *dst, const struct iovec *iov, void **desc, size_t count, size_t offset, size_t len)
 {
@@ -297,7 +326,7 @@ static int srdsim_copy_from(void *dst, const struct iovec *iov, void **desc, siz
 		n = MIN(iov[i].iov_len - skip, len - done);
 		mr = desc ? desc[i] : NULL;
 		if (mr && mr->iface != FI_HMEM_SYSTEM) {
-			ret = ofi_copy_from_hmem(mr->iface, mr->device, (char *) dst + done,
+			ret = srdsim_hmem_from(mr->iface, mr->device, (char *) dst + done,
 						 (char *) iov[i].iov_base + skip, n);
 			if (ret)
 				return ret;
@@ -325,7 +354,7 @@ static int srdsim_copy_to(const struct iovec *iov, void **desc, size_t count, si
 		n = MIN(iov[i].iov_len - skip, len - done);
 		mr = desc ? desc[i] : NULL;
 		if (mr && mr->iface != FI_HMEM_SYSTEM) {
-			ret = ofi_copy_to_hmem(mr->iface, mr->device, (char *) iov[i].iov_base + skip,
+			ret = srdsim_hmem_to(mr->iface, mr->device, (char *) iov[i].iov_base + skip,
 					       (const char *) src + done, n);
 			if (ret)
 				return ret;
@@ -508,7 +537,7 @@ static int srdsim_store(struct ofi_mr *mr, void *dst, const char *src, size_t le
 	size_t step = 128, n;
 
 	if (mr && mr->iface != FI_HMEM_SYSTEM)
-		return ofi_copy_to_hmem(mr->iface, mr->device, dst, src, len);
+		return srdsim_hmem_to(mr->iface, mr->device, dst, src, len);
 	if (in_order) {
 		/* Front to back, a block at a time, each visible before the next is written. */
 		while (len) {
@@ -663,7 +692,7 @@ static void srdsim_on_read_req(struct srdsim_xfer *x, struct srdsim_conn *c, con
 		off = (size_t) order[k] * x->chunk;
 		len = MIN(x->chunk, f->total - off);
 		if (mr && mr->iface != FI_HMEM_SYSTEM)
-			ret = ofi_copy_from_hmem(mr->iface, mr->device, tmp, (char *) src + off, len);
+			ret = srdsim_hmem_from(mr->iface, mr->device, tmp, (char *) src + off, len);
 		else
 			memcpy(tmp, (char *) src + off, len);
 		r.offset = off;

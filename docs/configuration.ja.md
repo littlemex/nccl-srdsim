@@ -100,3 +100,4 @@ libfabric プロバイダ (`libsrdsim-fi.so`、[プロバイダの説明](libfab
 | `SRDSIM_FI_WRITE_IN_ORDER` | `0` か `1`、`1` | `1` は、対応する EFA デバイスと同じく `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` を受け付ける。`0` は、対応しないデバイスと同じく `-FI_EOPNOTSUPP` で断る。ほかの値はログに書いて `1` として扱う |
 | `SRDSIM_FI_JITTER_US` | 個数、`200` | `srd` のとき、書き込みのチャンクが相手側で適用されるまでに待つ時間の最大値 (マイクロ秒)。各チャンクはこれ以下の乱数の時間だけ待つ。`0` は届いた順にすぐ適用する。`inorder` では使わない |
 | `SRDSIM_FI_CQ_DATA_EARLY` | `0` か `1`、`0` | `1` は、CQ データつき書き込みの相手側の完了を最後ではなく最初のチャンクで出す。EFA の保証をわざと破る、それに頼るコードのための陰性対照 |
+| `SRDSIM_FI_TRACE` | `0` か `1`、`0` | `1` にすると、libfabric プロバイダが出した操作、適用したフレーム、書いた完了の 1 件ごとに stderr へ 1 行書く |
