@@ -597,8 +597,9 @@ static void srdsim_on_write(struct srdsim_xfer *x, struct srdsim_conn *c, const 
 		dlist_insert_tail(&w->entry, &x->inwrites);
 	}
 
-	ret = srdsim_verify(x, f->addr, f->len, f->key, FI_REMOTE_WRITE, &dst, &mr);
-	if (!ret) {
+	/* A write of no bytes touches no memory, and the device checks no key for it. */
+	ret = f->len ? srdsim_verify(x, f->addr, f->len, f->key, FI_REMOTE_WRITE, &dst, &mr) : 0;
+	if (!ret && f->len) {
 		ret = srdsim_store(mr, dst, payload, f->len, f->flags & SRDSIM_FR_IN_ORDER);
 		srdsim_verify_done(x);
 	}
