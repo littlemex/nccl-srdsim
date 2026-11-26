@@ -70,6 +70,7 @@ struct srdsim_frame {
 	uint64_t data;		/* CQ data, or the status of an ACK */
 	uint64_t tag;
 };
+_Static_assert(sizeof(struct srdsim_frame) == 72, "tests/fi/test_fi_wire.cc mirrors the wire frame");
 
 enum srdsim_mode { SRDSIM_MODE_SRD, SRDSIM_MODE_INORDER };
 
@@ -85,6 +86,7 @@ struct srdsim_inmsg {
 	uint32_t flags;
 	struct srdsim_recv *recv;	/* the receive it matched, or */
 	struct srdsim_unexp *unexp;	/* the unexpected message it is kept in */
+	int status;			/* the first copy error of its pieces, 0 if none */
 };
 
 struct srdsim_conn {
@@ -283,6 +285,39 @@ static int srdsim_send_frame(struct srdsim_conn *c, const struct srdsim_frame *f
 	return ret;
 }
 
+/*
+ * GPU memory is read and written from the provider's own CUDA context (srdsim_gpu.c): libfabric's copy runs in the
+ * application's primary context and waits for any kernel resident there, which in DeepEP is waiting for these bytes.
+ * Every other kind of memory, and a GPU window the own context cannot address, takes libfabric's copy.
+ */
+static int srdsim_hmem_to(enum fi_hmem_iface iface, uint64_t device, void *dst, const void *src, size_t len)
+{
+	int ret;
+
+	if (iface == FI_HMEM_CUDA) {
+		ret = srdsim_gpu_copy_to(device, dst, src, len);
+		if (ret != -FI_ENOSYS)
+			return ret;
+		if (srdsim_gpu_exiting())
+			return -FI_ESHUTDOWN;
+	}
+	return ofi_copy_to_hmem(iface, device, dst, src, len);
+}
+
+static int srdsim_hmem_from(enum fi_hmem_iface iface, uint64_t device, void *dst, const void *src, size_t len)
+{
+	int ret;
+
+	if (iface == FI_HMEM_CUDA) {
+		ret = srdsim_gpu_copy_from(device, dst, src, len);
+		if (ret != -FI_ENOSYS)
+			return ret;
+		if (srdsim_gpu_exiting())
+			return -FI_ESHUTDOWN;
+	}
+	return ofi_copy_from_hmem(iface, device, dst, src, len);
+}
+
 /* Copies between a buffer of any memory kind (host or device, by its descriptor) and host memory. */
 static int srdsim_copy_from(void *dst, const struct iovec *iov, void **desc, size_t count, size_t offset, size_t len)
 {
@@ -298,7 +333,7 @@ static int srdsim_copy_from(void *dst, const struct iovec *iov, void **desc, siz
 		n = MIN(iov[i].iov_len - skip, len - done);
 		mr = desc ? desc[i] : NULL;
 		if (mr && mr->iface != FI_HMEM_SYSTEM) {
-			ret = ofi_copy_from_hmem(mr->iface, mr->device, (char *) dst + done,
+			ret = srdsim_hmem_from(mr->iface, mr->device, (char *) dst + done,
 						 (char *) iov[i].iov_base + skip, n);
 			if (ret)
 				return ret;
@@ -326,7 +361,7 @@ static int srdsim_copy_to(const struct iovec *iov, void **desc, size_t count, si
 		n = MIN(iov[i].iov_len - skip, len - done);
 		mr = desc ? desc[i] : NULL;
 		if (mr && mr->iface != FI_HMEM_SYSTEM) {
-			ret = ofi_copy_to_hmem(mr->iface, mr->device, (char *) iov[i].iov_base + skip,
+			ret = srdsim_hmem_to(mr->iface, mr->device, (char *) iov[i].iov_base + skip,
 					       (const char *) src + done, n);
 			if (ret)
 				return ret;
@@ -496,6 +531,14 @@ static int srdsim_verify(struct srdsim_xfer *x, uint64_t addr, uint64_t len, uin
 		ofi_genlock_unlock(&domain->lock);
 		return ret;
 	}
+	/*
+	 * libfabric's check adds the length to the address in pointer arithmetic, so an address near the top of the
+	 * address space with a short length wraps to a low end and passes. Nothing may be copied across that wrap.
+	 */
+	if (len > UINTPTR_MAX - io) {
+		ofi_genlock_unlock(&domain->lock);
+		return -FI_EACCES;
+	}
 	*local = (void *) io;
 	*mr = ctx;
 	return 0;
@@ -511,7 +554,7 @@ static int srdsim_store(struct ofi_mr *mr, void *dst, const char *src, size_t le
 	size_t step = 128, n;
 
 	if (mr && mr->iface != FI_HMEM_SYSTEM)
-		return ofi_copy_to_hmem(mr->iface, mr->device, dst, src, len);
+		return srdsim_hmem_to(mr->iface, mr->device, dst, src, len);
 	if (in_order) {
 		/* Front to back, a block at a time, each visible before the next is written. */
 		while (len) {
@@ -666,7 +709,7 @@ static void srdsim_on_read_req(struct srdsim_xfer *x, struct srdsim_conn *c, con
 		off = (size_t) order[k] * x->chunk;
 		len = MIN(x->chunk, f->total - off);
 		if (mr && mr->iface != FI_HMEM_SYSTEM)
-			ret = ofi_copy_from_hmem(mr->iface, mr->device, tmp, (char *) src + off, len);
+			ret = srdsim_hmem_from(mr->iface, mr->device, tmp, (char *) src + off, len);
 		else
 			memcpy(tmp, (char *) src + off, len);
 		r.offset = off;
@@ -764,10 +807,14 @@ static void srdsim_on_msg(struct srdsim_xfer *x, struct srdsim_conn *c, const st
 	struct srdsim_recv *r, *found = NULL;
 	struct srdsim_unexp *u;
 	size_t room;
+	int ret;
 
 	if (!c->peer_known)
 		return;
-	if (m->active && (f->op_id != m->op_id || f->offset != m->received))
+	/* A piece must continue the message it names: same total, and room for it in what was announced. The buffer
+	 * of an unexpected message was sized by its first piece, so a later piece may not claim more. */
+	if (m->active && (f->op_id != m->op_id || f->offset != m->received || f->total != m->total ||
+			  f->len > m->total - m->received))
 		srdsim_inmsg_abort(x, m, tagged);
 	if (!m->active) {
 		if (f->offset != 0)
@@ -809,8 +856,11 @@ static void srdsim_on_msg(struct srdsim_xfer *x, struct srdsim_conn *c, const st
 
 	if (m->recv) {
 		room = f->offset < m->recv->len ? MIN(f->len, m->recv->len - f->offset) : 0;
-		if (room)
-			(void) srdsim_copy_to(m->recv->iov, m->recv->desc, m->recv->iov_count, f->offset, payload, room);
+		if (room) {
+			ret = srdsim_copy_to(m->recv->iov, m->recv->desc, m->recv->iov_count, f->offset, payload, room);
+			if (ret && !m->status)
+				m->status = ret;
+		}
 	} else {
 		memcpy(m->unexp->buf + f->offset, payload, f->len);
 		m->unexp->received += f->len;
@@ -819,15 +869,31 @@ static void srdsim_on_msg(struct srdsim_xfer *x, struct srdsim_conn *c, const st
 	if (m->received < m->total)
 		return;
 
+	if (m->status) {
+		/* The bytes did not reach the receive: it fails, and so does the send. */
+		const uint64_t op_id = m->op_id;
+		const int status = m->status;
+
+		srdsim_inmsg_abort(x, m, tagged);
+		srdsim_ack(c, op_id, status);
+		return;
+	}
 	if (m->recv) {
 		srdsim_recv_complete(x, m->recv, tagged, m->total, m->tag, m->data, m->flags, &c->peer);
 	} else if (m->unexp->claimed) {
 		/* A receive matched it while it was arriving. */
 		r = m->unexp->claimed;
-		(void) srdsim_copy_to(r->iov, r->desc, r->iov_count, 0, m->unexp->buf, MIN(m->total, r->len));
+		ret = srdsim_copy_to(r->iov, r->desc, r->iov_count, 0, m->unexp->buf, MIN(m->total, r->len));
 		dlist_remove(&m->unexp->entry);
 		free(m->unexp->buf);
 		free(m->unexp);
+		if (ret) {
+			srdsim_event(x, SRDSIM_EV_RX, r->context, FI_RECV, 0, NULL, 0, 0, FI_EIO, 0, NULL);
+			free(r);
+			srdsim_ack(c, m->op_id, ret);
+			m->active = false;
+			return;
+		}
 		srdsim_recv_complete(x, r, tagged, m->total, m->tag, m->data, m->flags, &c->peer);
 	}
 	srdsim_ack(c, m->op_id, 0);
@@ -1022,19 +1088,27 @@ static bool srdsim_conn_write(struct srdsim_conn *c)
 static void srdsim_conn_lost(struct srdsim_xfer *x, struct srdsim_conn *c)
 {
 	struct dlist_entry *lists[2] = { &x->pending, &x->inflight };
-	struct srdsim_op *op, *otmp;
-	struct srdsim_inwrite *w, *wtmp;
+	struct srdsim_op *op;
+	struct srdsim_inwrite *w;
+	struct dlist_entry *otmp, *wtmp;
 	size_t i;
 
 	for (i = 0; i < 2; i++)
 		dlist_foreach_container_safe(lists[i], struct srdsim_op, op, entry, otmp)
 			if (op->conn == c)
 				srdsim_op_done(x, op, c->connecting ? -FI_EHOSTUNREACH : -FI_EIO);
-	struct srdsim_delayed *d, *dtmp;
+	struct srdsim_delayed *d;
+	struct dlist_entry *dtmp;
 
+	/*
+	 * Chunks already received from the peer land even if it closed right after sending them: the bytes had left
+	 * the sender, as they would have reached a NIC. Not when this endpoint is itself closing.
+	 */
 	dlist_foreach_container_safe(&x->delayed, struct srdsim_delayed, d, entry, dtmp)
 		if (d->conn == c) {
 			dlist_remove(&d->entry);
+			if (!x->stop)
+				srdsim_on_write(x, c, &d->f, d->payload);
 			free(d);
 		}
 	dlist_foreach_container_safe(&x->inwrites, struct srdsim_inwrite, w, entry, wtmp)
@@ -1068,7 +1142,8 @@ static void *srdsim_agent(void *arg)
 {
 	struct srdsim_xfer *x = arg;
 	struct pollfd *pfd = NULL;
-	struct srdsim_conn **who = NULL, *c, *tmp;
+	struct srdsim_conn **who = NULL, *c;
+	struct dlist_entry *tmp;
 	size_t n, cap = 0, i;
 	uint64_t drain;
 	int fd, timeout;
@@ -1281,7 +1356,17 @@ static bool srdsim_eligible(struct srdsim_xfer *x, struct srdsim_op *op)
 {
 	struct srdsim_op *e;
 
-	if (op->kind != SRDSIM_OP_SEND || x->direct)
+	if (op->kind != SRDSIM_OP_SEND)
+		return true;
+	/*
+	 * The pieces of one message arrive in order, one message after another, so a message that has begun owns the
+	 * stream to its peer until its last piece is out; another send to that peer waits, also on efa-direct, where
+	 * only the order between messages is free.
+	 */
+	dlist_foreach_container(&x->pending, struct srdsim_op, e, entry)
+		if (e != op && e->kind == SRDSIM_OP_SEND && e->conn == op->conn && e->next > 0 && e->next < e->nchunks)
+			return false;
+	if (x->direct)
 		return true;
 	dlist_foreach_container(&x->pending, struct srdsim_op, e, entry) {
 		if (e == op)
@@ -1437,9 +1522,15 @@ static ssize_t srdsim_post_recv(struct fid_ep *ep_fid, bool tagged, const struct
 	} else if (found->received < found->total) {
 		found->claimed = r;
 	} else {
-		(void) srdsim_copy_to(r->iov, r->desc, r->iov_count, 0, found->buf, MIN(found->total, r->len));
+		const int copied = srdsim_copy_to(r->iov, r->desc, r->iov_count, 0, found->buf, MIN(found->total, r->len));
+
 		dlist_remove(&found->entry);
-		srdsim_recv_complete(x, r, tagged, found->total, found->tag, found->data, found->flags, &found->src);
+		if (copied) {
+			srdsim_event(x, SRDSIM_EV_RX, r->context, FI_RECV, 0, NULL, 0, 0, FI_EIO, 0, NULL);
+			free(r);
+		} else {
+			srdsim_recv_complete(x, r, tagged, found->total, found->tag, found->data, found->flags, &found->src);
+		}
 		free(found->buf);
 		free(found);
 	}
@@ -1799,7 +1890,8 @@ void srdsim_xfer_close(struct srdsim_ep *ep)
 		 */
 		for (i = 0; i < 1000; i++) {
 			pthread_mutex_lock(&x->mu);
-			pending = false;
+			srdsim_release(x);	/* an inject nobody has read a completion after is still sent */
+			pending = !dlist_empty(&x->pending);
 			dlist_foreach_container(&x->conns, struct srdsim_conn, c, entry)
 				pending = pending || c->out.len > c->out.off;
 			pthread_mutex_unlock(&x->mu);

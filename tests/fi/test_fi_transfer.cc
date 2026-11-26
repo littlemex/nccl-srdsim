@@ -5,7 +5,7 @@
 //
 //   test_fi_transfer PROVIDER_SO SCENARIO
 //
-// SCENARIO is one of sendrecv, tagged, inject, unreachable, truncate, read, badkey, writedata, reorder. The program exits 0 when
+// SCENARIO is one of sendrecv, tagged, closeinject, closewrite, directsend, inject, unreachable, truncate, read, badkey, writedata, reorder. The program exits 0 when
 // the scenario's checks pass and 1 when one fails; each check prints one line.
 //
 // writedata checks EFA's guarantee that a write's remote completion with CQ data comes only after every byte
@@ -38,6 +38,7 @@ namespace {
 
 int g_rank = 0;
 int g_failures = 0;
+bool g_direct = false;   // the efa-direct fabric, whose sends are not ordered
 int g_to_peer = -1, g_from_peer = -1;
 
 void check(bool ok, const char* what) {
@@ -72,6 +73,7 @@ struct Endpoint {
     fid_cq* cq = nullptr;
     fid_ep* ep = nullptr;
     fi_addr_t peer = FI_ADDR_NOTAVAIL;
+    bool closed = false;
 };
 
 void open_endpoint(Endpoint* e) {
@@ -81,12 +83,19 @@ void open_endpoint(Endpoint* e) {
     hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
     hints->domain_attr->threading = FI_THREAD_COMPLETION;
     hints->fabric_attr->prov_name = strdup("efa");
-    hints->tx_attr->msg_order = FI_ORDER_SAS;
-    hints->rx_attr->msg_order = FI_ORDER_SAS;
+    if (g_direct) {
+        free(hints->fabric_attr->name);
+        hints->fabric_attr->name = strdup("efa-direct");
+        hints->caps &= ~uint64_t(FI_TAGGED);   // efa-direct has no tagged messages
+        hints->domain_attr->mr_mode |= FI_MR_LOCAL;
+    } else {
+        hints->tx_attr->msg_order = FI_ORDER_SAS;
+        hints->rx_attr->msg_order = FI_ORDER_SAS;
+    }
     int rc = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, hints, &e->info);
     fi_freeinfo(hints);
     if (rc) die("fi_getinfo", rc);
-    if (std::strcmp(e->info->domain_attr->name, "srdsim0-rdm") != 0) die("not the srdsim provider", -FI_ENODATA);
+    if (std::strncmp(e->info->domain_attr->name, "srdsim0", 7) != 0) die("not the srdsim provider", -FI_ENODATA);
     if ((rc = fi_fabric(e->info->fabric_attr, &e->fabric, nullptr))) die("fi_fabric", rc);
     if ((rc = fi_domain(e->fabric, e->info, &e->domain, nullptr))) die("fi_domain", rc);
     fi_av_attr av_attr = {};
@@ -108,6 +117,8 @@ void open_endpoint(Endpoint* e) {
 }
 
 void close_endpoint(Endpoint* e) {
+    if (e->closed) return;
+    e->closed = true;
     fi_close(&e->ep->fid);
     fi_close(&e->cq->fid);
     fi_close(&e->av->fid);
@@ -196,11 +207,96 @@ void sendrecv(Endpoint* e) {
     barrier();
 }
 
+// On efa-direct, sends to one peer are not ordered, but the pieces of one message are never mixed with another's: several
+// messages longer than one chunk, posted back to back, each arrive whole.
+void directsend(Endpoint* e) {
+    constexpr int kCount = 8;
+    constexpr size_t kLen = 40000;   // several chunks
+    if (g_rank == 0) {
+        std::vector<std::vector<uint8_t>> bufs(kCount, std::vector<uint8_t>(kLen));
+        for (int i = 0; i < kCount; ++i) {
+            for (size_t k = 0; k < kLen; ++k) bufs[i][k] = pattern(i, k);
+            if (int rc = int(fi_send(e->ep, bufs[i].data(), kLen, nullptr, e->peer, &bufs[i]))) die("fi_send", rc);
+        }
+        fi_cq_tagged_entry c;
+        for (int i = 0; i < kCount; ++i)
+            if (wait_cq(e, &c)) die("send completion", -FI_EIO);
+        check(true, "every long send completed");
+        barrier();
+        return;
+    }
+    std::vector<std::vector<uint8_t>> bufs(kCount, std::vector<uint8_t>(kLen, 0));
+    for (int i = 0; i < kCount; ++i)
+        if (int rc = int(fi_recv(e->ep, bufs[i].data(), kLen, nullptr, FI_ADDR_UNSPEC, &bufs[i]))) die("fi_recv", rc);
+    bool whole = true;
+    bool seen[kCount] = {};
+    for (int i = 0; i < kCount; ++i) {
+        fi_cq_tagged_entry c;
+        fi_cq_err_entry err = {};
+        if (wait_cq(e, &c, &err)) { whole = false; continue; }
+        const auto* b = static_cast<std::vector<uint8_t>*>(c.op_context);
+        int which = -1;
+        for (int m = 0; m < kCount and which < 0; ++m) {
+            bool same = true;
+            for (size_t k = 0; k < kLen and same; ++k) same = (*b)[k] == pattern(m, k);
+            if (same) which = m;
+        }
+        if (which < 0 or seen[which] or c.len != kLen) whole = false; else seen[which] = true;
+    }
+    check(whole, "eight messages of 40000 bytes each arrive whole and once, whatever the order between them");
+    barrier();
+}
+
+// What a sender had accepted before it closed still reaches its peer: an inject nobody read a completion after, and the
+// chunks of a write that are still in flight when the connection ends.
+void closeafter(Endpoint* e, bool write) {
+    constexpr size_t kLen = 200000;   // several chunks
+    Region r;
+    uint64_t desc[2] = {};
+    if (g_rank == 1) {
+        reg(e, &r, kLen, FI_REMOTE_WRITE);
+        desc[0] = uint64_t(uintptr_t(r.mem.data()));
+        desc[1] = r.key;
+        put(desc, sizeof desc);
+    } else {
+        get(desc, sizeof desc);
+    }
+    char in[16] = {};
+    if (g_rank == 1 and not write)
+        if (int rc = int(fi_recv(e->ep, in, sizeof in, nullptr, FI_ADDR_UNSPEC, nullptr))) die("fi_recv", rc);
+    barrier();
+    if (g_rank == 0) {
+        std::vector<uint8_t> b(kLen);
+        for (size_t k = 0; k < kLen; ++k) b[k] = pattern(7, k);
+        if (write) {
+            if (int rc = int(fi_write(e->ep, b.data(), kLen, nullptr, e->peer, desc[0], desc[1], nullptr))) die("fi_write", rc);
+        } else {
+            char m[16] = "inject, close";
+            if (int rc = int(fi_inject(e->ep, m, sizeof m, e->peer))) die("fi_inject", rc);
+        }
+        close_endpoint(e);   // with no completion read in between
+    } else if (write) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool landed = false;
+        while (not landed and std::chrono::steady_clock::now() < deadline) {
+            landed = true;
+            for (size_t k = 0; k < kLen and landed; ++k) landed = r.mem[k] == pattern(7, k);
+            if (not landed) usleep(2000);
+        }
+        check(landed, "a write whose sender closed right after it was posted landed whole");
+    } else {
+        fi_cq_tagged_entry c;
+        const int rc = wait_cq(e, &c, nullptr, 10);
+        check(rc == 0 and std::strncmp(in, "inject, close", 14) == 0, "an inject whose sender closed right after it reaches its peer");
+    }
+    barrier();
+}
+
 // Receives match by tag, not by order.
 void tagged(Endpoint* e) {
     const uint64_t tags[3] = {0x30, 0x10, 0x20};
     if (g_rank == 0) {
-        char m[3][8];
+        char m[3][8] = {};   // the whole 8 bytes are sent, so none may be left indeterminate
         for (int i = 0; i < 3; ++i) {
             std::snprintf(m[i], sizeof m[i], "tag%llx", (unsigned long long) tags[i]);
             if (int rc = int(fi_tsend(e->ep, m[i], sizeof m[i], nullptr, e->peer, tags[i], nullptr))) die("fi_tsend", rc);
@@ -218,9 +314,13 @@ void tagged(Endpoint* e) {
         if (int rc = int(fi_trecv(e->ep, b, sizeof b, nullptr, FI_ADDR_UNSPEC, want, 0, nullptr))) die("fi_trecv", rc);
         fi_cq_tagged_entry c;
         if (wait_cq(e, &c)) die("trecv completion", -FI_EIO);
-        char expect[8];
+        char expect[8] = {};
         std::snprintf(expect, sizeof expect, "tag%llx", (unsigned long long) want);
-        if (c.tag != want or std::memcmp(b, expect, sizeof b) != 0) ok = false;
+        if (c.tag != want or std::memcmp(b, expect, sizeof b) != 0) {
+            std::printf("rank 1: wanted tag %llx, completion tag %llx, buffer '%.8s', flags %llx\n", (unsigned long long) want,
+                        (unsigned long long) c.tag, b, (unsigned long long) c.flags);
+            ok = false;
+        }
     }
     check(ok, "three tagged messages are matched by tag, received in another order than sent");
     barrier();
@@ -448,6 +548,7 @@ int main(int argc, char** argv) {
     if (argc != 3) { std::fprintf(stderr, "usage: %s PROVIDER_SO SCENARIO\n", argv[0]); return 2; }
     setenv("FI_PROVIDER_PATH", (std::string("+") + argv[1]).c_str(), 1);
     const std::string scenario = argv[2];
+    g_direct = scenario == "directsend";
     int p01[2], p10[2];
     if (pipe(p01) or pipe(p10)) return 2;
     std::fflush(nullptr);
@@ -462,6 +563,9 @@ int main(int argc, char** argv) {
     open_endpoint(&e);
     if (scenario == "sendrecv") sendrecv(&e);
     else if (scenario == "tagged") tagged(&e);
+    else if (scenario == "closeinject") closeafter(&e, false);
+    else if (scenario == "closewrite") closeafter(&e, true);
+    else if (scenario == "directsend") directsend(&e);
     else if (scenario == "truncate") truncate(&e);
     else if (scenario == "inject") inject(&e);
     else if (scenario == "unreachable") unreachable(&e);
