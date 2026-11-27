@@ -6,7 +6,9 @@ _srdsim_files = \
 	prov/srdsim/srdsim_init.c	\
 	prov/srdsim/srdsim_fabric.c	\
 	prov/srdsim/srdsim_cq_av.c	\
-	prov/srdsim/srdsim_ep.c
+	prov/srdsim/srdsim_ep.c		\
+	prov/srdsim/srdsim_gpu.c	\
+	prov/srdsim/srdsim_xfer.c
 
 if HAVE_SRDSIM_DL
 pkglib_LTLIBRARIES += libsrdsim-fi.la

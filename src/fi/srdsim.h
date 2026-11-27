@@ -24,36 +24,50 @@
 
 #define SRDSIM_PROV_NAME "efa"
 #define SRDSIM_FABRIC_NAME "efa"
+#define SRDSIM_DIRECT_FABRIC_NAME "efa-direct"
 /* The real provider names its RDM domain "<device>-rdm". */
 #define SRDSIM_DOMAIN_NAME "srdsim0-rdm"
+/* As EFA_RDM_IOV_LIMIT. */
+#define SRDSIM_IOV_MAX 4
 
 extern struct fi_provider srdsim_prov;
 extern struct util_prov srdsim_util_prov;
 extern struct fi_info srdsim_info;
+extern struct fi_info srdsim_direct_info;
+bool srdsim_info_is_direct(const struct fi_info *info);
 
 #define SRDSIM_WARN(subsys, ...) FI_WARN(&srdsim_prov, subsys, __VA_ARGS__)
 #define SRDSIM_INFO(subsys, ...) FI_INFO(&srdsim_prov, subsys, __VA_ARGS__)
 
 /*
  * The address an endpoint reports from fi_getname and a peer inserts into its address vector: 32 bytes, the
- * size of the real provider's raw address, so buffers a consumer sizes for EFA hold it.
+ * size of the real provider's raw address, so buffers a consumer sizes for EFA hold it. The endpoint listens on
+ * the loopback interface at `port`.
  */
 struct srdsim_addr {
 	char magic[8];		/* SRDSIM_ADDR_MAGIC */
 	uint32_t version;	/* SRDSIM_ADDR_VERSION */
-	uint32_t reserved;
+	uint16_t port;		/* network byte order */
+	uint16_t reserved;
 	uint64_t nonce;		/* unique per endpoint */
-	uint64_t reserved2;
+	uint32_t ipv4;		/* network byte order */
+	uint32_t reserved2;
 };
 #define SRDSIM_ADDR_MAGIC "SRDSIMFI"
 #define SRDSIM_ADDR_VERSION 1
 
+struct srdsim_xfer;	/* the transfer engine of one endpoint, srdsim_xfer.c */
+
 struct srdsim_ep {
 	struct util_ep util_ep;
 	struct srdsim_addr addr;
+	struct srdsim_xfer *xfer;
 	bool enabled;
 	size_t max_msg_size;	/* from the fi_info it was opened with */
 	size_t inject_size;
+	size_t tx_size;
+	bool direct;		/* opened on the efa-direct fabric */
+	bool rx_cq_data;	/* with FI_RX_CQ_DATA */
 	/* The EFA endpoint options, as the consumer set them. */
 	size_t rnr_retry;
 	size_t min_multi_recv;
@@ -66,6 +80,22 @@ struct srdsim_ep {
 	bool use_unsolicited_write_recv;
 };
 
+/* srdsim_gpu.c: -FI_ENOSYS means the own CUDA context cannot be used and the caller falls back */
+int srdsim_gpu_copy_to(uint64_t device, void *dst, const void *src, size_t len);
+int srdsim_gpu_copy_from(uint64_t device, void *dst, const void *src, size_t len);
+int srdsim_gpu_exiting(void);	/* the process is exiting: no thread of the provider may enter the CUDA driver */
+
+/* srdsim_xfer.c */
+int srdsim_xfer_open(struct srdsim_ep *ep);
+int srdsim_xfer_start(struct srdsim_ep *ep);
+void srdsim_xfer_close(struct srdsim_ep *ep);
+void srdsim_xfer_progress(struct util_ep *util_ep);
+extern struct fi_ops_msg srdsim_msg_ops;
+extern struct fi_ops_tagged srdsim_tagged_ops;
+extern struct fi_ops_rma srdsim_rma_ops;
+
+int srdsim_build_infos(void);
+void srdsim_free_infos(void);
 int srdsim_getinfo_alter(uint32_t version, const struct fi_info *hints, struct fi_info *info);
 int srdsim_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric, void *context);
 int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct fid_domain **domain,

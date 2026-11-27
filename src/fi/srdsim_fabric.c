@@ -45,6 +45,25 @@ static struct fi_ops_mr srdsim_mr_ops = {
 	.regattr = ofi_mr_regattr,
 };
 
+/*
+ * Whether the domain's utility objects lock whatever the consumer asked for. 1, the default, is the only setting
+ * for ordinary use; 0 leaves libfabric's choice alone and so leaves the completion ring unguarded under
+ * FI_THREAD_COMPLETION and FI_THREAD_DOMAIN. It exists for one reason: a promise with no way to break it is not
+ * tested, and tests/fi/test_fi_cq_threads.cc is run both ways so that the passing run means something. Read once
+ * per domain.
+ */
+static bool srdsim_guard_cq(void)
+{
+	const char *v = getenv("SRDSIM_FI_GUARD_CQ");
+
+	if (!v || !*v || !strcmp(v, "1"))
+		return true;
+	if (!strcmp(v, "0"))
+		return false;
+	SRDSIM_WARN(FI_LOG_DOMAIN, "SRDSIM_FI_GUARD_CQ=%s is neither 0 nor 1; using 1\n", v);
+	return true;
+}
+
 int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct fid_domain **domain_fid,
 		       void *context)
 {
@@ -63,6 +82,52 @@ int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct f
 	if (ret) {
 		free(domain);
 		return ret;
+	}
+
+	/*
+	 * Every CQ of the domain keeps completion sources, as the efa provider's CQs do: a consumer may open the
+	 * domain with an info without FI_SOURCE and an endpoint on it with one, as aws-ofi-nccl's GIN does, and
+	 * then reads sources with fi_cq_readfrom.
+	 */
+	domain->info_domain_caps |= FI_SOURCE;
+
+	/*
+	 * The objects of this domain lock whatever the consumer asked for. libfabric's utility layer reads this
+	 * one field to choose their locks, and asking for FI_THREAD_COMPLETION or FI_THREAD_DOMAIN disarms the
+	 * one that matters here: the completion ring, for which ofi_cq_init picks OFI_LOCK_NOOP under both
+	 * models. Both the writer and the reader of that ring take it.
+	 *
+	 * Two others read the same field and are worth knowing about. The endpoint's own lock is disarmed for
+	 * anything other than FI_THREAD_SAFE (ofi_endpoint_init), but nothing in libfabric's utility layer, its
+	 * core, or this provider ever takes it -- only initialises and destroys it -- so today it is inert; it
+	 * stops being inert the moment this provider starts using it, which is the other reason to set this
+	 * field rather than reach into the queue. The endpoint-list and address-vector locks are not affected at
+	 * all here: those become no-ops only when control progress is FI_PROGRESS_CONTROL_UNIFIED, and this
+	 * provider reports manual control progress.
+	 *
+	 * In those models a consumer owes libfabric its own serialisation and the stock providers leave it at
+	 * that, the real efa provider included: its CQ is a util_cq too, so it gets the same no-op. None of that
+	 * is a defect in libfabric.
+	 *
+	 * It would be one here. This provider exists so that someone can find a bug in the code above it, and a
+	 * consumer hunting its own threading mistake must not first have to rule out a corrupted ring inside the
+	 * tool it is looking through. tests/fi/test_fi_cq_threads.cc is that promise written as a test.
+	 *
+	 * The cost is stated in the warning below and in docs/libfabric-provider.md: a consumer that forgets the
+	 * serialisation it owes works here and breaks on the real device.
+	 *
+	 * Nothing the consumer can observe changes: this is util_domain's own copy, used for picking locks and
+	 * nothing else (util_domain_init copies every field it wants out of `info` and keeps no pointer into it),
+	 * and the fi_info the consumer holds still says what it asked for. The domain's own lock is already a
+	 * real mutex -- the argument above.
+	 */
+	if (info->domain_attr->threading != FI_THREAD_SAFE && srdsim_guard_cq()) {
+		SRDSIM_WARN(FI_LOG_DOMAIN,
+			    "this domain asked for threading %d; its completion queues are locked anyway, so a "
+			    "missing serialisation of your own will not show here -- it will on a real EFA "
+			    "device. SRDSIM_FI_GUARD_CQ=0 leaves libfabric's choice alone\n",
+			    (int) info->domain_attr->threading);
+		domain->threading = FI_THREAD_SAFE;
 	}
 
 	*domain_fid = &domain->domain_fid;
@@ -112,7 +177,10 @@ int srdsim_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric_fid, v
 	if (!fabric)
 		return -FI_ENOMEM;
 
-	ret = ofi_fabric_init(&srdsim_prov, srdsim_info.fabric_attr, attr, fabric, context);
+	ret = ofi_fabric_init(&srdsim_prov,
+			      attr && attr->name && !strcmp(attr->name, SRDSIM_DIRECT_FABRIC_NAME) ?
+			      srdsim_direct_info.fabric_attr : srdsim_info.fabric_attr,
+			      attr, fabric, context);
 	if (ret) {
 		free(fabric);
 		return ret;

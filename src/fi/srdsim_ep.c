@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
  * The RDM endpoint. Its options are answered as the real RDM endpoint answers them, in libfabric's
- * prov/efa/src/rdm/efa_rdm_ep_fiops.c. Transfers are not carried yet: every data call returns -FI_ENOSYS.
+ * prov/efa/src/rdm/efa_rdm_ep_fiops.c. Transfers are carried by srdsim_xfer.c.
  */
 #include <sys/random.h>
 
@@ -24,18 +24,16 @@ static bool srdsim_write_in_order_supported(void)
 	return true;
 }
 
-static void srdsim_ep_progress(struct util_ep *util_ep)
-{
-	OFI_UNUSED(util_ep);
-}
-
 static int srdsim_ep_close(struct fid *fid)
 {
 	struct srdsim_ep *ep = container_of(fid, struct srdsim_ep, util_ep.ep_fid.fid);
-	int ret = ofi_endpoint_close(&ep->util_ep);
+	int ret;
 
+	/* Off the CQs first, so no other thread's fi_cq_read progresses it while it is torn down. */
+	ret = ofi_endpoint_close(&ep->util_ep);
 	if (ret)
 		return ret;
+	srdsim_xfer_close(ep);
 	free(ep);
 	return 0;
 }
@@ -43,6 +41,7 @@ static int srdsim_ep_close(struct fid *fid)
 static int srdsim_ep_control(struct fid *fid, int command, void *arg)
 {
 	struct srdsim_ep *ep = container_of(fid, struct srdsim_ep, util_ep.ep_fid.fid);
+	int ret;
 
 	OFI_UNUSED(arg);
 	if (command != FI_ENABLE)
@@ -52,6 +51,11 @@ static int srdsim_ep_control(struct fid *fid, int command, void *arg)
 		return -FI_ENOAV;
 	if (!ep->util_ep.tx_cq || !ep->util_ep.rx_cq)
 		return -FI_ENOCQ;
+	if (ep->enabled)
+		return 0;
+	ret = srdsim_xfer_start(ep);
+	if (ret)
+		return ret;
 	ep->enabled = true;
 	return 0;
 }
@@ -213,44 +217,8 @@ static struct fi_ops_cm srdsim_ep_cm_ops = {
 	.join = fi_no_join,
 };
 
-static struct fi_ops_msg srdsim_ep_msg_ops = {
-	.size = sizeof(struct fi_ops_msg),
-	.recv = fi_no_msg_recv,
-	.recvv = fi_no_msg_recvv,
-	.recvmsg = fi_no_msg_recvmsg,
-	.send = fi_no_msg_send,
-	.sendv = fi_no_msg_sendv,
-	.sendmsg = fi_no_msg_sendmsg,
-	.inject = fi_no_msg_inject,
-	.senddata = fi_no_msg_senddata,
-	.injectdata = fi_no_msg_injectdata,
-};
 
-static struct fi_ops_rma srdsim_ep_rma_ops = {
-	.size = sizeof(struct fi_ops_rma),
-	.read = fi_no_rma_read,
-	.readv = fi_no_rma_readv,
-	.readmsg = fi_no_rma_readmsg,
-	.write = fi_no_rma_write,
-	.writev = fi_no_rma_writev,
-	.writemsg = fi_no_rma_writemsg,
-	.inject = fi_no_rma_inject,
-	.writedata = fi_no_rma_writedata,
-	.injectdata = fi_no_rma_injectdata,
-};
 
-static struct fi_ops_tagged srdsim_ep_tagged_ops = {
-	.size = sizeof(struct fi_ops_tagged),
-	.recv = fi_no_tagged_recv,
-	.recvv = fi_no_tagged_recvv,
-	.recvmsg = fi_no_tagged_recvmsg,
-	.send = fi_no_tagged_send,
-	.sendv = fi_no_tagged_sendv,
-	.sendmsg = fi_no_tagged_sendmsg,
-	.inject = fi_no_tagged_inject,
-	.senddata = fi_no_tagged_senddata,
-	.injectdata = fi_no_tagged_injectdata,
-};
 
 static struct fi_ops_atomic srdsim_ep_atomic_ops = {
 	.size = sizeof(struct fi_ops_atomic),
@@ -283,7 +251,7 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 	if (!ep)
 		return -FI_ENOMEM;
 
-	ret = ofi_endpoint_init(domain, &srdsim_util_prov, info, &ep->util_ep, context, srdsim_ep_progress);
+	ret = ofi_endpoint_init(domain, &srdsim_util_prov, info, &ep->util_ep, context, srdsim_xfer_progress);
 	if (ret) {
 		free(ep);
 		return ret;
@@ -295,6 +263,16 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 		ofi_endpoint_close(&ep->util_ep);
 		free(ep);
 		return -FI_EOTHER;
+	}
+	ep->tx_size = info->tx_attr->size;
+	ep->direct = srdsim_info_is_direct(info);
+	ep->rx_cq_data = info->mode & FI_RX_CQ_DATA;
+	ep->inject_size = info->tx_attr->inject_size;
+	ret = srdsim_xfer_open(ep);
+	if (ret) {
+		ofi_endpoint_close(&ep->util_ep);
+		free(ep);
+		return ret;
 	}
 	ep->max_msg_size = info->ep_attr->max_msg_size;
 	ep->inject_size = info->tx_attr->inject_size;
@@ -310,9 +288,9 @@ int srdsim_endpoint(struct fid_domain *domain, struct fi_info *info, struct fid_
 	(*ep_fid)->fid.ops = &srdsim_ep_fi_ops;
 	(*ep_fid)->ops = &srdsim_ep_ops;
 	(*ep_fid)->cm = &srdsim_ep_cm_ops;
-	(*ep_fid)->msg = &srdsim_ep_msg_ops;
-	(*ep_fid)->rma = &srdsim_ep_rma_ops;
-	(*ep_fid)->tagged = &srdsim_ep_tagged_ops;
+	(*ep_fid)->msg = &srdsim_msg_ops;
+	(*ep_fid)->rma = &srdsim_rma_ops;
+	(*ep_fid)->tagged = &srdsim_tagged_ops;
 	(*ep_fid)->atomic = &srdsim_ep_atomic_ops;
 	return 0;
 }

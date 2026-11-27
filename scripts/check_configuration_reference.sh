@@ -25,7 +25,7 @@ read_vars=$(grep -oE "\\b($READERS)[[:space:]]*\\([[:space:]]*$LITERAL" <<<"$cal
 # getenv(name) each of them makes, and reads of variables outside SRDSIM_*.
 opaque=$(grep -vE "\\b($READERS)[[:space:]]*\\([[:space:]]*(\"SRDSIM_[A-Z0-9_]+\"[[:space:]]*[,)]|\"[^S\"][^\"]*\")" <<<"$calls" \
          | grep -vE "\\b(env_str|env_size|impair_env)\\(const char[[:space:]]*\\*[[:space:]]*name" \
-         | grep -vE 'std::getenv\(name\)' || true)
+         | grep -vE '(std::)?getenv\(name\)' || true)
 built=$(grep -rnE --include='*.cc' --include='*.c' --include='*.h' '"SRDSIM_"|"SRDSIM_[A-Z0-9_]*%' "$ROOT/src" \
         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*)' || true)
 # A full name in quotes that no read helper takes, for instance one passed to a helper this script does

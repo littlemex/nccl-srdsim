@@ -38,7 +38,7 @@ void check(bool ok, const char* what) {
 using Hints = std::function<void(fi_info*)>;
 
 // The provider's info for these hints, or nullptr. Infos of other providers (the built-in ones) are skipped.
-fi_info* ours(const Hints& fill, uint32_t version = FI_VERSION(1, 18)) {
+fi_info* ours(const Hints& fill, uint32_t version = FI_VERSION(1, 18), const char* fabric = "efa") {
     fi_info* hints = fi_allocinfo();
     fill(hints);
     fi_info* list = nullptr;
@@ -47,7 +47,8 @@ fi_info* ours(const Hints& fill, uint32_t version = FI_VERSION(1, 18)) {
     if (rc != 0) return nullptr;
     fi_info* found = nullptr;
     for (fi_info* i = list; i; i = i->next)
-        if (std::strcmp(i->fabric_attr->prov_name, "efa") == 0 and std::strcmp(i->domain_attr->name, kDomain) == 0) {
+        if (std::strcmp(i->fabric_attr->prov_name, "efa") == 0 and std::strcmp(i->domain_attr->name, kDomain) == 0 and
+            std::strcmp(i->fabric_attr->name, fabric) == 0) {
             found = fi_dupinfo(i);
             break;
         }
@@ -271,9 +272,6 @@ void object_checks() {
             if (mr2) fi_close(&mr2->fid);
             fi_close(&mr->fid);
         }
-        // Transfers are not carried yet, and say so rather than succeed.
-        char buf[8] = {};
-        check(fi_send(o.ep, buf, sizeof buf, nullptr, fa, nullptr) == -FI_ENOSYS, "a send reports -FI_ENOSYS");
         fi_cq_data_entry e;
         check(fi_cq_read(o.cq, &e, 1) == -FI_EAGAIN, "an empty CQ reads -FI_EAGAIN");
         check(fi_close(&o.domain->fid) == -FI_EBUSY, "a domain with objects open on it does not close");

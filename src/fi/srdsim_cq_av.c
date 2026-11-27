@@ -170,14 +170,19 @@ int srdsim_av_open(struct fid_domain *domain_fid, struct fi_av_attr *attr, struc
 	struct util_av *av;
 	int ret;
 
+	struct fi_av_attr a = *attr;
+
 	if (attr->name)
 		return -FI_ENOSYS;	/* named, shared address vectors */
+	/* As the efa provider: an unspecified type opens a table. */
+	if (a.type == FI_AV_UNSPEC)
+		a.type = FI_AV_TABLE;
 
 	av = calloc(1, sizeof(*av));
 	if (!av)
 		return -FI_ENOMEM;
 
-	ret = ofi_av_init(domain, attr, &util_attr, av, context);
+	ret = ofi_av_init(domain, &a, &util_attr, av, context);
 	if (ret) {
 		free(av);
 		return ret;

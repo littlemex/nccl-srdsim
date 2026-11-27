@@ -93,8 +93,12 @@ Each makes the fabric slow, bursty or partly stalled on purpose, never lossy, to
 
 ## libfabric provider
 
-Read by the libfabric provider (`libsrdsim-fi.so`, see [the provider's documentation](libfabric-provider.md)) each time the option it governs is set.
+Read by the libfabric provider (`libsrdsim-fi.so`, see [the provider's documentation](libfabric-provider.md)): `SRDSIM_FI_WRITE_IN_ORDER` each time the option it governs is set, the others when an endpoint is opened. The provider also reads `SRDSIM_MODE` (`srd` or `inorder` only), `SRDSIM_SEED` and `SRDSIM_CHUNK_BYTES`, with the meanings above.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `SRDSIM_FI_WRITE_IN_ORDER` | `0` or `1` | `1` | `1` accepts `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES`, as an EFA device that supports it does; `0` refuses it with `-FI_EOPNOTSUPP`, as one that does not. Any other value is logged and `1` is used |
+| `SRDSIM_FI_JITTER_US` | count | `200` | Under `srd`, the longest time, in microseconds, a write chunk waits at the target before it is applied; each waits a random time up to this. `0` applies chunks as they arrive. Not used under `inorder` |
+| `SRDSIM_FI_CQ_DATA_EARLY` | `0` or `1` | `0` | `1` raises a write's remote completion with CQ data on its first chunk instead of its last, which breaks EFA's guarantee on purpose: the negative control for code that relies on it |
+| `SRDSIM_FI_GUARD_CQ` | `0` or `1` | `1` | `1` makes the domain's utility objects lock whatever threading the consumer asked for, so a completion queue stays guarded under `FI_THREAD_COMPLETION` and `FI_THREAD_DOMAIN`, where libfabric's utility layer would leave it unlocked and a consumer owes it serialisation of its own. `0` leaves libfabric's choice alone: the negative control, so that the test of the guarantee has a way to fail. Any other value is logged and `1` is used |
+| `SRDSIM_FI_TRACE` | `0` or `1` | `0` | `1` writes one line to stderr for every operation the libfabric provider submits, every frame it applies and every completion it writes |
