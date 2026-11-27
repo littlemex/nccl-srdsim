@@ -8,6 +8,11 @@
 # LIBFABRIC_SRC is a clone of libfabric at the commit to build against; it is modified in place (the
 # provider is added to it). The provider ends up in PREFIX/lib/srdsim/libsrdsim-fi.so, outside libfabric's
 # default provider directory, so a process loads it only when FI_PROVIDER_PATH names it.
+#
+# The build happens inside LIBFABRIC_SRC, so building a second configuration in the same tree would
+# otherwise link the first one's object files -- which is silent, and the usual outcome is a provider
+# with no sanitizer instrumentation whose tests all pass for the wrong reason. This script records the
+# configuration it built with and cleans the tree when the next one differs.
 set -euo pipefail
 [ $# -ge 2 ] || { echo "usage: $0 LIBFABRIC_SRC PREFIX [CONFIGURE_ARGS...]" >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +32,19 @@ if ! grep -q '^include prov/srdsim/Makefile.include$' "$SRC/Makefile.am"; then
 fi
 
 cd "$SRC"
+# What this invocation asks for that affects the object files: the configure arguments and the
+# compiler and flags, which arrive as trailing VAR=value arguments. PREFIX is left out on purpose --
+# it decides where the result is installed, not how it is compiled, so building the same
+# configuration into a second prefix must not throw the objects away.
+STAMP=.srdsim-build-configuration
+WANT="--enable-srdsim=dl $*"
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" != "$WANT" ]; then
+    echo "this tree was built with a different configuration; cleaning it first" >&2
+    echo "  was:  $(cat "$STAMP")" >&2
+    echo "  want: $WANT" >&2
+    make distclean > distclean.log 2>&1 || rm -f "$STAMP"
+fi
+rm -f "$STAMP"
 ./autogen.sh > autogen.log 2>&1 || { tail -20 autogen.log; exit 1; }
 ./configure --quiet --prefix="$PREFIX" --enable-srdsim=dl "$@" > configure.log 2>&1 || { tail -30 configure.log; exit 1; }
 grep -q 'DSO providers:.*srdsim' configure.log || { echo "configure did not select the srdsim provider:"; grep -A3 'providers:' configure.log; exit 1; }
@@ -37,4 +55,5 @@ make install > install.log 2>&1 || { tail -20 install.log; exit 1; }
 mkdir -p "$PREFIX/lib/srdsim"
 mv "$PREFIX/lib/libfabric/libsrdsim-fi.so" "$PREFIX/lib/srdsim/libsrdsim-fi.so"
 rm -f "$PREFIX/lib/libfabric/libsrdsim-fi.la"
+printf '%s' "$WANT" > "$STAMP"
 echo "$PREFIX/lib/srdsim/libsrdsim-fi.so"

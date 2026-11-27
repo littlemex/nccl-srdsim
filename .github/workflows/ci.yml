@@ -489,6 +489,18 @@ jobs:
           ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/libfabric-$SAN" \
             --enable-efa=no --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp \
             CC="$CC_FOR_SAN" CFLAGS="-g -O1 -fno-omit-frame-pointer -fsanitize=$SAN" LDFLAGS="-fsanitize=$SAN"
+          # Is what was built actually instrumented? build_fi_provider.sh configures and makes inside
+          # the source tree it is given, with no clean, so a tree that was already built with other
+          # flags links its old objects: the provider comes out with no instrumentation and every
+          # test then passes for the wrong reason. Nothing stops that happening to someone building
+          # two configurations by hand in one checkout, so the claim is checked rather than assumed.
+          case "$SAN" in address) SYM=__asan_ ;; thread) SYM=__tsan_ ;; *) SYM= ;; esac
+          for obj in "$RUNNER_TEMP/libfabric-$SAN/lib/srdsim/libsrdsim-fi.so" \
+                     "$RUNNER_TEMP/libfabric-$SAN/lib/libfabric.so"; do
+            n=$(nm -D --undefined-only "$obj" | grep -c "$SYM" || true)
+            test "$n" -gt 0 || { echo "$obj has no $SAN instrumentation"; exit 1; }
+            echo "$(basename "$obj") carries $n $SYM references"
+          done
       - name: Test
         env:
           SAN: ${{ matrix.sanitizer }}
