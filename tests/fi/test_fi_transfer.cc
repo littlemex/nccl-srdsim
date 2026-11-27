@@ -158,6 +158,36 @@ void reg(Endpoint* e, Region* r, size_t len, uint64_t access) {
     r->key = fi_mr_key(r->mr);
 }
 
+// An RMA write raises no completion at the target, so two scenarios below read the target's region while the
+// provider may still be delivering into it: in `closewrite` that polling IS how the test learns the write landed,
+// and in `reorder` catching a half-landed region is the measurement itself. Both are races by the language's rules
+// and ThreadSanitizer is right to see them.
+//
+// What is silenced is the READ, for the few lines that do the polling -- not the region. Marking the region benign
+// would have gone further than the truth: it would also hide the provider delivering the same chunk twice, or
+// delivering into a region whose registration is gone, which is exactly what this suite is here to catch. The
+// symbols are weak, so a build without the sanitizer links unchanged and this costs nothing.
+extern "C" {
+void AnnotateIgnoreReadsBegin(const char*, int) __attribute__((weak));
+void AnnotateIgnoreReadsEnd(const char*, int) __attribute__((weak));
+}
+
+// Reads of the target region inside this object's lifetime are the test's own doing and are not reported.
+struct IntendedRaceOnReads {
+    const bool on;
+    explicit IntendedRaceOnReads(bool enable = true) : on(enable) {
+        if (on and AnnotateIgnoreReadsBegin) AnnotateIgnoreReadsBegin(__FILE__, __LINE__);
+    }
+    ~IntendedRaceOnReads() { if (on and AnnotateIgnoreReadsEnd) AnnotateIgnoreReadsEnd(__FILE__, __LINE__); }
+    IntendedRaceOnReads(const IntendedRaceOnReads&) = delete;
+    IntendedRaceOnReads& operator=(const IntendedRaceOnReads&) = delete;
+};
+
+bool early_cq_data() {
+    const char* v = std::getenv("SRDSIM_FI_CQ_DATA_EARLY");
+    return v and std::strcmp(v, "0") != 0 and *v;
+}
+
 void barrier() {
     char b = 1;
     put(&b, 1);
@@ -280,7 +310,10 @@ void closeafter(Endpoint* e, bool write) {
         bool landed = false;
         while (not landed and std::chrono::steady_clock::now() < deadline) {
             landed = true;
-            for (size_t k = 0; k < kLen and landed; ++k) landed = r.mem[k] == pattern(7, k);
+            {
+                const IntendedRaceOnReads polling;   // the write is still landing; that is what is being waited for
+                for (size_t k = 0; k < kLen and landed; ++k) landed = r.mem[k] == pattern(7, k);
+            }
             if (not landed) usleep(2000);
         }
         check(landed, "a write whose sender closed right after it was posted landed whole");
@@ -290,6 +323,11 @@ void closeafter(Endpoint* e, bool write) {
         check(rc == 0 and std::strncmp(in, "inject, close", 14) == 0, "an inject whose sender closed right after it reaches its peer");
     }
     barrier();
+    // Registered memory cannot be freed while an endpoint that may still be delivering into it is open: the rule
+    // is the same on real hardware, and ThreadSanitizer sees the region's free racing the provider's last chunk.
+    // Closing the endpoint here joins the thread doing the delivering, and that is the edge that makes the free
+    // safe. close_endpoint is idempotent, so main closing it again is harmless.
+    if (g_rank == 1) close_endpoint(e);
 }
 
 // Receives match by tag, not by order.
@@ -487,7 +525,14 @@ void writedata(Endpoint* e) {
         fi_cq_tagged_entry c;
         if (wait_cq(e, &c)) die("remote completion", -FI_EIO);
         bool whole = (c.flags & FI_REMOTE_CQ_DATA) and c.data == uint64_t(round);
-        for (size_t k = 0; k < kLen and whole; ++k) whole = r.mem[k] == pattern(round, k);
+        {
+            // Only under SRDSIM_FI_CQ_DATA_EARLY is the write still landing while this reads, and there that is
+            // the whole point of the control. Without it the write is finished before the completion, so leave
+            // the read tracked: that the two do not overlap is itself worth checking.
+            const bool early = early_cq_data();
+            const IntendedRaceOnReads checking(early);
+            for (size_t k = 0; k < kLen and whole; ++k) whole = r.mem[k] == pattern(round, k);
+        }
         if (not whole) ++bad_rounds;
         barrier();
     }
@@ -496,6 +541,11 @@ void writedata(Endpoint* e) {
         check(bad_rounds == 0, "every remote completion with CQ data found its whole 1 MiB write landed");
         fi_close(&r.mr->fid);
     }
+    // Registered memory cannot be freed while an endpoint that may still be delivering into it is open: the rule
+    // is the same on real hardware, and ThreadSanitizer sees the region's free racing the provider's last chunk.
+    // Closing the endpoint here joins the thread doing the delivering, and that is the edge that makes the free
+    // safe. close_endpoint is idempotent, so main closing it again is harmless.
+    if (g_rank == 1) close_endpoint(e);
 }
 
 // A write may land after a later write's remote completion, under srd; never under inorder.
@@ -526,20 +576,30 @@ void reorder(Endpoint* e) {
         fi_cq_tagged_entry c;
         if (wait_cq(e, &c)) die("remote completion", -FI_EIO);
         bool landed = true;
-        for (size_t k = 0; k < kLen and landed; ++k) landed = a.mem[k] == uint8_t(round + 1);
+        {
+            const IntendedRaceOnReads measuring;   // catching the earlier write half-landed IS the measurement
+            for (size_t k = 0; k < kLen and landed; ++k) landed = a.mem[k] == uint8_t(round + 1);
+        }
         if (not landed) ++overtaken;
         barrier();
     }
     if (g_rank == 1) {
         const char* mode = std::getenv("SRDSIM_MODE");
         const bool inorder = mode and std::strcmp(mode, "inorder") == 0;
-        std::printf("rank 1: in %d of %d rounds the earlier write had not fully landed at the later one's remote completion\n",
-                    overtaken, kRounds);
+        const char* jitter = std::getenv("SRDSIM_FI_JITTER_US");
+        std::printf("rank 1: in %d of %d rounds the earlier write had not fully landed at the later one's remote "
+                    "completion (jitter %s us, mode %s)\n",
+                    overtaken, kRounds, jitter ? jitter : "default", mode ? mode : "srd");
         if (inorder) check(overtaken == 0, "under inorder, the earlier write always landed first");
         else check(overtaken > 0, "under srd, a later write's completion overtook an earlier write");
         fi_close(&a.mr->fid);
         fi_close(&flag.mr->fid);
     }
+    // Registered memory cannot be freed while an endpoint that may still be delivering into it is open: the rule
+    // is the same on real hardware, and ThreadSanitizer sees the region's free racing the provider's last chunk.
+    // Closing the endpoint here joins the thread doing the delivering, and that is the edge that makes the free
+    // safe. close_endpoint is idempotent, so main closing it again is harmless.
+    if (g_rank == 1) close_endpoint(e);
 }
 
 }  // namespace
@@ -549,6 +609,18 @@ int main(int argc, char** argv) {
     setenv("FI_PROVIDER_PATH", (std::string("+") + argv[1]).c_str(), 1);
     const std::string scenario = argv[2];
     g_direct = scenario == "directsend";
+    // `reorder` asserts that a later write's completion can overtake an earlier write. That has to come from the
+    // simulated transport, not from how slowly this machine copies: with the default 200us it passed only because
+    // an instrumented memcpy made the 256 KiB write slow, and it failed outright in all 20 rounds once that copy
+    // was fast again.
+    //
+    // The provider gives every chunk a due time drawn uniformly from [0, jitter]. The earlier write is 32 chunks
+    // (256 KiB in 8 KiB chunks) and the later one is a single 8-byte chunk, so the later one is last to come due
+    // with probability 1/33, and a round shows the overtaking otherwise -- over 20 rounds the chance of seeing
+    // none is (1/33)^20. That argument holds for any jitter wide enough to dominate the copying, which is the only
+    // thing 3000us is chosen for: a hundred times the default, and still 60ms for the whole scenario. Not forced,
+    // so a caller can widen it further.
+    if (scenario == "reorder") setenv("SRDSIM_FI_JITTER_US", "3000", 0);
     int p01[2], p10[2];
     if (pipe(p01) or pipe(p10)) return 2;
     std::fflush(nullptr);
@@ -577,7 +649,9 @@ int main(int argc, char** argv) {
     barrier();
     close_endpoint(&e);
 
-    if (g_rank == 1) std::_Exit(g_failures ? 1 : 0);
+    /* _Exit does not flush stdio: with stdout redirected to a file, rank 1's PASS and FAIL lines
+       sat in the buffer and were thrown away. The `die` path already flushed; this one did not. */
+    if (g_rank == 1) { std::fflush(nullptr); std::_Exit(g_failures ? 1 : 0); }
     int st = 0;
     waitpid(child, &st, 0);
     const bool child_ok = WIFEXITED(st) and WEXITSTATUS(st) == 0;

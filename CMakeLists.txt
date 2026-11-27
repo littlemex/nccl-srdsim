@@ -139,6 +139,14 @@ if(SRDSIM_BUILD_FI_TEST)
   target_compile_options(test_fi_multipeer PRIVATE ${SRDSIM_WARNINGS})
   add_test(NAME fi_multipeer COMMAND test_fi_multipeer ${SRDSIM_FI_PROVIDER})
   set_tests_properties(fi_multipeer PROPERTIES TIMEOUT 180)
+  add_executable(test_fi_cq_threads tests/fi/test_fi_cq_threads.cc)
+  target_link_libraries(test_fi_cq_threads PRIVATE PkgConfig::LIBFABRIC Threads::Threads)
+  target_compile_options(test_fi_cq_threads PRIVATE ${SRDSIM_WARNINGS})
+  add_test(NAME fi_cq_threads COMMAND test_fi_cq_threads ${SRDSIM_FI_PROVIDER})
+  set_tests_properties(fi_cq_threads PROPERTIES TIMEOUT 180)
+  # The negative control for the guard above is a CI step, not a test here: ctest's WILL_FAIL passes on any
+  # non-zero exit, so it would also go green if the provider failed to load. The step in .github/workflows/ci.yml
+  # checks that the run fails with ThreadSanitizer's own exit code and that the report names the completion queue.
   foreach(s IN ITEMS sendrecv tagged directsend closeinject closewrite inject unreachable truncate read badkey writedata reorder)
     add_test(NAME fi_transfer_${s} COMMAND test_fi_transfer ${SRDSIM_FI_PROVIDER} ${s})
     set_tests_properties(fi_transfer_${s} PROPERTIES TIMEOUT 180)

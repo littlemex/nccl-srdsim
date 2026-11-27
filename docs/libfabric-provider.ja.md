@@ -48,12 +48,17 @@ export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
 | 能力 | メッセージ、タグつきメッセージ、RMA。`FI_HMEM` は求められたときだけ。atomic は無し | 本物のプロバイダは atomic をソフトウェアで模していて、このプロバイダが対象にするものはどれも atomic を使わない |
 | CQ データ | 4 バイト | EFA で `fi_writedata` が運ぶ大きさ |
 | 進行 | データも制御も手動 | 本物のプロバイダと同じ。自動進行を求める hints は断る |
+| スレッド | hints が何も指定しなければ `FI_THREAD_SAFE`、指定があればその値。ただしドメインのオブジェクトは、答えが何であれ `FI_THREAD_SAFE` と同じようにロックする | 名乗る値は libfabric が hints 側に決めさせる (`ofi_alter_info`)。util 層はその 1 つの値だけを見てロックを選ぶ。`FI_THREAD_COMPLETION` か `FI_THREAD_DOMAIN` を求めると、この構成では 2 つのロックが外れる。完了のリング (`ofi_cq_init`) と、endpoint 自身のロック (`ofi_endpoint_init` が `FI_THREAD_SAFE` 以外のとき外す) である。endpoint のリストとアドレスベクタのロックは影響を受けない。あちらが外れるのは `FI_PROGRESS_CONTROL_UNIFIED` のときだけで、このプロバイダは制御の進行を手動と答えるため。この 2 つのモードでは使う側が CQ ごとの直列化を負う決まりで、純正のプロバイダはそこで止める (`tcp` で実測し、`efa` はソースで確認した。`efa` の CQ も `util_cq` である)。このプロバイダはそれでも守る。上のコードのバグを見つけるための道具なので、使う側が自分のスレッドの誤りを追うときに、まず道具の内部でリングが壊れていないかを確かめさせられては意味がないため |
+
+この守りの代償も書いておく。`FI_THREAD_COMPLETION` を求めたうえで、自分が負うべき直列化を忘れた使う側は、ここでは正しく動いて実機で壊れる。守りが本物のロックなので、計測器にも見えない。プロバイダはドメインを守るときにモードを名指しした警告をログに出し、`SRDSIM_FI_GUARD_CQ=0` で libfabric の選択をそのままにできる。試験で確かめているのは `FI_THREAD_COMPLETION` のときの完了のリングである。`tests/fi/test_fi_cq_threads.cc` が 1 つのキューを 2 スレッドから読み、完了が必ず 1 回ずつ返ることを確かめ、CI は守りを外してもう一度流し、そのリングの中の競合として報告されて落ちることを確かめる。`FI_THREAD_DOMAIN`、endpoint のロック、その他のオブジェクトは同じ 1 つのフィールドから決まるが、専用の試験は無い。
 
 endpoint のオプションには、libfabric の `prov/efa/src/rdm/efa_rdm_ep_fiops.c` と同じように答える。`FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` は、本物の RDM endpoint と同じく断る。`FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` は受け付け、`SRDSIM_FI_WRITE_IN_ORDER=0` ([設定](configuration.ja.md#libfabric-プロバイダ)) のときは断る。これで、使う側の「これを持たないデバイス」向けの経路も試せる。`FI_OPT_EFA_EMULATED_READ` と `FI_OPT_EFA_EMULATED_WRITE` は false を返し、`FI_OPT_EFA_USE_DEVICE_RDMA` を false にした後は true を返す。`FI_OPT_EFA_EMULATED_ATOMICS` は true を返す。`FI_HMEM` は、デバイスメモリを運べるようになるまでは、GPU の有無にかかわらず提供する。
 
 ## テスト
 
 `tests/fi/test_fi_provider.cc` は、aws-ofi-nccl と NIXL が組む hints を使って libfabric を通してプロバイダに届き、libfabric の efa プロバイダが RDM endpoint について返すのと同じ答えを期待する。CI は、自前の efa プロバイダつきでビルドした libfabric に対してこれを流す。あわせて、名指ししたときだけプロバイダが読み込まれること、write-after-write の順序を名乗るように壊したプロバイダに対してテストが失敗することを確かめる。
+
+CI はさらに、libfabric とプロバイダとこれらのテストを AddressSanitizer と ThreadSanitizer つきで建て直し、同じ一式をもう一度流す。この 2 周目が、プロバイダ自身のエージェントスレッドと使う側のスレッドの関係を見る場所で、計測器なしの 1 周目では何も見えない。手元で再現するときの注意が 2 つある。libfabric は `--disable-opx` で構成する必要がある。opx の `target_clones` な原子演算が `libfabric.so` の中で唯一の ifunc で、ローダがそれを実行ファイルの ThreadSanitizer の初期化より前に解決するため、計測済みのリゾルバが `main` に入る前に `ld.so` の中で落ちる。もう 1 つ、ThreadSanitizer は clang のものを使う。gcc のものは、このプロバイダが payload を公開するのに使う `atomic_thread_fence` を模擬できないと警告する。
 
 ```bash
 export PKG_CONFIG_PATH="$HOME/srdsim-libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$HOME/srdsim-libfabric/lib"

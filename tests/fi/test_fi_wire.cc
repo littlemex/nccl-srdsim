@@ -333,5 +333,9 @@ int main(int argc, char** argv) {
     crafted(&victim, &peer);
     random_streams(&victim, &peer, rounds);
     std::printf("wire: %s\n", g_failures == 0 ? "passed" : "failed");
+    // _Exit does not flush stdio, and with stdout redirected to a file that silently threw away
+    // everything still in the buffer -- including this verdict line, so a log that looked complete
+    // ended on a PASS and said nothing about the result.
+    std::fflush(nullptr);
     std::_Exit(g_failures == 0 ? 0 : 1);   // closing the endpoints with hostile connections open is not what is tested here
 }

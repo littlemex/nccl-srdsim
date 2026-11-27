@@ -400,7 +400,7 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
           cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DCMAKE_CXX_FLAGS=-Werror \
             -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so"
-          cmake --build build -j --target test_fi_provider test_fi_transfer
+          cmake --build build -j --target test_fi_provider test_fi_transfer test_fi_wire test_fi_multipeer test_fi_cq_threads
           ctest --test-dir build -R '^fi_' --output-on-failure --verbose
           # The negative control fails for the reason it exists: a remote completion found its write incomplete.
           SRDSIM_FI_CQ_DATA_EARLY=1 ./build/test_fi_transfer "$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so" writedata \
@@ -431,3 +431,100 @@ jobs:
           fi
           grep -q '^FAIL write-after-write ordering is refused$' mutated.log \
             || { echo "the test failed for another reason:"; cat mutated.log; exit 1; }
+
+  # The provider and its tests under a sanitizer, which is where the provider's own agent thread is
+  # checked against the consumer's: a delivery landing while the test reads the target region, and
+  # the completion writes. The plain fi-provider job above cannot see any of that.
+  #
+  # --disable-opx is load-bearing for `thread`, not a preference. opx's target_clones atomics are the
+  # only ifuncs in libfabric.so; the loader resolves them during startup relocation, before the
+  # executable's ThreadSanitizer runtime is initialised, and an instrumented resolver then calls
+  # __tsan_func_entry with a null thread state and faults inside ld.so. Every ThreadSanitizer binary
+  # that has libfabric as a link-time dependency dies before main without it. A dlopened instrumented
+  # libfabric is unaffected, which is why nothing else here noticed.
+  #
+  # What this pass actually watches: the handover of completions from the provider's agent thread to
+  # the consumer's (`x->events`), the delivery landing in a region a test is reading, and -- in
+  # fi_cq_threads -- two consumer threads inside one completion queue whose lock libfabric's utility
+  # layer disarms for the threading model NIXL asks for.
+  fi-provider-sanitized:
+    name: fi-provider-sanitized (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: versions
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: address
+            cc: gcc
+            cxx: g++
+          # ThreadSanitizer is built with clang because gcc's emits -Wtsan ("atomic_thread_fence is
+          # not supported with -fsanitize=thread") on the fences this provider uses to publish a
+          # payload, and build_fi_provider.sh treats any warning as a failure. Neither compiler's
+          # runtime models a fence; only gcc says so, so this is a build-time reason and not a claim
+          # that clang sees more.
+          - sanitizer: thread
+            cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Same reason as host-tests-sanitized: this toolchain's sanitizers cannot map their shadow
+      # memory with more than 28 bits of ASLR entropy.
+      - name: Lower ASLR entropy for the sanitizers
+        run: |
+          sudo sysctl vm.mmap_rnd_bits
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Build libfabric and the provider under the sanitizer
+        env:
+          LIBFABRIC_TAG: ${{ needs.versions.outputs.libfabric_tag }}
+          LIBFABRIC_COMMIT: ${{ needs.versions.outputs.libfabric_commit }}
+          SAN: ${{ matrix.sanitizer }}
+          CC_FOR_SAN: ${{ matrix.cc }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libibverbs-dev librdmacm-dev libnuma-dev "$CC_FOR_SAN"
+          git clone --quiet --depth 1 --branch "$LIBFABRIC_TAG" https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-src"
+          test "$(git -C "$RUNNER_TEMP/libfabric-src" rev-parse HEAD)" = "$LIBFABRIC_COMMIT"
+          ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/libfabric-$SAN" \
+            --enable-efa=no --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp \
+            CC="$CC_FOR_SAN" CFLAGS="-g -O1 -fno-omit-frame-pointer -fsanitize=$SAN" LDFLAGS="-fsanitize=$SAN"
+      - name: Test
+        env:
+          SAN: ${{ matrix.sanitizer }}
+          CXX_FOR_SAN: ${{ matrix.cxx }}
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric-$SAN/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric-$SAN/lib"
+          # halt_on_error, because a report has to fail the job however the process ends. Measured on
+          # this toolchain with a two-line race: leaving through `return` gives the substituted exit
+          # code 66, leaving through `_Exit` gives 0 with the report only in the log. test_fi_wire and
+          # rank 1 of test_fi_transfer both leave through _Exit -- deliberately, they close endpoints
+          # with hostile connections open -- so without this a reported race is a green run.
+          export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+          export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0
+          cmake -S . -B "build-$SAN" -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON \
+            -DSRDSIM_SANITIZER="$SAN" -DCMAKE_CXX_COMPILER="$CXX_FOR_SAN" -DCMAKE_CXX_FLAGS=-Werror \
+            -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric-$SAN/lib/srdsim/libsrdsim-fi.so"
+          cmake --build "build-$SAN" -j --target test_fi_provider test_fi_transfer test_fi_wire test_fi_multipeer test_fi_cq_threads
+          ctest --test-dir "build-$SAN" -R '^fi_' --output-on-failure --timeout 900
+      # The negative control for the completion-queue guard: with it off, libfabric leaves the ring unlocked for
+      # the threading model the test asks for, and the test must fail with a race inside that ring. Checked the
+      # way the ordering control above is -- on the reason, not just on a non-zero exit, so that a provider that
+      # failed to load cannot pass as a caught race. ThreadSanitizer only: AddressSanitizer does not see this,
+      # and whether the test's own counts notice depends on the race having landed wrong.
+      - name: The completion-queue guard has a way to fail
+        if: matrix.sanitizer == 'thread'
+        env:
+          SAN: ${{ matrix.sanitizer }}
+        run: |
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric-$SAN/lib"
+          rc=0
+          SRDSIM_FI_GUARD_CQ=0 TSAN_OPTIONS=halt_on_error=1 \
+            ./build-$SAN/test_fi_cq_threads "$RUNNER_TEMP/libfabric-$SAN/lib/srdsim/libsrdsim-fi.so" \
+            > unguarded.log 2>&1 || rc=$?
+          test "$rc" -eq 66 || { echo "expected ThreadSanitizer's exit code 66, got $rc:"; cat unguarded.log; exit 1; }
+          grep -q 'ThreadSanitizer: data race' unguarded.log \
+            || { echo "it failed without reporting a race:"; cat unguarded.log; exit 1; }
+          grep -Eq 'ofi_cq_(readfrom|read_entries|write_entry|write_src)' unguarded.log \
+            || { echo "the race it reported is not in the completion queue:"; cat unguarded.log; exit 1; }
+          echo "with the guard off, the race is reported inside the completion queue"

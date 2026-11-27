@@ -1419,9 +1419,11 @@ static void srdsim_drain_events(struct srdsim_xfer *x)
 	struct fi_cq_err_entry err;
 	struct util_cq *cq;
 	fi_addr_t src;
+	int ret;
 
 	while (!dlist_empty(&x->events)) {
 		dlist_pop_front(&x->events, struct srdsim_event, e, entry);
+		/* Both queues are bound: srdsim_ep_control refuses to enable an endpoint without them. */
 		cq = e->kind == SRDSIM_EV_TX ? uep->tx_cq : uep->rx_cq;
 		SRDSIM_TRACE("ep %p completion %s ctx %p flags %#lx len %zu data %#lx err %d\n", (void *) x->ep,
 			     e->kind == SRDSIM_EV_TX ? "tx" : "rx", e->context, e->flags, e->len, e->data, e->err);
@@ -1439,13 +1441,20 @@ static void srdsim_drain_events(struct srdsim_xfer *x)
 			err.err = e->err;
 			err.prov_errno = -e->err;
 			err.src_addr = src;
-			(void) ofi_cq_write_error(cq, &err);
+			ret = ofi_cq_write_error(cq, &err);
 		} else if ((uep->caps & FI_SOURCE) && cq->src) {
 			/* cq->src exists only when the CQ's domain was opened with FI_SOURCE. */
-			(void) ofi_cq_write_src(cq, e->context, e->flags, e->len, e->buf, e->data, e->tag, src);
+			ret = ofi_cq_write_src(cq, e->context, e->flags, e->len, e->buf, e->data, e->tag, src);
 		} else {
-			(void) ofi_cq_write(cq, e->context, e->flags, e->len, e->buf, e->data, e->tag);
+			ret = ofi_cq_write(cq, e->context, e->flags, e->len, e->buf, e->data, e->tag);
 		}
+		if (ret)
+			/* The completion is gone and the consumer will wait for it forever. Say so:
+			   a transfer that hangs with no explanation is the worst thing this provider
+			   can do to someone debugging the software above it. */
+			SRDSIM_WARN(FI_LOG_CQ, "ep %p: writing the %s completion for ctx %p failed (%d): "
+				    "it is LOST and the consumer will never see it\n", (void *) x->ep,
+				    e->kind == SRDSIM_EV_TX ? "tx" : "rx", e->context, ret);
 		free(e);
 	}
 }

@@ -48,12 +48,24 @@ export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
 | Capabilities | Messages, tagged messages and RMA, with `FI_HMEM` only when asked for; no atomics | The real provider emulates atomics in software, and nothing this provider serves uses them |
 | CQ data | 4 bytes | What `fi_writedata` carries on EFA |
 | Progress | Manual, for data and control | As the real provider; hints asking for automatic progress are refused |
+| Threading | `FI_THREAD_SAFE` when the hints ask for nothing in particular, and otherwise whatever they ask for -- but the domain's objects lock as though it were `FI_THREAD_SAFE` whatever the answer | libfabric lets the hints decide the reported model (`ofi_alter_info`), and its utility layer then reads that one field to choose locks. Asking for `FI_THREAD_COMPLETION` or `FI_THREAD_DOMAIN` disarms two of them in this provider's configuration: the completion ring (`ofi_cq_init`) and the endpoint's own lock (`ofi_endpoint_init`, for anything other than `FI_THREAD_SAFE`). The endpoint-list and address-vector locks are not affected here, because those become no-ops only under `FI_PROGRESS_CONTROL_UNIFIED` and this provider reports manual control progress. In those models a consumer owes libfabric its own serialisation per queue and the stock providers leave it at that -- measured on `tcp`, and read in the source for `efa`, whose CQ is a `util_cq` too. This provider guards them anyway, because it exists so that someone can find a bug in the code above it, and a consumer hunting its own threading mistake must not first have to rule out a corrupted ring inside the tool it is looking through |
+
+The cost of that guard is worth stating plainly: a consumer that asks for `FI_THREAD_COMPLETION` and then forgets
+the serialisation it owes works correctly here and breaks on the real device, and because the guard is a real lock
+a sanitizer will not see the mistake either. The provider logs a warning naming the model when it guards a domain,
+and `SRDSIM_FI_GUARD_CQ=0` leaves libfabric's choice alone. What is tested is the completion ring under
+`FI_THREAD_COMPLETION`: `tests/fi/test_fi_cq_threads.cc` reads one queue from two threads and checks that every
+completion comes back exactly once, and CI runs it again with the guard off to check that it then fails with a
+race reported inside that ring. `FI_THREAD_DOMAIN`, the endpoint lock and the other objects follow from the same
+one field but have no test of their own.
 
 The endpoint options are answered as in libfabric's `prov/efa/src/rdm/efa_rdm_ep_fiops.c`. `FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` is refused, as by the real RDM endpoint. `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` is accepted, and refused with `SRDSIM_FI_WRITE_IN_ORDER=0` ([configuration](configuration.md#libfabric-provider)), so a consumer's path for a device without it can be tested. `FI_OPT_EFA_EMULATED_READ` and `FI_OPT_EFA_EMULATED_WRITE` read false, and true once `FI_OPT_EFA_USE_DEVICE_RDMA` is set false; `FI_OPT_EFA_EMULATED_ATOMICS` reads true. `FI_HMEM` is offered whether or not a GPU is present, until device memory is carried.
 
 ## Testing
 
 `tests/fi/test_fi_provider.cc` reaches the provider through libfabric, with the hints aws-ofi-nccl and NIXL build, and expects the answers libfabric's efa provider gives for its RDM endpoint. CI runs it against a libfabric built with its own efa provider, checks that the provider is loaded only when it is named, and checks that the test fails against a copy of the provider that claims write-after-write ordering.
+
+CI also builds libfabric, the provider and these tests under AddressSanitizer and under ThreadSanitizer and runs the whole set again. That second pass is where the provider's agent thread is checked against the consumer's, which the plain pass cannot see at all. Two notes for anyone reproducing it by hand: libfabric has to be configured `--disable-opx`, because opx's `target_clones` atomics are the only ifuncs in `libfabric.so` and the loader resolves them before the executable's ThreadSanitizer runtime exists, so an instrumented resolver faults inside `ld.so` before `main`; and ThreadSanitizer has to be clang's, because gcc's warns that it cannot model the `atomic_thread_fence` this provider uses to publish a payload.
 
 ```bash
 export PKG_CONFIG_PATH="$HOME/srdsim-libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$HOME/srdsim-libfabric/lib"
