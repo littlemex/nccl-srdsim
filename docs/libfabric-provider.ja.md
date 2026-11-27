@@ -13,7 +13,7 @@
 | プロセス間の send と receive (タグなしとタグつき)、RMA write、CQ データつき write、read を SRD の順序規則で運ぶ | 済み (`src/fi/srdsim_xfer.c`) |
 | ホストメモリと CUDA メモリの登録 (プロバイダが決めるキーつき) | 済み。libfabric の登録マップを使う。CUDA には libfabric を `--with-cuda` で configure する必要がある |
 | 1 台の GPU ホストで aws-ofi-nccl を通した NCCL (send/recv と RDMA の両プロトコル) | 動く。1 枚の GPU に 2 ランクで `all_reduce` が `srd` でも `inorder` でも正しい |
-| 1 台での NIXL の libfabric バックエンド | 動く。NIXL 自身の libfabric 向け単体テスト (バックエンド、送り主の解決、レールの参照数) がこのプロバイダに対して合格し、トポロジ探索もエミュレートした NIC の PCIe アドレスと速度を読める。2 エージェント間の実データ転送はまだ |
+| 1 台での NIXL の libfabric バックエンド | 動く。NIXL 自身の libfabric 向け単体テスト (バックエンド、送り主の解決、レールの参照数) がこのプロバイダに対して合格し、トポロジ探索もエミュレートした NIC の PCIe アドレスと速度を読め、2 エージェント間の実データ転送も端から端まで通る |
 
 ## ビルド
 

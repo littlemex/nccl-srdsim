@@ -13,7 +13,7 @@
 | Sends and receives (untagged and tagged), RMA writes, writes with CQ data and reads between processes, with SRD's orderings | Done (`src/fi/srdsim_xfer.c`) |
 | Memory registration of host and CUDA memory, with provider keys | Done, through libfabric's registration map; CUDA needs libfabric configured `--with-cuda` |
 | NCCL over aws-ofi-nccl on one GPU host, with its send/recv and RDMA protocols | Runs: two ranks on one GPU, `all_reduce` correct under `srd` and `inorder` |
-| NIXL's libfabric backend on one host | Runs: NIXL's own libfabric unit tests pass against this provider (backend, source-address resolution, rail refcount); its topology discovery reads the emulated NICs' PCIe addresses and link speed. Two-agent data transfer not yet run |
+| NIXL's libfabric backend on one host | Runs: NIXL's own libfabric unit tests pass against this provider (backend, source-address resolution, rail refcount), its topology discovery reads the emulated NICs' PCIe addresses and link speed, and two agents move real data through it end to end |
 
 ## Building
 
