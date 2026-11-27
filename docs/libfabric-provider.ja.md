@@ -40,6 +40,17 @@ export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
 
 本物の EFA デバイスを持つホストで、libfabric を `--enable-efa=yes` で建てて本物のプロバイダも同居させ、両方を実測した。名指ししないと `fi_info -p efa` はデバイスだけを答え (`rdmap88s0-rdm`、`efa` と `efa-direct` の両方)、この部品は読み込まれない。名指しするとこの部品が名前を取る (`srdsim0-rdm`、`srdsim1-rdm`)。試験一式を流したあとも、デバイスは自分の fabric すべてで正常に答える。
 
+名指しは名前を**丸ごと**取る。両方のプロバイダが登録され (`fi_info -l` に `efa` が 2 回出る) ながら、`fi_getinfo` が `efa` に対して返すのはこの部品の domain だけで、デバイスの domain は 1 つも返らない。これは、そうしたホストでの実験を信頼できるものにする性質である。試験がこの部品を使っているつもりの間に、要求が NIC に届くことはない。だからこの部品に作らせた順序はそのとおりに作られ、1 台の中に閉じておきたい通信は外に出ない。裏返すと、デバイスとこの部品を `efa` という名前で同時に使うことはできない。ジョブはどちらか一方を使う。そもそも 2 つのランクが両者に分かれることもできない。この部品は独自の宛先形式を持つ別の fabric だからである。
+
+`tests/fi/test_fi_beside_efa.cc` が両方を 1 回の実行で確かめる。それぞれが、そのホストで 2 つの endpoint 間のメッセージを運べることまで見る。本物のデバイスが要るので、CMake は `-DSRDSIM_BUILD_FI_EFA_TEST=ON` のときだけ建て、CI では流さない。
+
+```bash
+cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DSRDSIM_BUILD_FI_EFA_TEST=ON \
+  -DSRDSIM_FI_PROVIDER="$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
+cmake --build build -j --target test_fi_beside_efa
+./build/test_fi_beside_efa "$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
+```
+
 ## 報告する内容
 
 | 属性 | 値 | 理由 |

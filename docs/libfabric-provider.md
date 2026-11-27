@@ -40,6 +40,17 @@ export FI_PROVIDER_PATH="+$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
 
 On a host that has a real EFA device, with libfabric built `--enable-efa=yes` so that the real provider is there too, both halves of that were measured: not named, `fi_info -p efa` answers only for the device (`rdmap88s0-rdm`, on the `efa` and `efa-direct` fabrics) and this provider is not loaded; named, this provider takes the name (`srdsim0-rdm`, `srdsim1-rdm`); and after a full test run the device still answers on all of its fabrics.
 
+Naming this provider takes the name **whole**. Both providers are registered -- `fi_info -l` lists `efa` twice -- but `fi_getinfo` for `efa` then returns this provider's domains and none of the device's. That is the property that makes an experiment on such a host trustworthy: no request can reach the NIC while a test believes it is using this provider, so an ordering this provider was asked to produce is produced, and traffic a test meant to keep inside one host stays there. The other side of it is that the device and this provider cannot be used at the same time through the name `efa` -- a job uses one or the other. Two ranks could not split across them in any case, because this is a separate fabric with its own address format.
+
+`tests/fi/test_fi_beside_efa.cc` checks both halves in one run, including that each carries messages between two endpoints on the host it is on. It needs a real device, so CMake builds it only with `-DSRDSIM_BUILD_FI_EFA_TEST=ON` and CI does not run it:
+
+```bash
+cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DSRDSIM_BUILD_FI_EFA_TEST=ON \
+  -DSRDSIM_FI_PROVIDER="$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
+cmake --build build -j --target test_fi_beside_efa
+./build/test_fi_beside_efa "$HOME/srdsim-libfabric/lib/srdsim/libsrdsim-fi.so"
+```
+
 ## What it reports
 
 | Attribute | Value | Why |

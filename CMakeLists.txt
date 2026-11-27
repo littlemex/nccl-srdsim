@@ -147,6 +147,14 @@ if(SRDSIM_BUILD_FI_TEST)
     add_test(NAME fi_cq_threads_${m} COMMAND test_fi_cq_threads ${SRDSIM_FI_PROVIDER} ${m})
     set_tests_properties(fi_cq_threads_${m} PROPERTIES TIMEOUT 180)
   endforeach()
+  # Needs a real EFA device, so it is opt-in and not a ctest: CI has no such host. Built by
+  # -DSRDSIM_BUILD_FI_EFA_TEST=ON and run by hand, the way the GPU tests are.
+  option(SRDSIM_BUILD_FI_EFA_TEST "build the test that needs a real EFA device beside the provider" OFF)
+  if(SRDSIM_BUILD_FI_EFA_TEST)
+    add_executable(test_fi_beside_efa tests/fi/test_fi_beside_efa.cc)
+    target_link_libraries(test_fi_beside_efa PRIVATE PkgConfig::LIBFABRIC Threads::Threads)
+    target_compile_options(test_fi_beside_efa PRIVATE ${SRDSIM_WARNINGS})
+  endif()
   # The negative control for the guard above is a CI step, not a test here: ctest's WILL_FAIL passes on any
   # non-zero exit, so it would also go green if the provider failed to load. The step in .github/workflows/ci.yml
   # checks that the run fails with ThreadSanitizer's own exit code and that the report names the completion queue.
