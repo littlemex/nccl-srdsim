@@ -400,7 +400,7 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/libfabric/lib/pkgconfig" LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric/lib"
           cmake -S . -B build -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DCMAKE_CXX_FLAGS=-Werror \
             -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so"
-          cmake --build build -j --target test_fi_provider test_fi_transfer test_fi_wire test_fi_multipeer test_fi_cq_threads
+          cmake --build build -j --target test_fi_provider test_fi_transfer test_fi_wire test_fi_multipeer test_fi_cq_threads test_fi_close_while_reading
           ctest --test-dir build -R '^fi_' --output-on-failure --verbose
           # The negative control fails for the reason it exists: a remote completion found its write incomplete.
           SRDSIM_FI_CQ_DATA_EARLY=1 ./build/test_fi_transfer "$RUNNER_TEMP/libfabric/lib/srdsim/libsrdsim-fi.so" writedata \
@@ -517,7 +517,7 @@ jobs:
           cmake -S . -B "build-$SAN" -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON \
             -DSRDSIM_SANITIZER="$SAN" -DCMAKE_CXX_COMPILER="$CXX_FOR_SAN" -DCMAKE_CXX_FLAGS=-Werror \
             -DSRDSIM_FI_PROVIDER="$RUNNER_TEMP/libfabric-$SAN/lib/srdsim/libsrdsim-fi.so"
-          cmake --build "build-$SAN" -j --target test_fi_provider test_fi_transfer test_fi_wire test_fi_multipeer test_fi_cq_threads
+          cmake --build "build-$SAN" -j --target test_fi_provider test_fi_transfer test_fi_wire test_fi_multipeer test_fi_cq_threads test_fi_close_while_reading
           ctest --test-dir "build-$SAN" -R '^fi_' --output-on-failure --timeout 900
       # The negative control for the completion-queue guard: with it off, libfabric leaves the ring unlocked for
       # the threading model the test asks for, and the test must fail with a race inside that ring. Checked the
@@ -540,3 +540,36 @@ jobs:
           grep -Eq 'ofi_cq_(readfrom|read_entries|write_entry|write_src)' unguarded.log \
             || { echo "the race it reported is not in the completion queue:"; cat unguarded.log; exit 1; }
           echo "with the guard off, the race is reported inside the completion queue"
+      # The negative control for test_fi_close_while_reading: a provider that tears an endpoint's
+      # transfer engine down before taking the endpoint off its completion queues -- the order
+      # srdsim_ep_close exists to avoid -- must be caught as a use after free in the reader's progress
+      # call. AddressSanitizer only, where the outcome is certain; without the control, a passing run
+      # of that test would not show that it can see the problem it is about.
+      - name: The close test fails when an endpoint is freed before it leaves its queues
+        if: matrix.sanitizer == 'address'
+        env:
+          SAN: ${{ matrix.sanitizer }}
+          CC_FOR_SAN: ${{ matrix.cc }}
+        run: |
+          python3 - <<'EOF'
+          p = "src/fi/srdsim_ep.c"
+          s = open(p).read()
+          old = "\tret = ofi_endpoint_close(&ep->util_ep);\n\tif (ret)\n\t\treturn ret;\n\tsrdsim_xfer_close(ep);\n\tfree(ep);"
+          new = "\tsrdsim_xfer_close(ep);\n\tret = ofi_endpoint_close(&ep->util_ep);\n\tif (ret)\n\t\treturn ret;\n\tfree(ep);"
+          assert old in s, "the close order this control mutates is not where it was"
+          open(p, "w").write(s.replace(old, new, 1))
+          EOF
+          git diff --quiet -- src/fi/srdsim_ep.c && { echo "the mutation did not apply"; exit 1; }
+          git clone --quiet --depth 1 --branch "${{ needs.versions.outputs.libfabric_tag }}" \
+            https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-mutated-src"
+          ./scripts/build_fi_provider.sh "$RUNNER_TEMP/libfabric-mutated-src" "$RUNNER_TEMP/libfabric-mutated-$SAN" \
+            --enable-efa=no --enable-tcp=yes --disable-psm3 --disable-opx --disable-usnic --disable-verbs --disable-lpp \
+            CC="$CC_FOR_SAN" CFLAGS="-g -O1 -fno-omit-frame-pointer -fsanitize=$SAN" LDFLAGS="-fsanitize=$SAN"
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric-mutated-$SAN/lib"
+          if ASAN_OPTIONS=halt_on_error=1:detect_leaks=0 ./build-$SAN/test_fi_close_while_reading \
+               "$RUNNER_TEMP/libfabric-mutated-$SAN/lib/srdsim/libsrdsim-fi.so" > mutated-close.log 2>&1; then
+            echo "the close test passed against a provider that frees an endpoint still on its queues"; exit 1
+          fi
+          grep -q 'ERROR: AddressSanitizer: heap-use-after-free' mutated-close.log \
+            || { echo "the close test failed for another reason:"; tail -40 mutated-close.log; exit 1; }
+          echo "the close test catches an endpoint freed before it leaves its queues"

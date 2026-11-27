@@ -70,7 +70,11 @@ and `SRDSIM_FI_GUARD_CQ=0` leaves libfabric's choice alone. What is tested is th
 libfabric disarms it for: `tests/fi/test_fi_cq_threads.cc` reads one queue from two threads, with
 `FI_THREAD_COMPLETION` and again with `FI_THREAD_DOMAIN`, and checks that every completion comes back exactly
 once. CI runs it a third time with the guard off to check that it then fails with a race reported inside that
-ring. Binding or closing while another thread reads has no test of its own.
+ring. `tests/fi/test_fi_close_while_reading.cc` covers the other half of sharing a queue between threads: 60
+rounds of opening, binding, using and closing endpoints, with messages still in flight, while another thread keeps
+reading the queue they are bound to. Every close must return 0 and no completion may come out for an operation that
+was never posted. CI runs it under both sanitizers, and checks that a provider which frees an endpoint before taking
+it off its queues is caught by it as a use after free in the reader's progress call.
 
 The endpoint options are answered as in libfabric's `prov/efa/src/rdm/efa_rdm_ep_fiops.c`. `FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES` is refused, as by the real RDM endpoint. `FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES` is accepted, and refused with `SRDSIM_FI_WRITE_IN_ORDER=0` ([configuration](configuration.md#libfabric-provider)), so a consumer's path for a device without it can be tested. `FI_OPT_EFA_EMULATED_READ` and `FI_OPT_EFA_EMULATED_WRITE` read false, and true once `FI_OPT_EFA_USE_DEVICE_RDMA` is set false; `FI_OPT_EFA_EMULATED_ATOMICS` reads true. `FI_HMEM` is offered whether or not a GPU is present, until device memory is carried.
 

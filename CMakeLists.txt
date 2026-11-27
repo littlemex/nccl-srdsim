@@ -147,6 +147,11 @@ if(SRDSIM_BUILD_FI_TEST)
     add_test(NAME fi_cq_threads_${m} COMMAND test_fi_cq_threads ${SRDSIM_FI_PROVIDER} ${m})
     set_tests_properties(fi_cq_threads_${m} PROPERTIES TIMEOUT 180)
   endforeach()
+  add_executable(test_fi_close_while_reading tests/fi/test_fi_close_while_reading.cc)
+  target_link_libraries(test_fi_close_while_reading PRIVATE PkgConfig::LIBFABRIC Threads::Threads)
+  target_compile_options(test_fi_close_while_reading PRIVATE ${SRDSIM_WARNINGS})
+  add_test(NAME fi_close_while_reading COMMAND test_fi_close_while_reading ${SRDSIM_FI_PROVIDER})
+  set_tests_properties(fi_close_while_reading PROPERTIES TIMEOUT 300)
   # Needs a real EFA device, so it is opt-in and not a ctest: CI has no such host. Built by
   # -DSRDSIM_BUILD_FI_EFA_TEST=ON and run by hand, the way the GPU tests are.
   option(SRDSIM_BUILD_FI_EFA_TEST "build the test that needs a real EFA device beside the provider" OFF)
