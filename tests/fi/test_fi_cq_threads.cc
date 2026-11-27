@@ -2,7 +2,7 @@
 // Two threads read one completion queue of a domain opened with FI_THREAD_COMPLETION: every completion must be
 // returned exactly once, to exactly one of them.
 //
-//   test_fi_cq_threads PROVIDER_SO
+//   test_fi_cq_threads PROVIDER_SO [completion|domain]
 //
 // Why this is a test and not a consumer bug. libfabric's utility completion queue picks the lock that guards its
 // ring from the domain's threading model, and for FI_THREAD_COMPLETION and FI_THREAD_DOMAIN it picks one that does
@@ -15,6 +15,10 @@
 // hunting its own threading mistake must not first have to rule out a corrupted ring inside the tool it is using to
 // look. So this provider guards its queues whatever the consumer asked for, and this is the test of that: it breaks
 // the consumer's side of the contract on purpose and the completions still come out right.
+//
+// Both models libfabric disarms the lock for are run: FI_THREAD_COMPLETION, which is what NIXL asks for, and
+// FI_THREAD_DOMAIN. They reach ofi_cq_init by the same branch, so this is coverage of the claim rather than of a
+// second mechanism.
 //
 // Run it under ThreadSanitizer too. The counts below catch a duplicated or lost entry; the sanitizer catches the
 // race that produces one, in ofi_cq_readfrom, before it has had the luck to matter.
@@ -56,6 +60,9 @@ void check(bool ok, const char* what) {
     std::_Exit(1);
 }
 
+enum fi_threading g_threading = FI_THREAD_COMPLETION;
+const char* g_threading_name = "FI_THREAD_COMPLETION";
+
 struct Node {
     fi_info* info = nullptr;
     fid_fabric* fabric = nullptr;
@@ -72,13 +79,13 @@ void open_node(Node* n) {
     hints->caps = FI_MSG | FI_SOURCE | FI_LOCAL_COMM | FI_REMOTE_COMM;
     hints->ep_attr->type = FI_EP_RDM;
     hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    // The whole point of the test: this is the mode in which libfabric's utility queue stops locking.
-    hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    // The whole point of the test: these are the modes in which libfabric's utility queue stops locking.
+    hints->domain_attr->threading = g_threading;
     hints->fabric_attr->prov_name = strdup("efa");
     int rc = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, hints, &n->info);
     fi_freeinfo(hints);
     if (rc) die("fi_getinfo", rc);
-    if (n->info->domain_attr->threading != FI_THREAD_COMPLETION)
+    if (n->info->domain_attr->threading != g_threading)
         die("the domain did not keep the threading model asked for, so this test proves nothing", -FI_EINVAL);
     if ((rc = fi_fabric(n->info->fabric_attr, &n->fabric, nullptr))) die("fi_fabric", rc);
     if ((rc = fi_domain(n->fabric, n->info, &n->domain, nullptr))) die("fi_domain", rc);
@@ -117,8 +124,16 @@ uint8_t byte(int i, size_t k) { return uint8_t((i * 31 + k * 7) & 0xff); }
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s PROVIDER_SO\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s PROVIDER_SO [completion|domain]\n", argv[0]); return 2; }
     setenv("FI_PROVIDER_PATH", (std::string("+") + argv[1]).c_str(), 1);
+    if (argc > 2 and std::strcmp(argv[2], "domain") == 0) {
+        g_threading = FI_THREAD_DOMAIN;
+        g_threading_name = "FI_THREAD_DOMAIN";
+    } else if (argc > 2 and std::strcmp(argv[2], "completion") != 0) {
+        std::fprintf(stderr, "the threading model must be completion or domain, not %s\n", argv[2]);
+        return 2;
+    }
+    std::printf("threading %s\n", g_threading_name);
 
     static Node tx, rx;
     open_node(&tx);
@@ -242,7 +257,7 @@ int main(int argc, char** argv) {
 
     close_node(&tx, "the sending endpoint and its objects closed");
     close_node(&rx, "the receiving endpoint and its objects closed");
-    std::printf("cq_threads: %s\n", g_failures == 0 ? "passed" : "failed");
+    std::printf("cq_threads (%s): %s\n", g_threading_name, g_failures == 0 ? "passed" : "failed");
     std::fflush(nullptr);
     return g_failures == 0 ? 0 : 1;
 }

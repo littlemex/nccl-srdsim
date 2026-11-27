@@ -520,7 +520,7 @@ jobs:
           export LD_LIBRARY_PATH="$RUNNER_TEMP/libfabric-$SAN/lib"
           rc=0
           SRDSIM_FI_GUARD_CQ=0 TSAN_OPTIONS=halt_on_error=1 \
-            ./build-$SAN/test_fi_cq_threads "$RUNNER_TEMP/libfabric-$SAN/lib/srdsim/libsrdsim-fi.so" \
+            ./build-$SAN/test_fi_cq_threads "$RUNNER_TEMP/libfabric-$SAN/lib/srdsim/libsrdsim-fi.so" completion \
             > unguarded.log 2>&1 || rc=$?
           test "$rc" -eq 66 || { echo "expected ThreadSanitizer's exit code 66, got $rc:"; cat unguarded.log; exit 1; }
           grep -q 'ThreadSanitizer: data race' unguarded.log \

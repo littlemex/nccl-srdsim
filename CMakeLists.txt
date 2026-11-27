@@ -142,8 +142,11 @@ if(SRDSIM_BUILD_FI_TEST)
   add_executable(test_fi_cq_threads tests/fi/test_fi_cq_threads.cc)
   target_link_libraries(test_fi_cq_threads PRIVATE PkgConfig::LIBFABRIC Threads::Threads)
   target_compile_options(test_fi_cq_threads PRIVATE ${SRDSIM_WARNINGS})
-  add_test(NAME fi_cq_threads COMMAND test_fi_cq_threads ${SRDSIM_FI_PROVIDER})
-  set_tests_properties(fi_cq_threads PROPERTIES TIMEOUT 180)
+  # Both threading models libfabric disarms the completion queue's lock for.
+  foreach(m IN ITEMS completion domain)
+    add_test(NAME fi_cq_threads_${m} COMMAND test_fi_cq_threads ${SRDSIM_FI_PROVIDER} ${m})
+    set_tests_properties(fi_cq_threads_${m} PROPERTIES TIMEOUT 180)
+  endforeach()
   # The negative control for the guard above is a CI step, not a test here: ctest's WILL_FAIL passes on any
   # non-zero exit, so it would also go green if the provider failed to load. The step in .github/workflows/ci.yml
   # checks that the run fails with ThreadSanitizer's own exit code and that the report names the completion queue.

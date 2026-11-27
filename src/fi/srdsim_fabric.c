@@ -93,11 +93,17 @@ int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct f
 
 	/*
 	 * The objects of this domain lock whatever the consumer asked for. libfabric's utility layer reads this
-	 * one field to choose their locks, and asking for FI_THREAD_COMPLETION or FI_THREAD_DOMAIN disarms two of
-	 * them in this provider's configuration: the completion ring (ofi_cq_init picks OFI_LOCK_NOOP for both
-	 * models) and the endpoint's own lock (ofi_endpoint_init picks it for anything other than FI_THREAD_SAFE).
-	 * The endpoint-list and address-vector locks are not affected here -- those turn into no-ops only when
-	 * control progress is FI_PROGRESS_CONTROL_UNIFIED, and this provider reports manual control progress.
+	 * one field to choose their locks, and asking for FI_THREAD_COMPLETION or FI_THREAD_DOMAIN disarms the
+	 * one that matters here: the completion ring, for which ofi_cq_init picks OFI_LOCK_NOOP under both
+	 * models. Both the writer and the reader of that ring take it.
+	 *
+	 * Two others read the same field and are worth knowing about. The endpoint's own lock is disarmed for
+	 * anything other than FI_THREAD_SAFE (ofi_endpoint_init), but nothing in libfabric's utility layer, its
+	 * core, or this provider ever takes it -- only initialises and destroys it -- so today it is inert; it
+	 * stops being inert the moment this provider starts using it, which is the other reason to set this
+	 * field rather than reach into the queue. The endpoint-list and address-vector locks are not affected at
+	 * all here: those become no-ops only when control progress is FI_PROGRESS_CONTROL_UNIFIED, and this
+	 * provider reports manual control progress.
 	 *
 	 * In those models a consumer owes libfabric its own serialisation and the stock providers leave it at
 	 * that, the real efa provider included: its CQ is a util_cq too, so it gets the same no-op. None of that
@@ -117,9 +123,9 @@ int srdsim_domain_open(struct fid_fabric *fabric, struct fi_info *info, struct f
 	 */
 	if (info->domain_attr->threading != FI_THREAD_SAFE && srdsim_guard_cq()) {
 		SRDSIM_WARN(FI_LOG_DOMAIN,
-			    "this domain asked for threading %d; its completion queues and endpoints are locked "
-			    "anyway, so a missing serialisation of your own will not show here -- it will on a "
-			    "real EFA device. SRDSIM_FI_GUARD_CQ=0 leaves libfabric's choice alone\n",
+			    "this domain asked for threading %d; its completion queues are locked anyway, so a "
+			    "missing serialisation of your own will not show here -- it will on a real EFA "
+			    "device. SRDSIM_FI_GUARD_CQ=0 leaves libfabric's choice alone\n",
 			    (int) info->domain_attr->threading);
 		domain->threading = FI_THREAD_SAFE;
 	}
