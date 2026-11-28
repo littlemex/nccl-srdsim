@@ -616,3 +616,22 @@ jobs:
           git clone --quiet --depth 1 --branch "$LIBFABRIC_TAG" https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-src"
           test "$(git -C "$RUNNER_TEMP/libfabric-src" rev-parse HEAD)" = "$LIBFABRIC_COMMIT"
           ./ci/efa_unit_tests.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/efa-unit"
+
+  # libfabric's fabtests between two processes on the runner, through the unmodified efa provider on the
+  # device stand-in, with the data of every transfer checked.
+  efa-fabtests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: versions
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run fabtests through the efa provider on the stand-in
+        env:
+          LIBFABRIC_TAG: ${{ needs.versions.outputs.libfabric_tag }}
+          LIBFABRIC_COMMIT: ${{ needs.versions.outputs.libfabric_commit }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libibverbs-dev libnuma-dev
+          git clone --quiet --depth 1 --branch "$LIBFABRIC_TAG" https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-src"
+          test "$(git -C "$RUNNER_TEMP/libfabric-src" rev-parse HEAD)" = "$LIBFABRIC_COMMIT"
+          ./ci/efa_fabtests.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/efa-fabtests"

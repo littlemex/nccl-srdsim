@@ -1,24 +1,21 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * A stand-in for the EFA device below the libfabric efa provider.
+ * A stand-in for the EFA device below the libfabric efa provider: the device,
+ * its context, PDs, MRs and AHs. queue.c has the CQs, the QPs and the
+ * movement of data.
  *
  * Built twice, as libibverbs.so.1 and libefa.so.1, exporting the symbols the
  * provider links against with the same symbol versions. Objects are laid out
  * with the real rdma-core headers, so the provider's inline verbs calls reach
- * the function pointers filled in here.
+ * the function pointers filled in here. Where the real libefa decides how a
+ * device's answer looks to its caller, the stand-in answers the same way.
  *
- * It keeps state for the objects the provider creates (device, PD, MR, CQ,
- * QP, AH) and moves no data yet: posting work returns ENOSYS and every CQ
- * stays empty. It does not provide the rings of the direct data path, so the
- * provider takes the verbs path; efadv_query_qp_wqs and efadv_query_cq say
- * EOPNOTSUPP. Set SRDSIM_DEVICE_LOG=1 to log each call on stderr.
+ * Set SRDSIM_DEVICE_LOG=1 to log each call on stderr.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
-#include <stdatomic.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,24 +26,27 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <infiniband/verbs.h>
-#include <infiniband/efadv.h>
+#include "device.h"
 
-#include "profile.h"
+#define dlog sd_log
 
-#define EXPORT __attribute__((visibility("default")))
+bool sd_log_enabled(void)
+{
+	static int on = -1;
 
-static int log_on = -1;
+	if (on < 0) {
+		const char *v = getenv("SRDSIM_DEVICE_LOG");
 
-static void dlog(const char *fmt, ...)
+		on = v && *v && strcmp(v, "0");
+	}
+	return on;
+}
+
+void sd_log(const char *fmt, ...)
 {
 	va_list ap;
 
-	if (log_on < 0) {
-		const char *v = getenv("SRDSIM_DEVICE_LOG");
-		log_on = v && *v && strcmp(v, "0");
-	}
-	if (!log_on)
+	if (!sd_log_enabled())
 		return;
 	fprintf(stderr, "[srdsim-device %d] ", (int)getpid());
 	va_start(ap, fmt);
@@ -151,24 +151,7 @@ static const char *sysfs_tree(int ndev)
 
 /* ---- device and context ---------------------------------------------- */
 
-struct sd_device {
-	struct ibv_device dev;
-	int index;
-};
-
-struct sd_context {
-	struct verbs_context vctx;
-	struct sd_device *device;
-	pthread_mutex_t lock;
-	uint32_t next_qpn;
-	uint16_t next_ahn;
-	uint32_t next_key;
-};
-
-static struct sd_context *ctx_of(struct ibv_context *c)
-{
-	return (struct sd_context *)((char *)c - offsetof(struct verbs_context, context));
-}
+#define ctx_of sd_ctx
 
 static int device_count(void)
 {
@@ -231,12 +214,6 @@ EXPORT void ibv_free_device_list(struct ibv_device **list)
 }
 
 static int sd_query_port(struct ibv_context *c, uint8_t port, struct ibv_port_attr *a, size_t len);
-static struct ibv_cq_ex *sd_create_cq_ex(struct ibv_context *c, struct ibv_cq_init_attr_ex *attr);
-static struct ibv_qp *sd_create_qp_ex(struct ibv_context *c, struct ibv_qp_init_attr_ex *attr);
-static int sd_req_notify_cq(struct ibv_cq *cq, int solicited);
-static int sd_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_recv_wr **bad);
-static int sd_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad);
-static int sd_poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc);
 
 EXPORT struct ibv_context *ibv_open_device(struct ibv_device *device)
 {
@@ -249,13 +226,10 @@ EXPORT struct ibv_context *ibv_open_device(struct ibv_device *device)
 	}
 	sc->device = (struct sd_device *)device;
 	pthread_mutex_init(&sc->lock, NULL);
-	sc->next_qpn = 1;
 	sc->next_ahn = 1;
 	sc->next_key = 0x100;
 	sc->vctx.sz = sizeof(sc->vctx);
 	sc->vctx.query_port = sd_query_port;
-	sc->vctx.create_cq_ex = sd_create_cq_ex;
-	sc->vctx.create_qp_ex = sd_create_qp_ex;
 	c = &sc->vctx.context;
 	c->device = device;
 	c->abi_compat = __VERBS_ABI_IS_EXTENDED;
@@ -263,10 +237,16 @@ EXPORT struct ibv_context *ibv_open_device(struct ibv_device *device)
 	c->async_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	c->num_comp_vectors = SD_NUM_COMP_VECTORS;
 	pthread_mutex_init(&c->mutex, NULL);
-	c->ops.poll_cq = sd_poll_cq;
-	c->ops.req_notify_cq = sd_req_notify_cq;
-	c->ops.post_send = sd_post_send;
-	c->ops.post_recv = sd_post_recv;
+	if (sd_agent_start(sc)) {
+		int err = errno;
+
+		pthread_mutex_destroy(&sc->lock);
+		close(c->cmd_fd);
+		close(c->async_fd);
+		free(sc);
+		errno = err;
+		return NULL;
+	}
 	dlog("open_device %s -> ctx %p", device->name, (void *)c);
 	return c;
 }
@@ -276,6 +256,7 @@ EXPORT int ibv_close_device(struct ibv_context *c)
 	struct sd_context *sc = ctx_of(c);
 
 	dlog("close_device ctx %p", (void *)c);
+	sd_agent_stop(sc);
 	if (c->cmd_fd >= 0)
 		close(c->cmd_fd);
 	if (c->async_fd >= 0)
@@ -346,14 +327,19 @@ EXPORT int ibv_query_gid(struct ibv_context *c, uint8_t port, int index, union i
 
 	if (port != 1 || index != 0)
 		return -1;
+	sd_gid_of(sc->device->index, gid);
+	return 0;
+}
+
+void sd_gid_of(int device, union ibv_gid *gid)
+{
 	memset(gid, 0, sizeof(*gid));
 	gid->raw[0] = 0xfe;
 	gid->raw[1] = 0x80;
 	gid->raw[8] = 0x02;
 	gid->raw[13] = 0xef;
 	gid->raw[14] = 0xa0;
-	gid->raw[15] = (uint8_t)sc->device->index;
-	return 0;
+	gid->raw[15] = (uint8_t)device;
 }
 
 static int fork_initialized;
@@ -376,11 +362,6 @@ EXPORT enum ibv_fork_status ibv_is_fork_initialized(void)
  * still refers to: a PD with MRs, QPs or AHs, a CQ with QPs, a completion
  * channel with CQs.
  */
-struct sd_pd {
-	struct ibv_pd pd;
-	atomic_int users;
-};
-
 static void use(atomic_int *n, int d)
 {
 	atomic_fetch_add(n, d);
@@ -413,48 +394,47 @@ EXPORT int ibv_dealloc_pd(struct ibv_pd *pd)
 	return 0;
 }
 
-/*
- * rdma-core allocates every MR as struct verbs_mr (infiniband/driver.h, not
- * installed by distributions). The efa unit tests read its access field
- * through their own copy of the layout, so the stand-in uses the same one.
- */
-struct sd_verbs_mr {
-	struct ibv_mr ibv_mr;
-	int mr_type;		/* enum ibv_mr_type in driver.h */
-	int access;
-};
-
 EXPORT struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 				       uint64_t iova, unsigned int access)
 {
 	struct sd_context *sc = ctx_of(pd->context);
-	struct sd_verbs_mr *vmr;
-	struct ibv_mr *mr;
+	struct sd_mr *m;
 
-	(void)iova;
 	if (!length || length > SD_MAX_MR_SIZE) {
 		errno = EINVAL;
 		return NULL;
 	}
-	/* rdma-core hands out MRs as struct verbs_mr; callers may read access. */
-	vmr = calloc(1, sizeof(*vmr));
-	if (!vmr) {
+	m = calloc(1, sizeof(*m));
+	if (!m) {
 		errno = ENOMEM;
 		return NULL;
 	}
-	vmr->mr_type = 0;		/* IBV_MR_TYPE_MR */
-	vmr->access = (int)access;
-	mr = &vmr->ibv_mr;
-	mr->context = pd->context;
-	mr->pd = pd;
-	mr->addr = addr;
-	mr->length = length;
+	m->mr_type = 0;
+	m->access = (int)access;
+	m->iova = iova;
+	m->ibv_mr.context = pd->context;
+	m->ibv_mr.pd = pd;
+	m->ibv_mr.addr = addr;
+	m->ibv_mr.length = length;
 	use(&((struct sd_pd *)pd)->users, 1);
 	pthread_mutex_lock(&sc->lock);
-	mr->lkey = mr->rkey = mr->handle = sc->next_key++;
+	m->ibv_mr.lkey = m->ibv_mr.rkey = m->ibv_mr.handle = sc->next_key++;
+	m->next = sc->mrs;
+	sc->mrs = m;
 	pthread_mutex_unlock(&sc->lock);
-	dlog("reg_mr %p+%zu access 0x%x -> key 0x%x", addr, length, access, mr->lkey);
-	return mr;
+	dlog("reg_mr %p+%zu iova 0x%llx access 0x%x -> key 0x%x", addr, length,
+	     (unsigned long long)iova, access, m->ibv_mr.lkey);
+	return &m->ibv_mr;
+}
+
+struct sd_mr *sd_mr_find(struct sd_context *ctx, uint32_t key)
+{
+	struct sd_mr *m;
+
+	for (m = ctx->mrs; m; m = m->next)
+		if (m->ibv_mr.lkey == key)
+			return m;
+	return NULL;
 }
 
 EXPORT struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size_t length,
@@ -468,9 +448,19 @@ EXPORT struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset, size
 
 EXPORT int ibv_dereg_mr(struct ibv_mr *mr)
 {
+	struct sd_context *sc = ctx_of(mr->context);
+	struct sd_mr **p;
+
 	dlog("dereg_mr key 0x%x", mr->lkey);
+	pthread_mutex_lock(&sc->lock);
+	for (p = &sc->mrs; *p; p = &(*p)->next)
+		if (&(*p)->ibv_mr == mr) {
+			*p = (*p)->next;
+			break;
+		}
+	pthread_mutex_unlock(&sc->lock);
 	use(&((struct sd_pd *)mr->pd)->users, -1);
-	free(mr);
+	free((struct sd_mr *)mr);
 	return 0;
 }
 
@@ -483,361 +473,7 @@ EXPORT int efadv_query_mr(struct ibv_mr *ibvmr, struct efadv_mr_attr *attr, uint
 	return 0;
 }
 
-/* ---- completion channel and CQ ------------------------------------------ */
-
-EXPORT struct ibv_comp_channel *ibv_create_comp_channel(struct ibv_context *c)
-{
-	struct ibv_comp_channel *ch = calloc(1, sizeof(*ch));
-
-	if (!ch) {
-		errno = ENOMEM;
-		return NULL;
-	}
-	ch->context = c;
-	ch->fd = eventfd(0, EFD_CLOEXEC);
-	return ch;
-}
-
-EXPORT int ibv_destroy_comp_channel(struct ibv_comp_channel *ch)
-{
-	/* refcnt counts the CQs bound to the channel, as in rdma-core. */
-	if (ch->refcnt) {
-		dlog("destroy_comp_channel -> EBUSY (%d CQs)", ch->refcnt);
-		return EBUSY;
-	}
-	if (ch->fd >= 0)
-		close(ch->fd);
-	free(ch);
-	return 0;
-}
-
-struct sd_cq {
-	struct ibv_cq_ex ex;
-	struct efadv_cq dv;
-	uint64_t wc_flags;
-	atomic_int users;
-};
-
-static struct sd_cq *cq_of_ex(struct ibv_cq_ex *ex)
-{
-	return (struct sd_cq *)ex;
-}
-
-/* No data moves yet, so every CQ stays empty. */
-static int sd_start_poll(struct ibv_cq_ex *cq, struct ibv_poll_cq_attr *attr)
-{
-	(void)cq; (void)attr;
-	return ENOENT;
-}
-
-static int sd_next_poll(struct ibv_cq_ex *cq)
-{
-	(void)cq;
-	return ENOENT;
-}
-
-static void sd_end_poll(struct ibv_cq_ex *cq)
-{
-	(void)cq;
-}
-
-static enum ibv_wc_opcode sd_read_opcode(struct ibv_cq_ex *cq) { (void)cq; return IBV_WC_SEND; }
-static uint32_t sd_read_u32(struct ibv_cq_ex *cq) { (void)cq; return 0; }
-static __be32 sd_read_imm(struct ibv_cq_ex *cq) { (void)cq; return 0; }
-static unsigned int sd_read_wc_flags(struct ibv_cq_ex *cq) { (void)cq; return 0; }
-static uint8_t sd_read_u8(struct ibv_cq_ex *cq) { (void)cq; return 0; }
-static int sd_wc_read_sgid(struct efadv_cq *dv, union ibv_gid *gid) { (void)dv; memset(gid, 0, sizeof(*gid)); return 0; }
-#if SD_HAVE_EFADV_WC_IS_UNSOLICITED
-static bool sd_wc_is_unsolicited(struct efadv_cq *dv) { (void)dv; return false; }
-#endif
-
-static int sd_poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc)
-{
-	(void)cq; (void)n; (void)wc;
-	return 0;
-}
-
-static int sd_req_notify_cq(struct ibv_cq *cq, int solicited)
-{
-	(void)cq; (void)solicited;
-	return 0;
-}
-
-static struct ibv_cq_ex *create_cq(struct ibv_context *c, struct ibv_cq_init_attr_ex *attr,
-				   struct efadv_cq_init_attr *efa_attr, uint32_t inlen)
-{
-	struct sd_cq *cq;
-
-	if (!attr->cqe || attr->cqe > SD_MAX_CQE) {
-		errno = EINVAL;
-		return NULL;
-	}
-	cq = calloc(1, sizeof(*cq));
-	if (!cq) {
-		errno = ENOMEM;
-		return NULL;
-	}
-	cq->ex.context = c;
-	cq->ex.channel = attr->channel;
-	if (attr->channel) {
-		pthread_mutex_lock(&ctx_of(c)->lock);
-		attr->channel->refcnt++;
-		pthread_mutex_unlock(&ctx_of(c)->lock);
-	}
-	cq->ex.cq_context = attr->cq_context;
-	cq->ex.cqe = (int)attr->cqe;
-	pthread_mutex_init(&cq->ex.mutex, NULL);
-	pthread_cond_init(&cq->ex.cond, NULL);
-	cq->ex.start_poll = sd_start_poll;
-	cq->ex.next_poll = sd_next_poll;
-	cq->ex.end_poll = sd_end_poll;
-	cq->ex.read_opcode = sd_read_opcode;
-	cq->ex.read_vendor_err = sd_read_u32;
-	cq->ex.read_byte_len = sd_read_u32;
-	cq->ex.read_imm_data = sd_read_imm;
-	cq->ex.read_qp_num = sd_read_u32;
-	cq->ex.read_src_qp = sd_read_u32;
-	cq->ex.read_wc_flags = sd_read_wc_flags;
-	cq->ex.read_slid = sd_read_u32;
-	cq->ex.read_sl = sd_read_u8;
-	cq->ex.read_dlid_path_bits = sd_read_u8;
-	cq->dv.wc_read_sgid = sd_wc_read_sgid;
-#if SD_HAVE_EFADV_WC_IS_UNSOLICITED
-	cq->dv.wc_is_unsolicited = sd_wc_is_unsolicited;
-#endif
-	cq->wc_flags = attr->wc_flags;
-	if (efa_attr && inlen >= offsetof(struct efadv_cq_init_attr, wc_flags) + sizeof(efa_attr->wc_flags))
-		cq->wc_flags |= efa_attr->wc_flags << 32;
-	dlog("create_cq cqe %u wc_flags 0x%llx -> %p", attr->cqe,
-	     (unsigned long long)attr->wc_flags, (void *)cq);
-	return &cq->ex;
-}
-
-static struct ibv_cq_ex *sd_create_cq_ex(struct ibv_context *c, struct ibv_cq_init_attr_ex *attr)
-{
-	return create_cq(c, attr, NULL, 0);
-}
-
-EXPORT struct ibv_cq_ex *efadv_create_cq(struct ibv_context *c, struct ibv_cq_init_attr_ex *attr,
-					 struct efadv_cq_init_attr *efa_attr, uint32_t inlen)
-{
-	return create_cq(c, attr, efa_attr, inlen);
-}
-
-EXPORT struct efadv_cq *efadv_cq_from_ibv_cq_ex(struct ibv_cq_ex *ex)
-{
-	return &cq_of_ex(ex)->dv;
-}
-
-#if SD_HAVE_EFADV_QUERY_CQ
-EXPORT int efadv_query_cq(struct ibv_cq *cq, struct efadv_cq_attr *attr, uint32_t inlen)
-{
-	(void)cq; (void)attr; (void)inlen;
-	/* The direct data path needs the CQ ring; the stand-in has none. */
-	return EOPNOTSUPP;
-}
-#endif
-
-EXPORT int ibv_destroy_cq(struct ibv_cq *cq)
-{
-	struct sd_cq *c = (struct sd_cq *)cq;
-
-	/* SD_MUTATION_CQ_IN_USE builds the stand-in wrong on purpose, for the CI's mutation control. */
-#ifndef SD_MUTATION_CQ_IN_USE
-	int n = atomic_load(&c->users);
-
-	if (n) {
-		dlog("destroy_cq %p -> EBUSY (%d QPs)", (void *)cq, n);
-		return EBUSY;
-	}
-#endif
-	dlog("destroy_cq %p", (void *)cq);
-	if (c->ex.channel) {
-		pthread_mutex_lock(&ctx_of(cq->context)->lock);
-		c->ex.channel->refcnt--;
-		pthread_mutex_unlock(&ctx_of(cq->context)->lock);
-	}
-	pthread_mutex_destroy(&c->ex.mutex);
-	pthread_cond_destroy(&c->ex.cond);
-	free(c);
-	return 0;
-}
-
-EXPORT void ibv_ack_cq_events(struct ibv_cq *cq, unsigned int nevents)
-{
-	(void)cq; (void)nevents;
-}
-
-/* ---- QP ------------------------------------------------------------------- */
-
-struct sd_qp {
-	struct ibv_qp_ex ex;
-	int extended;
-};
-
-static void wr_unsupported(struct ibv_qp_ex *qp)
-{
-	(void)qp;
-}
-
-static void sd_wr_start(struct ibv_qp_ex *qp) { (void)qp; }
-static int sd_wr_complete(struct ibv_qp_ex *qp) { (void)qp; return ENOSYS; }
-static void sd_wr_abort(struct ibv_qp_ex *qp) { (void)qp; }
-static void sd_wr_send(struct ibv_qp_ex *qp) { wr_unsupported(qp); }
-static void sd_wr_send_imm(struct ibv_qp_ex *qp, __be32 imm) { (void)imm; wr_unsupported(qp); }
-static void sd_wr_rdma(struct ibv_qp_ex *qp, uint32_t rkey, uint64_t addr) { (void)rkey; (void)addr; wr_unsupported(qp); }
-static void sd_wr_rdma_imm(struct ibv_qp_ex *qp, uint32_t rkey, uint64_t addr, __be32 imm) { (void)rkey; (void)addr; (void)imm; wr_unsupported(qp); }
-static void sd_wr_set_ud_addr(struct ibv_qp_ex *qp, struct ibv_ah *ah, uint32_t qpn, uint32_t qkey) { (void)ah; (void)qpn; (void)qkey; wr_unsupported(qp); }
-static void sd_wr_set_sge(struct ibv_qp_ex *qp, uint32_t lkey, uint64_t addr, uint32_t len) { (void)lkey; (void)addr; (void)len; wr_unsupported(qp); }
-static void sd_wr_set_sge_list(struct ibv_qp_ex *qp, size_t n, const struct ibv_sge *sg) { (void)n; (void)sg; wr_unsupported(qp); }
-static void sd_wr_set_inline_data(struct ibv_qp_ex *qp, void *addr, size_t len) { (void)addr; (void)len; wr_unsupported(qp); }
-static void sd_wr_set_inline_data_list(struct ibv_qp_ex *qp, size_t n, const struct ibv_data_buf *b) { (void)n; (void)b; wr_unsupported(qp); }
-
-static int sd_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_recv_wr **bad)
-{
-	(void)qp;
-	if (bad)
-		*bad = wr;
-	return ENOSYS;
-}
-
-static int sd_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad)
-{
-	(void)qp;
-	if (bad)
-		*bad = wr;
-	return ENOSYS;
-}
-
-static struct ibv_qp *create_qp(struct ibv_context *c, struct ibv_qp_init_attr_ex *attr, int extended)
-{
-	struct sd_context *sc = ctx_of(c);
-	struct sd_qp *qp;
-
-	if (attr->cap.max_send_wr > SD_EFA_MAX_SQ_WR || attr->cap.max_recv_wr > SD_EFA_MAX_RQ_WR ||
-	    attr->cap.max_send_sge > SD_EFA_MAX_SQ_SGE || attr->cap.max_recv_sge > SD_EFA_MAX_RQ_SGE ||
-	    attr->cap.max_inline_data > SD_EFA_INLINE_BUF_SIZE) {
-		dlog("create_qp caps beyond device: wr %u/%u sge %u/%u inline %u",
-		     attr->cap.max_send_wr, attr->cap.max_recv_wr, attr->cap.max_send_sge,
-		     attr->cap.max_recv_sge, attr->cap.max_inline_data);
-		errno = EINVAL;
-		return NULL;
-	}
-	qp = calloc(1, sizeof(*qp));
-	if (!qp) {
-		errno = ENOMEM;
-		return NULL;
-	}
-	qp->extended = extended;
-	qp->ex.qp_base.context = c;
-	qp->ex.qp_base.qp_context = attr->qp_context;
-	qp->ex.qp_base.pd = attr->pd;
-	qp->ex.qp_base.send_cq = attr->send_cq;
-	qp->ex.qp_base.recv_cq = attr->recv_cq;
-	qp->ex.qp_base.srq = attr->srq;
-	qp->ex.qp_base.qp_type = attr->qp_type;
-	qp->ex.qp_base.state = IBV_QPS_RESET;
-	use(&((struct sd_pd *)attr->pd)->users, 1);
-	if (attr->send_cq)
-		use(&((struct sd_cq *)attr->send_cq)->users, 1);
-	if (attr->recv_cq)
-		use(&((struct sd_cq *)attr->recv_cq)->users, 1);
-	pthread_mutex_init(&qp->ex.qp_base.mutex, NULL);
-	pthread_cond_init(&qp->ex.qp_base.cond, NULL);
-	pthread_mutex_lock(&sc->lock);
-	qp->ex.qp_base.qp_num = sc->next_qpn++;
-	pthread_mutex_unlock(&sc->lock);
-	qp->ex.qp_base.handle = qp->ex.qp_base.qp_num;
-	qp->ex.comp_mask = attr->comp_mask;
-	qp->ex.wr_start = sd_wr_start;
-	qp->ex.wr_complete = sd_wr_complete;
-	qp->ex.wr_abort = sd_wr_abort;
-	qp->ex.wr_send = sd_wr_send;
-	qp->ex.wr_send_imm = sd_wr_send_imm;
-	qp->ex.wr_rdma_read = sd_wr_rdma;
-	qp->ex.wr_rdma_write = sd_wr_rdma;
-	qp->ex.wr_rdma_write_imm = sd_wr_rdma_imm;
-	qp->ex.wr_set_ud_addr = sd_wr_set_ud_addr;
-	qp->ex.wr_set_sge = sd_wr_set_sge;
-	qp->ex.wr_set_sge_list = sd_wr_set_sge_list;
-	qp->ex.wr_set_inline_data = sd_wr_set_inline_data;
-	qp->ex.wr_set_inline_data_list = sd_wr_set_inline_data_list;
-	dlog("create_qp type %d send_wr %u recv_wr %u -> qpn %u", attr->qp_type,
-	     attr->cap.max_send_wr, attr->cap.max_recv_wr, qp->ex.qp_base.qp_num);
-	return &qp->ex.qp_base;
-}
-
-static struct ibv_qp *sd_create_qp_ex(struct ibv_context *c, struct ibv_qp_init_attr_ex *attr)
-{
-	return create_qp(c, attr, 1);
-}
-
-EXPORT struct ibv_qp *efadv_create_qp_ex(struct ibv_context *c, struct ibv_qp_init_attr_ex *attr,
-					 struct efadv_qp_init_attr *efa_attr, uint32_t inlen)
-{
-	if (efa_attr && inlen >= offsetof(struct efadv_qp_init_attr, driver_qp_type) + sizeof(efa_attr->driver_qp_type) &&
-	    efa_attr->driver_qp_type != EFADV_QP_DRIVER_TYPE_SRD) {
-		errno = EOPNOTSUPP;
-		return NULL;
-	}
-	return create_qp(c, attr, 1);
-}
-
-EXPORT struct ibv_qp_ex *ibv_qp_to_qp_ex(struct ibv_qp *qp)
-{
-	struct sd_qp *q = (struct sd_qp *)qp;
-
-	return q->extended ? &q->ex : NULL;
-}
-
-EXPORT int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int mask)
-{
-	if (mask & IBV_QP_STATE)
-		qp->state = attr->qp_state;
-	dlog("modify_qp qpn %u mask 0x%x state %d", qp->qp_num, mask, qp->state);
-	return 0;
-}
-
-EXPORT int ibv_destroy_qp(struct ibv_qp *qp)
-{
-	dlog("destroy_qp qpn %u", qp->qp_num);
-	use(&((struct sd_pd *)qp->pd)->users, -1);
-	if (qp->send_cq)
-		use(&((struct sd_cq *)qp->send_cq)->users, -1);
-	if (qp->recv_cq)
-		use(&((struct sd_cq *)qp->recv_cq)->users, -1);
-	pthread_mutex_destroy(&qp->mutex);
-	pthread_cond_destroy(&qp->cond);
-	free(qp);
-	return 0;
-}
-
-#if SD_HAVE_IBV_QUERY_QP_DATA_IN_ORDER
-EXPORT int ibv_query_qp_data_in_order(struct ibv_qp *qp, enum ibv_wr_opcode op, uint32_t flags)
-{
-	(void)qp; (void)op; (void)flags;
-	/* SRD keeps no order between messages, and the stand-in promises none. */
-	return 0;
-}
-#endif
-
-#if SD_HAVE_EFADV_QUERY_QP_WQS
-EXPORT int efadv_query_qp_wqs(struct ibv_qp *qp, struct efadv_wq_attr *sq, struct efadv_wq_attr *rq,
-			      uint32_t inlen)
-{
-	(void)qp; (void)sq; (void)rq; (void)inlen;
-	/* The direct data path needs the work queue rings; the stand-in has none. */
-	return EOPNOTSUPP;
-}
-#endif
-
 /* ---- AH ------------------------------------------------------------------- */
-
-struct sd_ah {
-	struct ibv_ah ah;
-	uint16_t ahn;
-	union ibv_gid gid;
-};
 
 EXPORT struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 {
@@ -854,14 +490,36 @@ EXPORT struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 	use(&((struct sd_pd *)pd)->users, 1);
 	pthread_mutex_lock(&sc->lock);
 	a->ahn = sc->next_ahn++;
+	a->next = sc->ahs;
+	sc->ahs = a;
 	pthread_mutex_unlock(&sc->lock);
 	a->ah.handle = a->ahn;
 	dlog("create_ah -> ahn %u", a->ahn);
 	return &a->ah;
 }
 
+uint16_t sd_ahn_of(struct sd_context *ctx, const union ibv_gid *gid)
+{
+	struct sd_ah *a;
+
+	for (a = ctx->ahs; a; a = a->next)
+		if (!memcmp(a->gid.raw, gid->raw, sizeof(gid->raw)))
+			return a->ahn;
+	return 0xffff;
+}
+
 EXPORT int ibv_destroy_ah(struct ibv_ah *ah)
 {
+	struct sd_context *sc = ctx_of(ah->context);
+	struct sd_ah **p;
+
+	pthread_mutex_lock(&sc->lock);
+	for (p = &sc->ahs; *p; p = &(*p)->next)
+		if (&(*p)->ah == ah) {
+			*p = (*p)->next;
+			break;
+		}
+	pthread_mutex_unlock(&sc->lock);
 	dlog("destroy_ah ahn %u", ((struct sd_ah *)ah)->ahn);
 	use(&((struct sd_pd *)ah->pd)->users, -1);
 	free(ah);

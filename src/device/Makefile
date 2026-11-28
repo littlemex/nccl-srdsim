@@ -18,7 +18,10 @@ FEATURES := \
 	-DSD_HAVE_EFADV_QUERY_QP_WQS=$(call probe,int f(struct efadv_wq_attr *a) { return efadv_query_qp_wqs(0, a, a, sizeof(*a)); }) \
 	-DSD_HAVE_EFADV_QUERY_CQ=$(call probe,int f(struct efadv_cq_attr *a) { return efadv_query_cq(0, a, sizeof(*a)); }) \
 	-DSD_HAVE_EFADV_WC_IS_UNSOLICITED=$(call probe,int f(struct efadv_cq *c) { return c->wc_is_unsolicited != 0; }) \
-	-DSD_HAVE_IBV_QUERY_QP_DATA_IN_ORDER=$(call probe,int f(struct ibv_qp *q) { return ibv_query_qp_data_in_order(q, IBV_WR_SEND, 0); })
+	-DSD_HAVE_IBV_QUERY_QP_DATA_IN_ORDER=$(call probe,int f(struct ibv_qp *q) { return ibv_query_qp_data_in_order(q, IBV_WR_SEND, 0); }) \
+	-DSD_HAVE_EFADV_QP_FLAGS=$(call probe,int f(struct efadv_qp_init_attr *a) { return a->flags & EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV; })
+
+SOURCES := $(addprefix $(SRC),device.c queue.c device.h profile.h libibverbs.map libefa.map)
 
 ALL_CFLAGS := $(CFLAGS) $(MUTATION) -std=gnu11 -fPIC -Wall -Wextra -Werror -fvisibility=hidden $(FEATURES)
 
@@ -27,13 +30,13 @@ all: $(OUT)/libibverbs.so.1 $(OUT)/libefa.so.1
 $(OUT):
 	mkdir -p $@
 
-$(OUT)/libibverbs.so.1: $(SRC)device.c $(SRC)profile.h $(SRC)libibverbs.map | $(OUT)
+$(OUT)/libibverbs.so.1: $(SOURCES) | $(OUT)
 	$(CC) $(ALL_CFLAGS) -shared -Wl,-soname,libibverbs.so.1 -Wl,--version-script=$(SRC)libibverbs.map \
-		-o $@ $(SRC)device.c -lpthread
+		-o $@ $(SRC)device.c $(SRC)queue.c -lpthread
 
-$(OUT)/libefa.so.1: $(SRC)device.c $(SRC)profile.h $(SRC)libefa.map | $(OUT)
+$(OUT)/libefa.so.1: $(SOURCES) | $(OUT)
 	$(CC) $(ALL_CFLAGS) -shared -Wl,-soname,libefa.so.1 -Wl,--version-script=$(SRC)libefa.map \
-		-o $@ $(SRC)device.c -lpthread
+		-o $@ $(SRC)device.c $(SRC)queue.c -lpthread
 
 features:
 	@echo $(FEATURES)
