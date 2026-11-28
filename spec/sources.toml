@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# The documents and source files the records in this directory quote, each pinned to one commit.
+#
+# A record's quote must appear in its source at that commit (whitespace and Markdown emphasis
+# aside); tools/spec.py fetches each source and checks. Moving a pin is a deliberate change: the
+# check then reports every record whose quoted text changed or vanished at the new commit, which
+# is how a change in what the fabric promises becomes visible here.
+
+[sources.fi_efa]
+title = "fi_efa(7), the libfabric EFA provider man page"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_efa.7.md"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_efa.7.md"
+
+[sources.fi_endpoint]
+title = "fi_endpoint(3)"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_endpoint.3.md"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_endpoint.3.md"
+
+[sources.fi_cq]
+title = "fi_cq(3)"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_cq.3.md"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_cq.3.md"
+
+[sources.efa_prov_info]
+title = "prov/efa/src/efa_prov_info.c, the attributes the efa provider reports"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/efa_prov_info.c"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/efa_prov_info.c"
+
+[sources.nccl_rma]
+title = "NCCL RMA plugin specification"
+version = "NCCL v2.32.6-1"
+url = "https://raw.githubusercontent.com/NVIDIA/nccl/ad2d192c1f279aefcaf340f67e07880b65a1116b/plugins/rma/README.md"
+view = "https://github.com/NVIDIA/nccl/blob/ad2d192c1f279aefcaf340f67e07880b65a1116b/plugins/rma/README.md"
+
+[sources.fi_domain]
+title = "fi_domain(3)"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_domain.3.md"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/man/fi_domain.3.md"
+
+[sources.util_attr]
+title = "prov/util/src/util_attr.c, how fi_getinfo shapes the attributes a consumer gets"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/prov/util/src/util_attr.c"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/util/src/util_attr.c"
+
+[sources.efa_rdm_ope]
+title = "prov/efa/src/rdm/efa_rdm_ope.c, the efa RDM endpoint's operation entries"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ope.c"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ope.c"
+
+[sources.efa_rdm_ep_fiops]
+title = "prov/efa/src/rdm/efa_rdm_ep_fiops.c, the efa RDM endpoint's options"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ep_fiops.c"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ep_fiops.c"

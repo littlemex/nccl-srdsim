@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+# What NCCL's RMA plugin interface guarantees to the code above it, which the plugin front end
+# (src/nccl_rma_srdsim.cc) must provide on an unordered fabric. Same fields as spec/efa.toml.
+
+[[guarantee]]
+id = "NCCL-SIG-001"
+title = "A weak signal becomes visible only after its own put"
+kind = "forbids"
+statement = "A weak signal bundled with a put does not become visible before every byte of that put is visible."
+basis_note = "This project's documentation calls this invariant I1."
+scope = { fabric = ["nccl-rma"], operations = ["put+signal"] }
+basis = "documented"
+sources = [
+  { source = "nccl_rma", quote = "The visibility of a *weak* signal guarantees the completion/visibility of the bundled put (in the case of put+signal)" },
+]
+checked_by = ["test:model_srdsim_schedule_exhaustive", "test:test_srdsim_schedule"]
+srdsim = { status = "conforms", note = "A signal is held until every byte of its own operation has landed, in every mode but violate-i1, which exists to break it." }
+
+[[guarantee]]
+id = "NCCL-SIG-002"
+title = "A weak signal may become visible before earlier puts"
+kind = "permits"
+statement = "A weak signal may become visible before puts posted earlier than its own put are visible."
+scope = { fabric = ["nccl-rma"], operations = ["put", "signal"] }
+basis = "documented"
+sources = [
+  { source = "nccl_rma", quote = "but makes no guarantees on previous puts or previous signals." },
+]
+checked_by = ["test:model_srdsim_schedule_exhaustive"]
+srdsim = { status = "conforms", note = "Under srd, operations release in any order across operations, so a later signal can overtake an earlier put." }
+
+[[guarantee]]
+id = "NCCL-SIG-004"
+title = "A weak signal may become visible before earlier signals"
+kind = "permits"
+statement = "A weak signal may become visible before signals posted earlier than it are visible."
+scope = { fabric = ["nccl-rma"], operations = ["signal"] }
+basis = "documented"
+sources = [
+  { source = "nccl_rma", quote = "but makes no guarantees on previous puts or previous signals." },
+]
+checked_by = []
+unchecked = "Not established that any test shows one signal overtaking an earlier one."
+srdsim = { status = "unverified", note = "To be read in src/srdsim_schedule.h and the exhaustive model: whether two operations' signals can be released out of order." }
+
+[[guarantee]]
+id = "NCCL-SIG-003"
+title = "A strong signal covers every earlier put and signal"
+kind = "forbids"
+statement = "A strong signal does not become visible before every earlier put and signal, and its bundled put, are visible."
+scope = { fabric = ["nccl-rma"], operations = ["put+signal"] }
+basis = "documented"
+sources = [
+  { source = "nccl_rma", quote = "The visibility of a *strong* signal guarantees the completion/visibility of all previous puts and signals, including the bundled put in the case of put+signal." },
+]
+checked_by = []
+unchecked = "Not established which mode, if any, the plugin offers strong signals in, or whether NCCL ever requests them from this plugin."
+srdsim = { status = "unverified", note = "To be read in src/nccl_rma_srdsim.cc." }

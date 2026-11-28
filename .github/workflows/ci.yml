@@ -58,6 +58,30 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: ./scripts/check_configuration_reference.sh
 
+  # The guarantee records in spec/: every field, every test they name, every quote against its
+  # pinned source, and docs/specification.md being what they render to.
+  specification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check the records against their sources
+        run: python3 tools/spec.py check
+      - name: docs/specification.md is up to date
+        run: python3 tools/spec.py render --check
+      # The quote check has to be able to fail: a record whose quote is not in its source must be
+      # reported, so a check that fetched nothing, or compared nothing, cannot pass as clean.
+      - name: The quote check fails on a quote its source does not contain
+        run: |
+          sed -i 's/so that the TX completion of an operation/so that the RX completion of an operation/' spec/efa.toml
+          git diff --quiet -- spec/efa.toml && { echo "the mutation did not apply"; exit 1; }
+          if python3 tools/spec.py check > mutated-spec.log 2>&1; then
+            echo "the check passed a quote its source does not contain"; cat mutated-spec.log; exit 1
+          fi
+          grep -q 'EFA-RMA-002: quote not found in fi_efa' mutated-spec.log \
+            || { echo "the check failed for another reason:"; cat mutated-spec.log; exit 1; }
+          echo "the check catches a quote that is not in its source"
+
   # The host tests under each sanitizer. ThreadSanitizer checks the threads of every test process,
   # including a process a test forks; it cannot see a race between two processes, and a finding in a
   # forked child fails the test only through the child's exit status. The plugin is not built here.
