@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -89,22 +90,64 @@ void open_node(Node* n) {
     n->key = fi_mr_key(n->mr);
 }
 
-// Waits for one completion on `n`; returns the source in *src when the entry carries one.
-int wait_one(Node* n, fi_cq_tagged_entry* out, fi_addr_t* src, int timeout_s = 30) {
+Node g_nodes[kN];
+
+// A completion read from a node's queue while waiting for another node, kept for when that node is read.
+struct Pending {
+    fi_cq_tagged_entry entry;
+    fi_addr_t src;
+    int err;
+};
+std::deque<Pending> g_pending[kN];
+
+// Reads one completion of node n, from what was kept first: 1 with one, 0 with none yet, or -err.
+ssize_t read_one(int n, fi_cq_tagged_entry* out, fi_addr_t* src) {
+    if (not g_pending[n].empty()) {
+        const Pending p = g_pending[n].front();
+        g_pending[n].pop_front();
+        if (p.err) return -p.err;
+        *out = p.entry;
+        if (src) *src = p.src;
+        return 1;
+    }
+    fi_addr_t from = FI_ADDR_NOTAVAIL;
+    ssize_t r = fi_cq_readfrom(g_nodes[n].cq, out, 1, &from);
+    if (r == 1) {
+        if (src) *src = from;
+        return 1;
+    }
+    if (r == -FI_EAVAIL) {
+        fi_cq_err_entry e = {};
+        fi_cq_readerr(g_nodes[n].cq, &e, 0);
+        return -e.err;
+    }
+    if (r != -FI_EAGAIN) die("fi_cq_readfrom", int(r));
+    return 0;
+}
+
+// Waits for one completion on node n; returns the source in *src when the entry carries one. The other nodes'
+// queues are read meanwhile, and what they hold is kept: on the efa fabric a node serves RMA and answers the
+// handshake only while its own queue is read (EFA-PROG-002), so waiting on one node alone can wait forever.
+int wait_one(int n, fi_cq_tagged_entry* out, fi_addr_t* src, int timeout_s = 30) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     while (std::chrono::steady_clock::now() < deadline) {
-        fi_addr_t from = FI_ADDR_NOTAVAIL;
-        ssize_t r = fi_cq_readfrom(n->cq, out, 1, &from);
-        if (r == 1) {
-            if (src) *src = from;
-            return 0;
+        ssize_t r = read_one(n, out, src);
+        if (r == 1) return 0;
+        if (r < 0) return int(-r);
+        for (int m = 0; m < kN; ++m) {
+            if (m == n) continue;
+            Pending p = {};
+            p.src = FI_ADDR_NOTAVAIL;
+            ssize_t q = fi_cq_readfrom(g_nodes[m].cq, &p.entry, 1, &p.src);
+            if (q == -FI_EAVAIL) {
+                fi_cq_err_entry e = {};
+                fi_cq_readerr(g_nodes[m].cq, &e, 0);
+                p.err = e.err;
+                q = 1;
+            }
+            if (q == 1) g_pending[m].push_back(p);
+            else if (q != -FI_EAGAIN) die("fi_cq_readfrom", int(q));
         }
-        if (r == -FI_EAVAIL) {
-            fi_cq_err_entry e = {};
-            fi_cq_readerr(n->cq, &e, 0);
-            return e.err;
-        }
-        if (r != -FI_EAGAIN) die("fi_cq_readfrom", int(r));
     }
     die("no completion within the timeout", -FI_ETIMEDOUT);
 }
@@ -123,7 +166,7 @@ void writes(Node* nodes) {
             int rc = int(fi_write(nodes[i].ep, src.data(), kSlice, nullptr, nodes[i].peer[j], addr, nodes[j].key, nullptr));
             if (rc) die("fi_write", rc);
             fi_cq_tagged_entry c;
-            if (wait_one(&nodes[i], &c, nullptr)) die("write completion", -FI_EIO);
+            if (wait_one(i, &c, nullptr)) die("write completion", -FI_EIO);
         }
     }
     bool ok = true;
@@ -169,8 +212,8 @@ void sends(Node* nodes) {
         for (int n = 0; n < kN; ++n) {
             fi_cq_tagged_entry c;
             fi_addr_t src = FI_ADDR_NOTAVAIL;
-            const ssize_t r = fi_cq_readfrom(nodes[n].cq, &c, 1, &src);
-            if (r == -FI_EAGAIN) continue;
+            const ssize_t r = read_one(n, &c, &src);
+            if (r == 0) continue;
             if (r != 1) die("fi_cq_readfrom", int(r));
             if (c.flags & FI_RECV) {
                 ++recvs_done[n];
@@ -199,8 +242,8 @@ void sends(Node* nodes) {
 int main(int argc, char** argv) {
     if (argc != 2) { std::fprintf(stderr, "usage: %s PROVIDER_SO\n", argv[0]); return 2; }
     setenv("FI_PROVIDER_PATH", (std::string("+") + argv[1]).c_str(), 1);
-    static Node nodes[kN];
-    for (auto& n : nodes) open_node(&n);
+    Node* nodes = g_nodes;
+    for (auto& n : g_nodes) open_node(&n);
     for (int i = 0; i < kN; ++i)
         for (int j = 0; j < kN; ++j) {
             if (i == j) continue;
@@ -208,7 +251,7 @@ int main(int argc, char** argv) {
         }
     writes(nodes);
     sends(nodes);
-    for (auto& n : nodes) {
+    for (auto& n : g_nodes) {
         fi_close(&n.mr->fid);
         fi_close(&n.ep->fid);
         fi_close(&n.cq->fid);

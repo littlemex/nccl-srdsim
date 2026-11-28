@@ -256,6 +256,22 @@ unchecked = "The stand-in shows it; no test registered with CMake asserts it yet
 srdsim = { status = "hides-bugs", note = "The provider applies RMA at the target without the target calling into it, so a target that registers memory and then only waits serves reads and writes here and stalls its initiator on the hardware (test_fi_transfer read and badkey rely on this)." }
 
 [[guarantee]]
+id = "EFA-ERR-001"
+title = "An RMA the target refuses for its key, range or access completes with FI_EINVAL"
+kind = "forbids"
+statement = "On the efa and efa-direct fabrics, an RMA operation whose remote key, address range or access the target's memory registration does not allow completes on the initiator with an error whose err is FI_EINVAL, never with another error code."
+scope = { fabric = ["efa", "efa-direct"], operations = ["write", "read"] }
+layer = "efa-provider"
+basis = "read-from-source"
+basis_note = "The device's status for this case is named in efa_errno.h; that the device reports exactly this status for a wrong key is not yet seen on hardware (#81)."
+sources = [
+  { source = "efa_errno", quote = "REMOTE_ERROR_BAD_ADDRESS,	Remote memory registration is invalid, has insufficient access flags or does not match IOVA" },
+  { source = "efa_errno", quote = "case EFA_IO_COMP_STATUS_REMOTE_ERROR_BAD_ADDRESS:" },
+]
+checked_by = ["test:fi_transfer_badkey"]
+srdsim = { status = "conforms", note = "The provider reports a refused remote key, range or access as FI_EINVAL. Before, it reported FI_EACCES, which no EFA host returns. prov_errno is still this project's own value, not the device status 7." }
+
+[[guarantee]]
 id = "EFA-AV-001"
 title = "The target must know the initiator before an RMA operation, on efa-direct and on efa with homogeneous peers"
 kind = "forbids"

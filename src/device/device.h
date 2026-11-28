@@ -101,8 +101,12 @@ void sd_gid_of(int device, union ibv_gid *gid);
 /* Under ctx->lock: the MR whose key is key, or NULL. */
 struct sd_mr *sd_mr_find(struct sd_context *ctx, uint32_t key);
 
-/* Under ctx->lock: the AH number this context gave gid, or 0xffff when it has none. */
-uint16_t sd_ahn_of(struct sd_context *ctx, const union ibv_gid *gid);
+/*
+ * Under ctx->lock: the AH number gid has in pd, or 0xffff when pd has no AH for it. assumed: a receive
+ * completion names its sender by an AH of the receiving QP's PD; several domains of one process share a
+ * device context, each with its own PD and its own AH for the same GID.
+ */
+uint16_t sd_ahn_of(struct sd_context *ctx, struct ibv_pd *pd, const union ibv_gid *gid);
 
 /* queue.c */
 int sd_agent_start(struct sd_context *ctx);

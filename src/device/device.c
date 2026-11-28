@@ -530,7 +530,19 @@ EXPORT struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 	a->gid = attr->grh.dgid;
 	use(&((struct sd_pd *)pd)->users, 1);
 	pthread_mutex_lock(&sc->lock);
-	a->ahn = sc->next_ahn++;
+	/*
+	 * assumed: the device has one AH number per destination GID in a PD, and every AH created for that GID
+	 * gets it. A receive completion names its sender by that number (slid) and the sender's QP number,
+	 * which the efa provider looks up together, so two numbers for one GID would leave the lookup to chance.
+	 */
+	{
+		struct sd_ah *o;
+
+		for (o = sc->ahs; o; o = o->next)
+			if (o->ah.pd == pd && !memcmp(o->gid.raw, a->gid.raw, sizeof(a->gid.raw)))
+				break;
+		a->ahn = o ? o->ahn : sc->next_ahn++;
+	}
 	a->next = sc->ahs;
 	sc->ahs = a;
 	pthread_mutex_unlock(&sc->lock);
@@ -539,12 +551,12 @@ EXPORT struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 	return &a->ah;
 }
 
-uint16_t sd_ahn_of(struct sd_context *ctx, const union ibv_gid *gid)
+uint16_t sd_ahn_of(struct sd_context *ctx, struct ibv_pd *pd, const union ibv_gid *gid)
 {
 	struct sd_ah *a;
 
 	for (a = ctx->ahs; a; a = a->next)
-		if (!memcmp(a->gid.raw, gid->raw, sizeof(gid->raw)))
+		if (a->ah.pd == pd && !memcmp(a->gid.raw, gid->raw, sizeof(gid->raw)))
 			return a->ahn;
 	return 0xffff;
 }

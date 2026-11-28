@@ -741,14 +741,18 @@ static void srdsim_op_free(struct srdsim_op *op)
 	free(op);
 }
 
-/* Reports an operation this endpoint started as done, and forgets it. Called with x->mu held. */
+/*
+ * Reports an operation this endpoint started as done, and forgets it. Called with x->mu held. A remote key,
+ * range or access the target refused completes with FI_EINVAL, as on EFA, where the device reports a bad
+ * remote address and the efa provider turns that into FI_EINVAL (EFA-ERR-001).
+ */
 static void srdsim_op_done(struct srdsim_xfer *x, struct srdsim_op *op, int status)
 {
 	dlist_remove(&op->entry);
 	x->outstanding--;
 	if (status)
 		srdsim_event(x, SRDSIM_EV_TX, op->context, op->cq_flags, 0, NULL, 0, 0,
-			     status == -FI_EACCES || status == -FI_EINVAL ? FI_EACCES : -status, 0, NULL);
+			     status == -FI_EACCES || status == -FI_EINVAL ? FI_EINVAL : -status, 0, NULL);
 	else if (op->completion)
 		srdsim_event(x, SRDSIM_EV_TX, op->context, op->cq_flags, 0, NULL, 0, 0, 0, 0, NULL);
 	srdsim_op_free(op);

@@ -25,6 +25,7 @@
 
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -192,6 +193,23 @@ bool early_cq_data() {
 void barrier() {
     char b = 1;
     put(&b, 1);
+    get(&b, 1);
+}
+
+// The barrier, for a target that posted nothing and expects no completion of its own: it keeps reading its
+// queue while it waits. On the efa fabric a target serves RMA, and answers the handshake that has to come before
+// the first one, only while its queue is read (EFA-PROG-002), so a target that just waits stalls its initiator.
+void serving_barrier(Endpoint* e) {
+    char b = 1;
+    put(&b, 1);
+    for (;;) {
+        pollfd p = {g_from_peer, POLLIN, 0};
+        if (poll(&p, 1, 0) == 1) break;
+        fi_cq_tagged_entry c;
+        const ssize_t r = fi_cq_read(e->cq, &c, 1);
+        if (r == 1) check(false, "the target gets no completion of its own");
+        else if (r != -FI_EAGAIN) die("fi_cq_read", int(r));
+    }
     get(&b, 1);
 }
 
@@ -467,7 +485,7 @@ void read_region(Endpoint* e) {
         for (size_t k = 0; k < kLen; ++k) r.mem[k] = pattern(5, k);
         uint64_t desc[2] = {uint64_t(uintptr_t(r.mem.data())), r.key};
         put(desc, sizeof desc);
-        barrier();
+        serving_barrier(e);
         fi_close(&r.mr->fid);
         return;
     }
@@ -482,14 +500,14 @@ void read_region(Endpoint* e) {
     barrier();
 }
 
-// A write under a key the target never handed out fails on the initiator.
+// A write under a key the target never handed out fails on the initiator, with FI_EINVAL.
 void badkey(Endpoint* e) {
     if (g_rank == 1) {
         Region r;
         reg(e, &r, 4096, FI_REMOTE_WRITE);
         uint64_t desc[2] = {uint64_t(uintptr_t(r.mem.data())), r.key + 12345};
         put(desc, sizeof desc);
-        barrier();
+        serving_barrier(e);
         check(r.mem[0] == 0, "the target's memory is untouched");
         fi_close(&r.mr->fid);
         return;
@@ -499,7 +517,8 @@ void badkey(Endpoint* e) {
     std::vector<uint8_t> b(4096, 9);
     if (int rc = int(fi_write(e->ep, b.data(), b.size(), nullptr, e->peer, desc[0], desc[1], nullptr))) die("fi_write", rc);
     fi_cq_tagged_entry c;
-    check(wait_cq(e, &c) == FI_EACCES, "a write under an unknown key completes with FI_EACCES");
+    // FI_EINVAL, as the efa provider reports a bad remote address from the device (EFA-ERR-001).
+    check(wait_cq(e, &c) == FI_EINVAL, "a write under an unknown key completes with FI_EINVAL");
     barrier();
 }
 

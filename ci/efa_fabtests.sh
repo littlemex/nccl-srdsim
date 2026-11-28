@@ -105,4 +105,34 @@ if order inorder "$SRC/src/.libs"; then
 else
     echo "FAIL that provider failed even in order; the control does not isolate reordering"; fail=1
 fi
+# This project's own fi tests, against the efa provider on the stand-in instead of this project's provider.
+# Not run here, each for a reason that is about the test, not the stand-in: directsend, closewrite, inorder128,
+# test_fi_provider and test_fi_wire check behaviour of this project's provider itself; unreachable expects the
+# status a device gives for a QP nobody listens on, and closeinject expects an inject posted just before its
+# endpoint closes to arrive, neither yet seen on hardware (#81); test_fi_cq_threads completion checks that both of
+# its reading threads got a completion, which depends on scheduling, not on the provider; test_fi_close_while_reading
+# closes endpoints while another thread reads their CQ, which FI_THREAD_COMPLETION leaves to the application to
+# serialize (EFA-THR-002).
+export PKG_CONFIG_PATH="$WORK/libfabric/lib/pkgconfig"
+cmake -S "$ROOT" -B "$WORK/fi-build" -DSRDSIM_BUILD_TESTS=OFF -DSRDSIM_BUILD_FI_TEST=ON -DCMAKE_CXX_FLAGS=-Werror \
+    -DSRDSIM_FI_PROVIDER=/nonexistent/none.so > "$WORK/fi-cmake.log" 2>&1 \
+    || { tail -20 "$WORK/fi-cmake.log"; exit 1; }
+cmake --build "$WORK/fi-build" -j \
+    --target test_fi_transfer test_fi_multipeer test_fi_cq_threads > "$WORK/fi-build.log" 2>&1 \
+    || { grep -m5 -B2 -A5 error "$WORK/fi-build.log"; exit 1; }
+fi_test() {
+    local st=0 log="$WORK/fi-$n.log"
+    n=$((n + 1))
+    timeout 120 "$WORK/fi-build/$1" /nonexistent/none.so "${@:2}" > "$log" 2>&1 || st=$?
+    if [ "$st" -eq 0 ]; then
+        echo "PASS $*"
+    else
+        echo "FAIL $* (exit $st)"; grep -E 'FAIL' "$log" | head -3; fail=1
+    fi
+}
+for s in sendrecv tagged inject truncate read badkey writedata reorder; do
+    fi_test test_fi_transfer "$s"
+done
+fi_test test_fi_multipeer
+fi_test test_fi_cq_threads domain
 exit "$fail"

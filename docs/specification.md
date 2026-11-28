@@ -9,6 +9,7 @@ Each row is one record in [`spec/`](../spec/). A record either **forbids** somet
 | EFA-AV-001 | On the efa-direct fabric, and on the efa fabric with FI_OPT_EFA_HOMOGENEOUS_PEERS set to true, the consumer must insert the initiator's address into the target's address vector before an RMA operation is posted; the result otherwise is not defined by the man page. | forbids | device | documented | nothing yet | hides-bugs |
 | EFA-CQD-001 | The target's completion for a device RMA write carrying remote CQ data is not raised before every byte of that write is in the target buffer. | forbids | device | assumed | `fi_transfer_writedata`, `fi_transfer_writedata_early` | conforms |
 | EFA-DIR-001 | On the efa-direct fabric, an RDM endpoint is not offered to a consumer that does not support FI_MR_LOCAL and FI_CONTEXT2. | forbids | efa-provider | documented | `fi_provider` | conforms |
+| EFA-ERR-001 | On the efa and efa-direct fabrics, an RMA operation whose remote key, address range or access the target's memory registration does not allow completes on the initiator with an error whose err is FI_EINVAL, never with another error code. | forbids | efa-provider | read-from-source | `fi_transfer_badkey` | conforms |
 | EFA-MRA-001 | On the efa fabric, if the memory region of an outstanding send, write or device RMA read is closed while the peer connection works, that operation ends with exactly one transmit completion, success or error; never none and never more. | forbids | efa-provider | documented | nothing yet | unverified |
 | EFA-MRA-002 | On the efa fabric, if a receive has been matched to a send whose memory region the sender closed, and the peer connection works, the receiver does not go without an error completion for that receive. | forbids | efa-provider | documented | nothing yet | unverified |
 | EFA-MSG-001 | On the efa fabric, a send posted after another send from the same endpoint to the same destination endpoint is not matched against receives before it. | forbids | efa-provider | documented | `fi_transfer_sendrecv`, `fi_transfer_tagged`, `fi_provider` | conforms |
@@ -59,6 +60,7 @@ The records where this project does not do what the fabric does, with the reason
 On the real stack these guarantees are kept by software above the device -- libfabric's efa provider or its common layer -- and this project's provider reimplements them. A fake at the device boundary would run that software unchanged and get them exactly; until then each is a place this project can drift from the real stack (issue #82).
 
 - **EFA-DIR-001** (efa-provider, conforms). efa-direct requires FI_MR_LOCAL and FI_CONTEXT2
+- **EFA-ERR-001** (efa-provider, conforms). An RMA the target refuses for its key, range or access completes with FI_EINVAL
 - **EFA-MRA-001** (efa-provider, unverified). Closing the memory region under an outstanding operation produces one transmit completion
 - **EFA-MRA-002** (efa-provider, unverified). A receive matched to an aborted send gets an error completion
 - **EFA-MSG-001** (efa-provider, conforms). Sends from one endpoint to another are matched in submission order on the efa fabric
@@ -89,3 +91,4 @@ On the real stack these guarantees are kept by software above the device -- libf
 - `efa_rdm_ope`: [prov/efa/src/rdm/efa_rdm_ope.c, the efa RDM endpoint's operation entries](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ope.c), libfabric v2.7.0
 - `efa_rdm_ep_fiops`: [prov/efa/src/rdm/efa_rdm_ep_fiops.c, the efa RDM endpoint's options](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ep_fiops.c), libfabric v2.7.0
 - `efa_rdm_rma`: [prov/efa/src/rdm/efa_rdm_rma.c, the efa fabric's RMA operations](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_rma.c), libfabric v2.7.0
+- `efa_errno`: [prov/efa/src/efa_errno.h, how the efa provider names device statuses and maps them to libfabric errors](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/efa_errno.h), libfabric v2.7.0

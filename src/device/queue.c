@@ -1484,7 +1484,7 @@ static void recv_cqe(struct sd_context *ctx, struct sd_qp *qp, const struct sd_f
 	};
 
 	sd_gid_of((int)f->src_dev, &e.sgid);
-	e.slid = sd_ahn_of(ctx, &e.sgid);
+	e.slid = sd_ahn_of(ctx, qp->ex.qp_base.pd, &e.sgid);
 	cq_push(qp->ex.qp_base.recv_cq, &e);
 }
 
