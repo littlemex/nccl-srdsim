@@ -15,6 +15,7 @@ Each row is one record in [`spec/`](../spec/). A record either **forbids** somet
 | EFA-MSG-002 | On the efa-direct fabric, sends from the same endpoint to the same destination may be matched in an order other than the one they were posted in. | permits | device | documented | nothing yet | conforms |
 | EFA-MSG-003 | Setting FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES on an RDM endpoint does not succeed; it returns -FI_EOPNOTSUPP. | forbids | efa-provider | read-from-source | `fi_provider` | conforms |
 | EFA-PROG-001 | On the efa-direct fabric, data and control progress do not depend on the consumer calling into the provider: the endpoints use FI_PROGRESS_AUTO. | forbids | device | documented | nothing yet | invents-bugs |
+| EFA-PROG-002 | On the efa fabric, an RMA read or write to a peer whose handshake has not been received is queued until the handshake arrives, unless the peer is the endpoint itself or FI_OPT_EFA_HOMOGENEOUS_PEERS is true; the peer sends its handshake only when it makes progress, so with manual progress the operation may not complete while the target never reads a completion queue. | permits | efa-provider | read-from-source | nothing yet | hides-bugs |
 | EFA-RMA-001 | Two RMA writes from one endpoint, the second posted before the first one's transmit completion, may take effect at the target in either order. | permits | device | documented | `fi_transfer_reorder`, `fi_transfer_reorder_inorder`, `fi_provider` | conforms |
 | EFA-RMA-002 | Unless FI_EFA_MR_RELAXED_ORDERING is set, an operation to the same endpoint posted after the transmit completion of an earlier one does not appear at the target before the earlier one. | forbids | device | documented | nothing yet | conforms |
 | EFA-RMA-003 | With FI_EFA_MR_RELAXED_ORDERING set, an operation posted after an earlier one's transmit completion may appear at the target before the earlier one. | permits | device | documented | nothing yet | hides-bugs |
@@ -42,6 +43,7 @@ The records where this project does not do what the fabric does, with the reason
 - **EFA-MRA-001** (unverified: not yet established). Not yet established how the provider behaves here.
 - **EFA-MRA-002** (unverified: not yet established). Not yet established how the provider behaves here.
 - **EFA-PROG-001** (invents-bugs: code that is right on the hardware can fail here). efa-direct endpoints use manual progress, as the efa fabric does: an operation moves only when the consumer reads a completion queue. Code that is correct on the hardware because it waits without polling stalls here.
+- **EFA-PROG-002** (hides-bugs: code that is wrong on the hardware can pass here). The provider applies RMA at the target without the target calling into it, so a target that registers memory and then only waits serves reads and writes here and stalls its initiator on the hardware (test_fi_transfer read and badkey rely on this).
 - **EFA-RMA-003** (hides-bugs: code that is wrong on the hardware can pass here). The flag is accepted and has no effect, so the ordering of EFA-RMA-002 still holds and code that wrongly relies on it under relaxed ordering passes.
 - **EFA-RMA-006** (hides-bugs: code that is wrong on the hardware can pass here). Each unit is written back to front, one block at a time; that is one permitted order and the only one produced, so code that breaks under another order passes.
 - **EFA-RMA-007** (hides-bugs: code that is wrong on the hardware can pass here). Data is applied exactly once. Code that breaks when a block is rewritten with the same bytes passes here.
@@ -61,6 +63,7 @@ On the real stack these guarantees are kept by software above the device -- libf
 - **EFA-MRA-002** (efa-provider, unverified). A receive matched to an aborted send gets an error completion
 - **EFA-MSG-001** (efa-provider, conforms). Sends from one endpoint to another are matched in submission order on the efa fabric
 - **EFA-MSG-003** (efa-provider, conforms). In-order 128-byte send/recv is not offered by the RDM endpoint
+- **EFA-PROG-002** (efa-provider, hides-bugs). On the efa fabric, the first RMA to a peer waits for that peer to progress
 - **EFA-SIZE-001** (efa-provider, conforms). The efa fabric imposes no maximum message size
 - **EFA-THR-001** (efa-provider, conforms). RDM endpoints accept FI_THREAD_SAFE, FI_THREAD_COMPLETION and FI_THREAD_DOMAIN
 - **EFA-THR-002** (libfabric-core, hides-bugs). Under FI_THREAD_COMPLETION, the consumer serialises access to what shares a completion queue or counter
@@ -85,3 +88,4 @@ On the real stack these guarantees are kept by software above the device -- libf
 - `util_attr`: [prov/util/src/util_attr.c, how fi_getinfo shapes the attributes a consumer gets](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/util/src/util_attr.c), libfabric v2.7.0
 - `efa_rdm_ope`: [prov/efa/src/rdm/efa_rdm_ope.c, the efa RDM endpoint's operation entries](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ope.c), libfabric v2.7.0
 - `efa_rdm_ep_fiops`: [prov/efa/src/rdm/efa_rdm_ep_fiops.c, the efa RDM endpoint's options](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ep_fiops.c), libfabric v2.7.0
+- `efa_rdm_rma`: [prov/efa/src/rdm/efa_rdm_rma.c, the efa fabric's RMA operations](https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_rma.c), libfabric v2.7.0

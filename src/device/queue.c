@@ -66,6 +66,7 @@ struct sd_cqe {
 	uint32_t imm;			/* host order, as the device writes it */
 	bool has_imm;
 	bool unsolicited;
+	bool orphan;			/* its QP was destroyed before it was read */
 	uint32_t qp_num;
 	uint32_t src_qp;
 	uint16_t slid;
@@ -166,7 +167,10 @@ static void cq_push(struct ibv_cq *ibcq, const struct sd_cqe *e)
 	     e->byte_len, e->qp_num, e->src_qp, e->slid);
 }
 
-/* Under cq->lock. */
+/*
+ * Under cq->lock. As libefa does for a completion whose QP is gone, an orphan is consumed and reported
+ * as EINVAL; the efa provider drains a CQ after destroying a QP by polling until ENOENT.
+ */
 static int take(struct sd_cq *cq)
 {
 	if (!cq->count)
@@ -174,6 +178,10 @@ static int take(struct sd_cq *cq)
 	cq->cur = cq->ring[cq->head];
 	cq->head = (cq->head + 1) % cq->size;
 	cq->count--;
+	if (cq->cur.orphan) {
+		dlog("CQ %p: completion of destroyed QP %u -> EINVAL", (void *)cq, cq->cur.qp_num);
+		return EINVAL;
+	}
 	cq->ex.wr_id = cq->cur.wr_id;
 	cq->ex.status = cq->cur.status;
 	return 0;
@@ -244,10 +252,10 @@ static bool sd_wc_is_unsolicited(struct efadv_cq *dv)
 static int sd_poll_cq(struct ibv_cq *ibcq, int n, struct ibv_wc *wc)
 {
 	struct sd_cq *cq = (struct sd_cq *)ibcq;
-	int i;
+	int i, r = 0;
 
 	pthread_mutex_lock(&cq->lock);
-	for (i = 0; i < n && !take(cq); i++) {
+	for (i = 0; i < n && !(r = take(cq)); i++) {
 		memset(&wc[i], 0, sizeof(wc[i]));
 		wc[i].wr_id = cq->cur.wr_id;
 		wc[i].status = cq->cur.status;
@@ -261,7 +269,7 @@ static int sd_poll_cq(struct ibv_cq *ibcq, int n, struct ibv_wc *wc)
 		wc[i].slid = cq->cur.slid;
 	}
 	pthread_mutex_unlock(&cq->lock);
-	return i;
+	return r == EINVAL && !i ? -1 : i;
 }
 
 static int sd_req_notify_cq(struct ibv_cq *ibcq, int solicited)
@@ -773,10 +781,13 @@ static socklen_t qp_name(int device, uint32_t qpn, struct sockaddr_un *a)
 static int agent_watch(struct sd_context *ctx, int fd, bool add);
 
 /*
- * A socket bound to the first free QP number at or after a start that differs between processes. The
- * efa provider carries a QP number in 16 bits of its address, as EFA's QP numbers fit, so these do too.
+ * A socket bound to the first free QP number at or after a start that differs between processes, so QP
+ * numbers are unique on the host as on one device. They stay below max_qp: the efa provider finds the
+ * QP of a completion at qp_table[qp_num & (table size - 1)], with the table sized from max_qp
+ * (efa_device_construct_data), so a larger number lands on another QP's slot or an empty one. The
+ * provider's address also carries the number in 16 bits.
  */
-#define SD_QPN_MAX 0xffffu
+#define SD_QPN_MAX (SD_MAX_QP - 1u)
 
 static int bind_qp(int device, uint32_t *qpn)
 {
@@ -926,6 +937,24 @@ EXPORT int ibv_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr, int mask
 
 static void tx_forget_qp(struct sd_context *ctx, struct sd_qp *qp);
 
+/* Under ctx->lock: marks the unread completions of a QP that is being destroyed. */
+static void orphan_cqes(struct ibv_cq *ibcq, uint32_t qp_num)
+{
+	struct sd_cq *cq = (struct sd_cq *)ibcq;
+	uint32_t i;
+
+	if (!cq)
+		return;
+	pthread_mutex_lock(&cq->lock);
+	for (i = 0; i < cq->count; i++) {
+		struct sd_cqe *e = &cq->ring[(cq->head + i) % cq->size];
+
+		if (e->qp_num == qp_num)
+			e->orphan = true;
+	}
+	pthread_mutex_unlock(&cq->lock);
+}
+
 EXPORT int ibv_destroy_qp(struct ibv_qp *ibqp)
 {
 	struct sd_qp *qp = qp_of(ibqp);
@@ -941,6 +970,9 @@ EXPORT int ibv_destroy_qp(struct ibv_qp *ibqp)
 		}
 	agent_watch(ctx, qp->fd, false);
 	tx_forget_qp(ctx, qp);
+	orphan_cqes(ibqp->send_cq, ibqp->qp_num);
+	if (ibqp->recv_cq != ibqp->send_cq)
+		orphan_cqes(ibqp->recv_cq, ibqp->qp_num);
 	pthread_mutex_unlock(&ctx->lock);
 	close(qp->fd);
 	while (qp->rq) {

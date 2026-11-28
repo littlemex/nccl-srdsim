@@ -239,6 +239,23 @@ unchecked = "No test relies on progress without calling into the provider."
 srdsim = { status = "invents-bugs", note = "efa-direct endpoints use manual progress, as the efa fabric does: an operation moves only when the consumer reads a completion queue. Code that is correct on the hardware because it waits without polling stalls here." }
 
 [[guarantee]]
+id = "EFA-PROG-002"
+title = "On the efa fabric, the first RMA to a peer waits for that peer to progress"
+kind = "permits"
+statement = "On the efa fabric, an RMA read or write to a peer whose handshake has not been received is queued until the handshake arrives, unless the peer is the endpoint itself or FI_OPT_EFA_HOMOGENEOUS_PEERS is true; the peer sends its handshake only when it makes progress, so with manual progress the operation may not complete while the target never reads a completion queue."
+scope = { fabric = ["efa"], operations = ["write", "read"], when = ["FI_OPT_EFA_HOMOGENEOUS_PEERS false (the default)", "peer is not the endpoint itself"] }
+layer = "efa-provider"
+basis = "read-from-source"
+basis_note = "Seen also with the unmodified efa provider on the device stand-in (#82): a 300 KB fi_read to a target that registered its memory and then only waited never completed."
+sources = [
+  { source = "efa_rdm_rma", quote = "A handshake is required to choose the correct protocol (whether to use device read)." },
+  { source = "efa_rdm_rma", quote = "if (!ep->homogeneous_peers && !(txe->peer->is_self) && !(txe->peer->flags & EFA_RDM_PEER_HANDSHAKE_RECEIVED))" },
+]
+checked_by = []
+unchecked = "The stand-in shows it; no test registered with CMake asserts it yet."
+srdsim = { status = "hides-bugs", note = "The provider applies RMA at the target without the target calling into it, so a target that registers memory and then only waits serves reads and writes here and stalls its initiator on the hardware (test_fi_transfer read and badkey rely on this)." }
+
+[[guarantee]]
 id = "EFA-AV-001"
 title = "The target must know the initiator before an RMA operation, on efa-direct and on efa with homogeneous peers"
 kind = "forbids"

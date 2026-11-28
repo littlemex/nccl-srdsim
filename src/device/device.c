@@ -64,14 +64,39 @@ void sd_log(const char *fmt, ...)
  * SYSFS_PATH at it.
  */
 
+/*
+ * Several processes build the same tree at once (a test forks, or two ranks start together), and each
+ * may be reading what another is writing, so every file and link is made under a private name and
+ * renamed into place, which replaces it in one step.
+ */
 static int write_file(const char *path, const char *text)
 {
-	FILE *f = fopen(path, "w");
+	char tmp[1100];
+	FILE *f;
 
+	snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+	f = fopen(tmp, "w");
 	if (!f)
 		return -1;
 	fputs(text, f);
-	return fclose(f);
+	if (fclose(f) || rename(tmp, path)) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
+}
+
+static int link_to(const char *target, const char *path)
+{
+	char tmp[1100];
+
+	snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+	unlink(tmp);
+	if (symlink(target, tmp) || rename(tmp, path)) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
 }
 
 static int mkdirs(const char *path)
@@ -131,15 +156,13 @@ static const char *sysfs_tree(int ndev)
 		write_file(p, t);
 		snprintf(p, sizeof(p), "%s/driver", dev);
 		snprintf(t, sizeof(t), "%s/bus/pci/drivers/efa", sysfs_root);
-		unlink(p);
-		if (symlink(t, p))
+		if (link_to(t, p))
 			return NULL;
 		snprintf(p, sizeof(p), "%s/class/infiniband/srdsim%d", sysfs_root, i);
 		if (mkdirs(p))
 			return NULL;
 		snprintf(p, sizeof(p), "%s/class/infiniband/srdsim%d/device", sysfs_root, i);
-		unlink(p);
-		if (symlink(dev, p))
+		if (link_to(dev, p))
 			return NULL;
 	}
 	if (!getenv("SYSFS_PATH")) {
@@ -161,7 +184,16 @@ static int device_count(void)
 	return n < 0 ? 0 : n > 32 ? 32 : n;
 }
 
-EXPORT struct ibv_device **ibv_get_device_list(int *num_devices)
+/*
+ * The devices, made once and kept for the life of the process. rdma-core does the same: a context keeps
+ * pointing at its ibv_device, and the efa provider reads the device's name through it long after
+ * ibv_free_device_list, which frees only the array.
+ */
+static struct sd_device *devices[32];
+static int ndevices = -1;
+static pthread_mutex_t devices_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int make_devices(void)
 {
 	int n = device_count(), i;
 	const char *root = sysfs_tree(n);
@@ -169,23 +201,14 @@ EXPORT struct ibv_device **ibv_get_device_list(int *num_devices)
 	if (!root) {
 		dlog("cannot write the sysfs tree under %s", sysfs_root);
 		errno = EIO;
-		return NULL;
-	}
-	struct ibv_device **list = calloc((size_t)n + 1, sizeof(*list));
-
-	if (!list) {
-		errno = ENOMEM;
-		return NULL;
+		return -1;
 	}
 	for (i = 0; i < n; i++) {
 		struct sd_device *d = calloc(1, sizeof(*d));
 
 		if (!d) {
-			while (i--)
-				free(list[i]);
-			free(list);
 			errno = ENOMEM;
-			return NULL;
+			return -1;
 		}
 		d->index = i;
 		d->dev.node_type = IBV_NODE_UNSPECIFIED;
@@ -194,22 +217,40 @@ EXPORT struct ibv_device **ibv_get_device_list(int *num_devices)
 		snprintf(d->dev.dev_name, sizeof(d->dev.dev_name), "uverbs%d", i);
 		snprintf(d->dev.dev_path, sizeof(d->dev.dev_path), "/nonexistent/srdsim/uverbs%d", i);
 		snprintf(d->dev.ibdev_path, sizeof(d->dev.ibdev_path), "%s/class/infiniband/srdsim%d", root, i);
-		list[i] = &d->dev;
+		devices[i] = d;
 	}
+	ndevices = n;
+	return 0;
+}
+
+EXPORT struct ibv_device **ibv_get_device_list(int *num_devices)
+{
+	struct ibv_device **list;
+	int i, err = 0;
+
+	pthread_mutex_lock(&devices_lock);
+	if (ndevices < 0 && make_devices())
+		err = errno;
+	pthread_mutex_unlock(&devices_lock);
+	if (err) {
+		errno = err;
+		return NULL;
+	}
+	list = calloc((size_t)ndevices + 1, sizeof(*list));
+	if (!list) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	for (i = 0; i < ndevices; i++)
+		list[i] = &devices[i]->dev;
 	if (num_devices)
-		*num_devices = n;
-	dlog("get_device_list -> %d", n);
+		*num_devices = ndevices;
+	dlog("get_device_list -> %d", ndevices);
 	return list;
 }
 
 EXPORT void ibv_free_device_list(struct ibv_device **list)
 {
-	int i;
-
-	if (!list)
-		return;
-	for (i = 0; list[i]; i++)
-		free(list[i]);
 	free(list);
 }
 

@@ -59,3 +59,9 @@ title = "prov/efa/src/rdm/efa_rdm_ep_fiops.c, the efa RDM endpoint's options"
 version = "libfabric v2.7.0"
 url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ep_fiops.c"
 view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_ep_fiops.c"
+
+[sources.efa_rdm_rma]
+title = "prov/efa/src/rdm/efa_rdm_rma.c, the efa fabric's RMA operations"
+version = "libfabric v2.7.0"
+url = "https://raw.githubusercontent.com/ofiwg/libfabric/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_rma.c"
+view = "https://github.com/ofiwg/libfabric/blob/9011331bb34bb90b38a7aad53857df4430c5db45/prov/efa/src/rdm/efa_rdm_rma.c"
