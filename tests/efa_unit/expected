@@ -1,0 +1,15 @@
+# libfabric's efa unit tests that fail on the device stand-in in the CI job efa-unit-tests (ubuntu-24.04,
+# its libibverbs-dev, libfabric at the commit versions.env pins). One test per line, then the reason.
+#
+# All four assume the device has unsolicited write recv. Built against efadv headers that lack that
+# capability, as here, the provider reports it absent on every device (prov/efa/src/efa_device.c), so
+# the four fail on any device, the stand-in included. Without it, efa-direct (efa_user_info.c):
+#  - clears FI_RMA from the application's info when the hints do not ask for it, and the provider then
+#    registers no zero-byte bounce buffer; the first two tests expect one because the domain's own
+#    info still has FI_RMA;
+#  - refuses hints that ask for FI_RMA without FI_RX_CQ_DATA, which the last two pass, so their setup
+#    gets -FI_ENODATA.
+test_efa_domain_direct_has_bounce_buffer bounce buffer expected from the domain's caps, registered from the application's
+test_efa_domain_bounce_buffer_with_rdma bounce buffer expected from the domain's caps, registered from the application's
+test_efa_direct_ope_released_on_read_error asks efa-direct for FI_RMA without FI_RX_CQ_DATA; setup gets -FI_ENODATA
+test_efa_direct_ope_released_on_write_error asks efa-direct for FI_RMA without FI_RX_CQ_DATA; setup gets -FI_ENODATA

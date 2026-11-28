@@ -597,3 +597,22 @@ jobs:
           grep -q 'ERROR: AddressSanitizer: heap-use-after-free' mutated-close.log \
             || { echo "the close test failed for another reason:"; tail -40 mutated-close.log; exit 1; }
           echo "the close test catches an endpoint freed before it leaves its queues"
+
+  # libfabric's own efa unit tests, on a runner with no EFA device: the efa provider is built unmodified at the
+  # pinned commit, and the device stand-in in src/device replaces libibverbs and libefa below it.
+  efa-unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: versions
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run the efa unit tests without a device, then on the stand-in
+        env:
+          LIBFABRIC_TAG: ${{ needs.versions.outputs.libfabric_tag }}
+          LIBFABRIC_COMMIT: ${{ needs.versions.outputs.libfabric_commit }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libibverbs-dev libcmocka-dev libnuma-dev
+          git clone --quiet --depth 1 --branch "$LIBFABRIC_TAG" https://github.com/ofiwg/libfabric.git "$RUNNER_TEMP/libfabric-src"
+          test "$(git -C "$RUNNER_TEMP/libfabric-src" rev-parse HEAD)" = "$LIBFABRIC_COMMIT"
+          ./ci/efa_unit_tests.sh "$RUNNER_TEMP/libfabric-src" "$RUNNER_TEMP/efa-unit"

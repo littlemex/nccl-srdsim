@@ -1,0 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+EFA_1.1 { global: efadv_create_qp_ex; efadv_query_ah; efadv_query_device; local: *; };
+EFA_1.2 { global: efadv_create_cq; efadv_cq_from_ibv_cq_ex; } EFA_1.1;
+EFA_1.3 { global: efadv_query_mr; } EFA_1.2;
+EFA_1.4 { global: efadv_query_cq; efadv_query_qp_wqs; } EFA_1.3;
