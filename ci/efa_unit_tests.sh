@@ -35,6 +35,7 @@ TEST=$SRC/prov/efa/test/efa_unit_test
 [ -x "$TEST" ] || { echo "the efa unit tests were not built"; exit 1; }
 
 make -C "$ROOT/src/device" OUT="$WORK/device" > "$WORK/device-build.log" 2>&1 || { cat "$WORK/device-build.log"; exit 1; }
+"$ROOT/ci/device_symbols.sh" "$TEST" "$WORK/device"
 make -s -C "$ROOT/src/device" features
 
 # run OUT LIBRARY_PATH: cmocka writes JUnit XML to stdout; a crash still leaves the cases that finished.

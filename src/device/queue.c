@@ -24,9 +24,11 @@
  * sq_sig_all is set, only IBV_SEND_SIGNALED and IBV_SEND_INLINE are accepted,
  * and a full queue says ENOMEM.
  *
- * Not modelled yet: reordering (every frame between two QPs arrives in the
- * order sent), RNR retry limits (a send that finds no receive waits for one),
- * and CQ overrun (an entry that does not fit is dropped and logged).
+ * Frames leave in a random order (see pick()), so messages between two QPs,
+ * and the chunks of one RDMA operation, arrive out of order as SRD allows.
+ *
+ * Not modelled yet: RNR retry limits (a send that finds no receive waits for
+ * one) and CQ overrun (an entry that does not fit is dropped and logged).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -70,8 +72,17 @@ struct sd_cqe {
 	union ibv_gid sgid;
 };
 
+/* A completion channel: an eventfd that counts events, and the CQs whose events are not read yet. */
+struct sd_channel {
+	struct ibv_comp_channel ch;
+	pthread_mutex_t lock;
+	struct sd_cq *fired, **fired_tail;
+};
+
 struct sd_cq {
 	struct ibv_cq_ex ex;
+	struct sd_cq *next_fired;
+	bool queued;			/* on its channel's fired list */
 	struct efadv_cq dv;
 	atomic_int users;
 	/*
@@ -136,10 +147,19 @@ static void cq_push(struct ibv_cq *ibcq, const struct sd_cqe *e)
 	ch = cq->ex.channel;
 	pthread_mutex_unlock(&cq->lock);
 	if (notify && ch) {
+		struct sd_channel *sc = (struct sd_channel *)ch;
 		uint64_t one = 1;
 
-		if (write(ch->fd, &one, sizeof(one)) < 0)
-			dlog("completion channel write: %s", strerror(errno));
+		pthread_mutex_lock(&sc->lock);
+		if (!cq->queued) {
+			cq->queued = true;
+			cq->next_fired = NULL;
+			*sc->fired_tail = cq;
+			sc->fired_tail = &cq->next_fired;
+			if (write(ch->fd, &one, sizeof(one)) < 0)
+				dlog("completion channel write: %s", strerror(errno));
+		}
+		pthread_mutex_unlock(&sc->lock);
 	}
 	dlog("cqe cq %p wr_id 0x%llx status %d vendor %u opcode %d len %u qp %u src %u slid 0x%x",
 	     (void *)cq, (unsigned long long)e->wr_id, e->status, e->vendor_err, e->opcode,
@@ -347,6 +367,21 @@ EXPORT int ibv_destroy_cq(struct ibv_cq *ibcq)
 #endif
 	dlog("destroy_cq %p (%llu overruns)", (void *)cq, (unsigned long long)cq->overruns);
 	if (cq->ex.channel) {
+		struct sd_channel *sc = (struct sd_channel *)cq->ex.channel;
+		struct sd_cq **p;
+
+		pthread_mutex_lock(&sc->lock);
+		for (p = &sc->fired; *p; p = &(*p)->next_fired)
+			if (*p == cq) {
+				*p = cq->next_fired;
+				break;
+			}
+		sc->fired_tail = &sc->fired;
+		while (*sc->fired_tail)
+			sc->fired_tail = &(*sc->fired_tail)->next_fired;
+		pthread_mutex_unlock(&sc->lock);
+	}
+	if (cq->ex.channel) {
 		pthread_mutex_lock(&sd_ctx(ibcq->context)->lock);
 		cq->ex.channel->refcnt--;
 		pthread_mutex_unlock(&sd_ctx(ibcq->context)->lock);
@@ -366,15 +401,49 @@ EXPORT void ibv_ack_cq_events(struct ibv_cq *cq, unsigned int nevents)
 
 EXPORT struct ibv_comp_channel *ibv_create_comp_channel(struct ibv_context *c)
 {
-	struct ibv_comp_channel *ch = calloc(1, sizeof(*ch));
+	struct sd_channel *sc = calloc(1, sizeof(*sc));
 
-	if (!ch) {
+	if (!sc) {
 		errno = ENOMEM;
 		return NULL;
 	}
-	ch->context = c;
-	ch->fd = eventfd(0, EFD_CLOEXEC);
-	return ch;
+	sc->ch.context = c;
+	/* One read per event, as the kernel's channel gives one event per read. */
+	sc->ch.fd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE);
+	if (sc->ch.fd < 0) {
+		free(sc);
+		return NULL;
+	}
+	pthread_mutex_init(&sc->lock, NULL);
+	sc->fired_tail = &sc->fired;
+	return &sc->ch;
+}
+
+/* Waits for the next event on the channel, or fails with EAGAIN when its fd is non-blocking. */
+EXPORT int ibv_get_cq_event(struct ibv_comp_channel *ch, struct ibv_cq **cq, void **cq_context)
+{
+	struct sd_channel *sc = (struct sd_channel *)ch;
+	struct sd_cq *c;
+	uint64_t v;
+
+	if (read(ch->fd, &v, sizeof(v)) != sizeof(v))
+		return -1;
+	pthread_mutex_lock(&sc->lock);
+	c = sc->fired;
+	if (c) {
+		sc->fired = c->next_fired;
+		if (!sc->fired)
+			sc->fired_tail = &sc->fired;
+		c->queued = false;
+	}
+	pthread_mutex_unlock(&sc->lock);
+	if (!c) {
+		errno = EIO;
+		return -1;
+	}
+	*cq = (struct ibv_cq *)c;
+	*cq_context = c->ex.cq_context;
+	return 0;
 }
 
 EXPORT int ibv_destroy_comp_channel(struct ibv_comp_channel *ch)
@@ -386,6 +455,7 @@ EXPORT int ibv_destroy_comp_channel(struct ibv_comp_channel *ch)
 	}
 	if (ch->fd >= 0)
 		close(ch->fd);
+	pthread_mutex_destroy(&((struct sd_channel *)ch)->lock);
 	free(ch);
 	return 0;
 }
@@ -973,6 +1043,9 @@ struct sd_agent {
 	struct sd_op *inflight;		/* sent, waiting for their answer */
 	struct sd_rxw *rxw;
 	uint64_t next_op_id;
+	bool reorder;
+	uint64_t rng, seed;
+	uint64_t frames, reordered;	/* reported at close under SRDSIM_DEVICE_STATS */
 	unsigned char buf[SD_FRAME_MAX];
 };
 
@@ -1154,9 +1227,12 @@ static void frame_init(struct sd_frame *f, struct sd_context *ctx, struct sd_qp 
 	f->op_id = op_id;
 }
 
+#define SD_MORE 1
+
 /*
- * Under ctx->lock: sends what remains of an op. 0 when its frames are all out (the op then waits in
- * inflight for its answer, or has completed with an error), EAGAIN when the destination is full.
+ * Under ctx->lock: sends the next frame of an op. SD_MORE when frames remain, 0 when its frames are all
+ * out (the op then waits in inflight for its answer, or has completed with an error), EAGAIN when the
+ * destination is full.
  */
 static int pump_op(struct sd_context *ctx, struct sd_op *op)
 {
@@ -1181,7 +1257,7 @@ static int pump_op(struct sd_context *ctx, struct sd_op *op)
 		}
 	}
 	dev = sd_gid_device(&op->ah->gid);
-	do {
+	{
 		uint64_t n = 0;
 
 		switch (op->kind) {
@@ -1220,7 +1296,9 @@ static int pump_op(struct sd_context *ctx, struct sd_op *op)
 			return 0;
 		}
 		op->sent += n;
-	} while (op->kind == SD_OP_WRITE && op->sent < op->len);
+	}
+	if (op->kind == SD_OP_WRITE && op->sent < op->len)
+		return SD_MORE;
 	op->next = ag->inflight;
 	ag->inflight = op;
 	return 0;
@@ -1231,7 +1309,7 @@ static int pump_reply(struct sd_context *ctx, struct sd_tx *t)
 	struct sd_frame *f = (struct sd_frame *)ctx->agent->buf;
 	int st;
 
-	do {
+	{
 		uint64_t n = 0;
 
 		frame_init(f, ctx, t->from, t->kind == SD_TX_ACK ? SD_F_ACK : SD_F_READ_RESP, t->dst_qpn,
@@ -1250,24 +1328,58 @@ static int pump_reply(struct sd_context *ctx, struct sd_tx *t)
 		if (st)
 			return 0;	/* the requester is gone; nothing waits for this answer */
 		t->sent += n;
-	} while (t->kind == SD_TX_RESP && !t->status && t->sent < t->total);
-	return 0;
+	}
+	return t->kind == SD_TX_RESP && !t->status && t->sent < t->total ? SD_MORE : 0;
 }
 
-/* Under ctx->lock: sends queued work in order until a destination is full. Whether it stopped early. */
+/*
+ * Which queued item sends its next frame. SRD delivers neither messages nor the packets of one RDMA
+ * operation in the order they were posted (EFA-MSG-002, EFA-RMA-001), so under SRDSIM_MODE=srd, the
+ * default, it is drawn at random from the first SD_REORDER_WINDOW items, seeded by SRDSIM_SEED; under
+ * SRDSIM_MODE=inorder it is always the first. Each draw that skips the first is counted as reordered.
+ */
+#define SD_REORDER_WINDOW 16
+
+static unsigned int pick(struct sd_agent *ag)
+{
+	unsigned int n = 0, k;
+	struct sd_tx *t;
+
+	if (!ag->reorder)
+		return 0;
+	for (t = ag->tx; t && n < SD_REORDER_WINDOW; t = t->next)
+		n++;
+	ag->rng ^= ag->rng << 13;
+	ag->rng ^= ag->rng >> 7;
+	ag->rng ^= ag->rng << 17;
+	k = (unsigned int)(ag->rng % n);
+	if (k)
+		ag->reordered++;
+	return k;
+}
+
+/* Under ctx->lock: sends queued frames until a destination is full. Whether it stopped early. */
 static bool pump(struct sd_context *ctx)
 {
 	struct sd_agent *ag = ctx->agent;
 
 	while (ag->tx) {
-		struct sd_tx *t = ag->tx;
-		int r = t->kind == SD_TX_OP ? pump_op(ctx, t->op) : pump_reply(ctx, t);
+		unsigned int k = pick(ag);
+		struct sd_tx **p = &ag->tx, *t;
+		int r;
 
+		while (k--)
+			p = &(*p)->next;
+		t = *p;
+		r = t->kind == SD_TX_OP ? pump_op(ctx, t->op) : pump_reply(ctx, t);
 		if (r == EAGAIN)
 			return true;
-		ag->tx = t->next;
-		if (!ag->tx)
-			ag->tx_tail = &ag->tx;
+		ag->frames++;
+		if (r == SD_MORE)
+			continue;
+		*p = t->next;
+		if (ag->tx_tail == &t->next)
+			ag->tx_tail = p;
 		free(t);
 	}
 	return false;
@@ -1580,6 +1692,14 @@ int sd_agent_start(struct sd_context *ctx)
 		return -1;
 	}
 	ag->tx_tail = &ag->tx;
+	{
+		const char *mode = getenv("SRDSIM_MODE"), *seed = getenv("SRDSIM_SEED");
+
+		ag->reorder = !mode || strcmp(mode, "inorder");
+		ag->seed = seed && *seed ? strtoull(seed, NULL, 0) : (uint64_t)getpid() * 0x9e3779b97f4a7c15ull;
+		ag->rng = ag->seed ? ag->seed : 1;
+		dlog("mode %s seed %llu", ag->reorder ? "srd" : "inorder", (unsigned long long)ag->seed);
+	}
 	ag->epfd = epoll_create1(EPOLL_CLOEXEC);
 	ag->wakefd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	ev.data.fd = ag->wakefd;
@@ -1621,6 +1741,17 @@ void sd_agent_stop(struct sd_context *ctx)
 	pthread_mutex_unlock(&ctx->lock);
 	wake(ctx);
 	pthread_join(ag->thread, NULL);
+	{
+		const char *path = getenv("SRDSIM_DEVICE_STATS");
+		FILE *f = path && *path ? fopen(path, "a") : NULL;
+
+		if (f) {
+			fprintf(f, "pid %d mode %s seed %llu frames %llu reordered %llu\n", (int)getpid(),
+				ag->reorder ? "srd" : "inorder", (unsigned long long)ag->seed,
+				(unsigned long long)ag->frames, (unsigned long long)ag->reordered);
+			fclose(f);
+		}
+	}
 	while (ag->tx) {
 		struct sd_tx *t = ag->tx;
 
