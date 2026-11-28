@@ -163,7 +163,7 @@ if(SRDSIM_BUILD_FI_TEST)
   # The negative control for the guard above is a CI step, not a test here: ctest's WILL_FAIL passes on any
   # non-zero exit, so it would also go green if the provider failed to load. The step in .github/workflows/ci.yml
   # checks that the run fails with ThreadSanitizer's own exit code and that the report names the completion queue.
-  foreach(s IN ITEMS sendrecv tagged directsend closeinject closewrite inject unreachable truncate read badkey writedata reorder)
+  foreach(s IN ITEMS sendrecv tagged directsend closeinject closewrite inject unreachable truncate read badkey writedata reorder inorder128)
     add_test(NAME fi_transfer_${s} COMMAND test_fi_transfer ${SRDSIM_FI_PROVIDER} ${s})
     set_tests_properties(fi_transfer_${s} PROPERTIES TIMEOUT 180)
   endforeach()

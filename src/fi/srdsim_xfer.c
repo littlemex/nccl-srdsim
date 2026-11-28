@@ -152,6 +152,7 @@ struct srdsim_op {
 	uint64_t cq_flags;		/* the flags of its completion */
 	bool completion;		/* whether it reports one */
 	size_t nchunks, next;		/* units released so far, in `order` */
+	size_t step, lead;		/* unit k > 0 starts at k * step - lead; unit 0 is the first step - lead bytes */
 	uint32_t *order;
 	uint64_t landed;		/* reads: bytes of the answer applied */
 };
@@ -1281,7 +1282,16 @@ static ssize_t srdsim_submit(struct fid_ep *ep_fid, enum srdsim_op_kind kind, co
 			return -FI_ENOMEM;
 		}
 	}
-	op->nchunks = kind == SRDSIM_OP_READ ? 1 : MAX((size_t) 1, (op->len + x->chunk - 1) / x->chunk);
+	op->step = x->chunk;
+	op->lead = 0;
+	if (kind == SRDSIM_OP_WRITE && (op->frame_flags & SRDSIM_FR_IN_ORDER)) {
+		op->step = x->chunk - x->chunk % 128;	/* SRDSIM_CHUNK_BYTES is at least 128 */
+		op->lead = (size_t) (addr % 128);
+	}
+	if (kind == SRDSIM_OP_READ || op->len + op->lead <= op->step)
+		op->nchunks = 1;
+	else
+		op->nchunks = (op->len + op->lead + op->step - 1) / op->step;
 	op->order = malloc(op->nchunks * sizeof(*op->order));
 	if (!op->order) {
 		srdsim_op_free(op);
@@ -1321,6 +1331,28 @@ static ssize_t srdsim_submit(struct fid_ep *ep_fid, enum srdsim_op_kind kind, co
 }
 
 /* Releases one unit of `op`. Called with x->mu held. */
+/*
+ * Where unit k of `op` starts and how long it is.
+ *
+ * A write with FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES is promised that the data inside each 128-byte aligned
+ * block lands in order (fi_efa(7); spec/efa.toml EFA-RMA-004). The blocks are aligned in the target's address
+ * space, so the cuts between units have to fall on multiples of 128 there, not on multiples of the chunk size
+ * counted from the start of the write: a block that straddled a cut would be carried in two units, and the units
+ * of a write land in any order. Such a write is cut at its first 128-byte boundary and then every `step` bytes,
+ * `step` being the chunk size rounded down to a multiple of 128; every other operation is cut every chunk-size
+ * bytes from its start, as before.
+ */
+static void srdsim_unit_span(const struct srdsim_op *op, size_t k, size_t *off, size_t *len)
+{
+	size_t start = k ? k * op->step - op->lead : 0;
+	size_t end = (k + 1) * op->step - op->lead;
+
+	if (end > op->len)
+		end = op->len;
+	*off = start;
+	*len = op->len ? end - start : 0;
+}
+
 static int srdsim_release_one(struct srdsim_xfer *x, struct srdsim_op *op, char *tmp)
 {
 	struct srdsim_frame f = { .op_id = op->id, .total = op->len, .flags = op->frame_flags, .data = op->data,
@@ -1335,8 +1367,7 @@ static int srdsim_release_one(struct srdsim_xfer *x, struct srdsim_op *op, char 
 		op->next = op->nchunks;
 		return ret;
 	}
-	off = (size_t) op->order[op->next] * x->chunk;
-	len = op->len ? MIN(x->chunk, op->len - off) : 0;
+	srdsim_unit_span(op, op->order[op->next], &off, &len);
 	if (op->staged)
 		memcpy(tmp, op->staged + off, len);
 	else if (len && (ret = srdsim_copy_from(tmp, op->iov, op->desc, op->iov_count, off, len)))

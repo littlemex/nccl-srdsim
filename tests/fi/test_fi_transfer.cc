@@ -19,6 +19,7 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_eq.h>
 #include <rdma/fi_errno.h>
+#include <rdma/fi_ext.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_tagged.h>
 
@@ -548,6 +549,68 @@ void writedata(Endpoint* e) {
     if (g_rank == 1) close_endpoint(e);
 }
 
+// With FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES the data inside each 128-byte aligned block of a write lands in
+// order (fi_efa(7); spec record EFA-RMA-004). The block is aligned in the target's address space, not counted from
+// the start of the write, so a write to an address 64 bytes past a 128-byte boundary is the case that matters: a
+// block then straddles whatever boundary the provider cuts the write at, and if the two pieces of that block land
+// in either order, its back half can be seen before its front half -- which the hardware never shows.
+void inorder128(Endpoint* e) {
+    constexpr size_t kLen = 64 << 10;    // several chunks at the default chunk size
+    constexpr size_t kSkew = 64;         // the write starts this far past a 128-byte boundary
+    constexpr int kRounds = 30;
+    Region r;
+    uint64_t desc[2] = {};
+    if (g_rank == 1) {
+        reg(e, &r, kLen + 256, FI_REMOTE_WRITE);
+        const uintptr_t base = uintptr_t(r.mem.data());
+        desc[0] = uint64_t(((base + 127) & ~uintptr_t(127)) + kSkew);
+        desc[1] = r.key;
+        put(desc, sizeof desc);
+    } else {
+        get(desc, sizeof desc);
+        const bool on = true;
+        if (int rc = fi_setopt(&e->ep->fid, FI_OPT_ENDPOINT, FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, &on, sizeof on))
+            die("fi_setopt WRITE_IN_ORDER_ALIGNED_128_BYTES", rc);
+    }
+    long split_blocks = 0, polls = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        const uint8_t v = uint8_t(round + 1);
+        if (g_rank == 0) {
+            std::vector<uint8_t> b(kLen, v);
+            if (int rc = int(fi_writedata(e->ep, b.data(), kLen, nullptr, uint64_t(round), e->peer, desc[0], desc[1], nullptr)))
+                die("fi_writedata", rc);
+            fi_cq_tagged_entry c;
+            if (wait_cq(e, &c)) die("write completion", -FI_EIO);
+            barrier();
+            continue;
+        }
+        // Watch every whole 128-byte block of the target range while the write lands, until its remote completion.
+        // A block whose last byte already holds this round's value while its first byte does not has been written
+        // back to front.
+        const uint8_t* t = reinterpret_cast<const uint8_t*>(uintptr_t(desc[0]));
+        const size_t first = 128 - kSkew;                     // offset of the first aligned block in the write
+        fi_cq_tagged_entry c;
+        for (;;) {
+            const ssize_t n = fi_cq_read(e->cq, &c, 1);
+            if (n == 1) break;
+            if (n != -FI_EAGAIN) die("fi_cq_read", int(n));
+            const IntendedRaceOnReads watching;               // the write is landing while this reads; that is the test
+            ++polls;
+            for (size_t blk = first; blk + 128 <= kLen; blk += 128)
+                if (t[blk + 127] == v and t[blk] != v) { ++split_blocks; break; }
+        }
+        barrier();
+    }
+    if (g_rank == 1) {
+        std::printf("rank 1: %ld of %ld polls saw an aligned 128-byte block with its end landed before its start\n",
+                    split_blocks, polls);
+        check(polls > 0, "the target was watching while the writes landed");
+        check(split_blocks == 0, "with in-order 128-byte writes, no aligned block ever showed its end before its start");
+        fi_close(&r.mr->fid);
+    }
+    if (g_rank == 1) close_endpoint(e);
+}
+
 // A write may land after a later write's remote completion, under srd; never under inorder.
 void reorder(Endpoint* e) {
     constexpr size_t kLen = 256 << 10;
@@ -645,6 +708,7 @@ int main(int argc, char** argv) {
     else if (scenario == "badkey") badkey(&e);
     else if (scenario == "writedata") writedata(&e);
     else if (scenario == "reorder") reorder(&e);
+    else if (scenario == "inorder128") inorder128(&e);
     else die("unknown scenario", -FI_EINVAL);
     barrier();
     close_endpoint(&e);
