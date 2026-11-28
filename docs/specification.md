@@ -3,35 +3,35 @@
 
 Each row is one record in [`spec/`](../spec/). A record either **forbids** something (the fabric never does it, so this project must not either) or **permits** it (the fabric may do it, so this project should be able to). The last column says how this project compares: `hides-bugs` means code that is wrong on the hardware can pass here, and `invents-bugs` that code that is right on the hardware can fail here.
 
-| ID | Guarantee | Kind | Basis | Checked by | This project |
-|---|---|---|---|---|---|
-| EFA-ATOM-001 | On the efa fabric, the provider does not refuse hints that ask for FI_ATOMIC. | forbids | documented | nothing yet | not-implemented |
-| EFA-AV-001 | On the efa-direct fabric, and on the efa fabric with FI_OPT_EFA_HOMOGENEOUS_PEERS set to true, the consumer must insert the initiator's address into the target's address vector before an RMA operation is posted; the result otherwise is not defined by the man page. | forbids | documented | nothing yet | hides-bugs |
-| EFA-CQD-001 | The target's completion for a device RMA write carrying remote CQ data is not raised before every byte of that write is in the target buffer. | forbids | assumed | `fi_transfer_writedata`, `fi_transfer_writedata_early` | conforms |
-| EFA-DIR-001 | On the efa-direct fabric, an RDM endpoint is not offered to a consumer that does not support FI_MR_LOCAL and FI_CONTEXT2. | forbids | documented | `fi_provider` | conforms |
-| EFA-MRA-001 | On the efa fabric, if the memory region of an outstanding send, write or device RMA read is closed while the peer connection works, that operation ends with exactly one transmit completion, success or error; never none and never more. | forbids | documented | nothing yet | unverified |
-| EFA-MRA-002 | On the efa fabric, if a receive has been matched to a send whose memory region the sender closed, and the peer connection works, the receiver does not go without an error completion for that receive. | forbids | documented | nothing yet | unverified |
-| EFA-MSG-001 | On the efa fabric, a send posted after another send from the same endpoint to the same destination endpoint is not matched against receives before it. | forbids | documented | `fi_transfer_sendrecv`, `fi_transfer_tagged`, `fi_provider` | conforms |
-| EFA-MSG-002 | On the efa-direct fabric, sends from the same endpoint to the same destination may be matched in an order other than the one they were posted in. | permits | documented | nothing yet | conforms |
-| EFA-MSG-003 | Setting FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES on an RDM endpoint does not succeed; it returns -FI_EOPNOTSUPP. | forbids | read-from-source | `fi_provider` | conforms |
-| EFA-PROG-001 | On the efa-direct fabric, data and control progress do not depend on the consumer calling into the provider: the endpoints use FI_PROGRESS_AUTO. | forbids | documented | nothing yet | invents-bugs |
-| EFA-RMA-001 | Two RMA writes from one endpoint, the second posted before the first one's transmit completion, may take effect at the target in either order. | permits | documented | `fi_transfer_reorder`, `fi_transfer_reorder_inorder`, `fi_provider` | conforms |
-| EFA-RMA-002 | Unless FI_EFA_MR_RELAXED_ORDERING is set, an operation to the same endpoint posted after the transmit completion of an earlier one does not appear at the target before the earlier one. | forbids | documented | nothing yet | conforms |
-| EFA-RMA-003 | With FI_EFA_MR_RELAXED_ORDERING set, an operation posted after an earlier one's transmit completion may appear at the target before the earlier one. | permits | documented | nothing yet | hides-bugs |
-| EFA-RMA-004 | Once FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES has been set successfully, the data inside each 128-byte block aligned in the target's address space is not written out of order. | forbids | documented | `fi_transfer_inorder128` | conforms |
-| EFA-RMA-005 | Once FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES has been set successfully, the data of an RMA write is not delivered to the target buffer more than once. | forbids | documented | nothing yet | conforms |
-| EFA-RMA-006 | Without FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, the data inside a 128-byte aligned block of an RMA write may be written in any order. | permits | assumed | nothing yet | hides-bugs |
-| EFA-RMA-007 | Without FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, the data of an RMA write may be delivered to the target buffer more than once. | permits | assumed | nothing yet | hides-bugs |
-| EFA-SIZE-001 | On the efa fabric, the provider does not refuse a message or RMA operation for its size. | forbids | documented | `fi_provider` | conforms |
-| EFA-SIZE-002 | On the efa-direct fabric, a MSG operation larger than the device MTU (about 8 KiB) is not supported; the result of posting one is not defined by the man page. | forbids | documented | nothing yet | hides-bugs |
-| EFA-THR-001 | The provider does not refuse an RDM endpoint for asking for FI_THREAD_SAFE, FI_THREAD_COMPLETION or FI_THREAD_DOMAIN. | forbids | documented | `fi_cq_threads_completion`, `fi_cq_threads_domain` | conforms |
-| EFA-THR-002 | Under FI_THREAD_COMPLETION, the provider need not serialise concurrent access to objects bound to one completion queue or counter; what happens when the consumer does not serialise it is not defined. | permits | documented | `fi_cq_threads_completion` | hides-bugs |
-| EFA-THR-003 | Under FI_THREAD_DOMAIN, the provider need not serialise concurrent access to the objects of one domain; what happens when the consumer does not serialise it is not defined. | permits | documented | `fi_cq_threads_domain` | hides-bugs |
-| EFA-TXC-001 | Unless the consumer asks for FI_DELIVERY_COMPLETE, a transmit completion from an efa RDM endpoint may be reported before the operation has taken effect at the target. | permits | read-from-source | nothing yet | hides-bugs |
-| NCCL-SIG-001 | A weak signal bundled with a put does not become visible before every byte of that put is visible. | forbids | documented | `model_srdsim_schedule_exhaustive`, `test_srdsim_schedule` | conforms |
-| NCCL-SIG-002 | A weak signal may become visible before puts posted earlier than its own put are visible. | permits | documented | `model_srdsim_schedule_exhaustive` | conforms |
-| NCCL-SIG-003 | A strong signal does not become visible before every earlier put and signal, and its bundled put, are visible. | forbids | documented | nothing yet | unverified |
-| NCCL-SIG-004 | A weak signal may become visible before signals posted earlier than it are visible. | permits | documented | nothing yet | unverified |
+| ID | Guarantee | Kind | Layer | Basis | Checked by | This project |
+|---|---|---|---|---|---|---|
+| EFA-ATOM-001 | On the efa fabric, the provider does not refuse hints that ask for FI_ATOMIC. | forbids | efa-provider | documented | nothing yet | not-implemented |
+| EFA-AV-001 | On the efa-direct fabric, and on the efa fabric with FI_OPT_EFA_HOMOGENEOUS_PEERS set to true, the consumer must insert the initiator's address into the target's address vector before an RMA operation is posted; the result otherwise is not defined by the man page. | forbids | device | documented | nothing yet | hides-bugs |
+| EFA-CQD-001 | The target's completion for a device RMA write carrying remote CQ data is not raised before every byte of that write is in the target buffer. | forbids | device | assumed | `fi_transfer_writedata`, `fi_transfer_writedata_early` | conforms |
+| EFA-DIR-001 | On the efa-direct fabric, an RDM endpoint is not offered to a consumer that does not support FI_MR_LOCAL and FI_CONTEXT2. | forbids | efa-provider | documented | `fi_provider` | conforms |
+| EFA-MRA-001 | On the efa fabric, if the memory region of an outstanding send, write or device RMA read is closed while the peer connection works, that operation ends with exactly one transmit completion, success or error; never none and never more. | forbids | efa-provider | documented | nothing yet | unverified |
+| EFA-MRA-002 | On the efa fabric, if a receive has been matched to a send whose memory region the sender closed, and the peer connection works, the receiver does not go without an error completion for that receive. | forbids | efa-provider | documented | nothing yet | unverified |
+| EFA-MSG-001 | On the efa fabric, a send posted after another send from the same endpoint to the same destination endpoint is not matched against receives before it. | forbids | efa-provider | documented | `fi_transfer_sendrecv`, `fi_transfer_tagged`, `fi_provider` | conforms |
+| EFA-MSG-002 | On the efa-direct fabric, sends from the same endpoint to the same destination may be matched in an order other than the one they were posted in. | permits | device | documented | nothing yet | conforms |
+| EFA-MSG-003 | Setting FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES on an RDM endpoint does not succeed; it returns -FI_EOPNOTSUPP. | forbids | efa-provider | read-from-source | `fi_provider` | conforms |
+| EFA-PROG-001 | On the efa-direct fabric, data and control progress do not depend on the consumer calling into the provider: the endpoints use FI_PROGRESS_AUTO. | forbids | device | documented | nothing yet | invents-bugs |
+| EFA-RMA-001 | Two RMA writes from one endpoint, the second posted before the first one's transmit completion, may take effect at the target in either order. | permits | device | documented | `fi_transfer_reorder`, `fi_transfer_reorder_inorder`, `fi_provider` | conforms |
+| EFA-RMA-002 | Unless FI_EFA_MR_RELAXED_ORDERING is set, an operation to the same endpoint posted after the transmit completion of an earlier one does not appear at the target before the earlier one. | forbids | device | documented | nothing yet | conforms |
+| EFA-RMA-003 | With FI_EFA_MR_RELAXED_ORDERING set, an operation posted after an earlier one's transmit completion may appear at the target before the earlier one. | permits | device | documented | nothing yet | hides-bugs |
+| EFA-RMA-004 | Once FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES has been set successfully, the data inside each 128-byte block aligned in the target's address space is not written out of order. | forbids | device | documented | `fi_transfer_inorder128` | conforms |
+| EFA-RMA-005 | Once FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES has been set successfully, the data of an RMA write is not delivered to the target buffer more than once. | forbids | device | documented | nothing yet | conforms |
+| EFA-RMA-006 | Without FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, the data inside a 128-byte aligned block of an RMA write may be written in any order. | permits | device | assumed | nothing yet | hides-bugs |
+| EFA-RMA-007 | Without FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, the data of an RMA write may be delivered to the target buffer more than once. | permits | device | assumed | nothing yet | hides-bugs |
+| EFA-SIZE-001 | On the efa fabric, the provider does not refuse a message or RMA operation for its size. | forbids | efa-provider | documented | `fi_provider` | conforms |
+| EFA-SIZE-002 | On the efa-direct fabric, a MSG operation larger than the device MTU (about 8 KiB) is not supported; the result of posting one is not defined by the man page. | forbids | device | documented | nothing yet | hides-bugs |
+| EFA-THR-001 | The provider does not refuse an RDM endpoint for asking for FI_THREAD_SAFE, FI_THREAD_COMPLETION or FI_THREAD_DOMAIN. | forbids | efa-provider | documented | `fi_cq_threads_completion`, `fi_cq_threads_domain` | conforms |
+| EFA-THR-002 | Under FI_THREAD_COMPLETION, the provider need not serialise concurrent access to objects bound to one completion queue or counter; what happens when the consumer does not serialise it is not defined. | permits | libfabric-core | documented | `fi_cq_threads_completion` | hides-bugs |
+| EFA-THR-003 | Under FI_THREAD_DOMAIN, the provider need not serialise concurrent access to the objects of one domain; what happens when the consumer does not serialise it is not defined. | permits | libfabric-core | documented | `fi_cq_threads_domain` | hides-bugs |
+| EFA-TXC-001 | Unless the consumer asks for FI_DELIVERY_COMPLETE, a transmit completion from an efa RDM endpoint may be reported before the operation has taken effect at the target. | permits | efa-provider | read-from-source | nothing yet | hides-bugs |
+| NCCL-SIG-001 | A weak signal bundled with a put does not become visible before every byte of that put is visible. | forbids | nccl | documented | `model_srdsim_schedule_exhaustive`, `test_srdsim_schedule` | conforms |
+| NCCL-SIG-002 | A weak signal may become visible before puts posted earlier than its own put are visible. | permits | nccl | documented | `model_srdsim_schedule_exhaustive` | conforms |
+| NCCL-SIG-003 | A strong signal does not become visible before every earlier put and signal, and its bundled put, are visible. | forbids | nccl | documented | nothing yet | unverified |
+| NCCL-SIG-004 | A weak signal may become visible before signals posted earlier than it are visible. | permits | nccl | documented | nothing yet | unverified |
 
 ## Known differences
 
@@ -51,6 +51,28 @@ The records where this project does not do what the fabric does, with the reason
 - **EFA-TXC-001** (hides-bugs: code that is wrong on the hardware can pass here). Every transmit completion has delivery-complete meaning. Code that reads the target's memory by another path as soon as its local completion arrives passes here and can fail on the hardware. EFA-RMA-002 currently depends on this strictness.
 - **NCCL-SIG-003** (unverified: not yet established). To be read in src/nccl_rma_srdsim.cc.
 - **NCCL-SIG-004** (unverified: not yet established). To be read in src/srdsim_schedule.h and the exhaustive model: whether two operations' signals can be released out of order.
+
+## Owned above the device, reproduced here
+
+On the real stack these guarantees are kept by software above the device -- libfabric's efa provider or its common layer -- and this project's provider reimplements them. A fake at the device boundary would run that software unchanged and get them exactly; until then each is a place this project can drift from the real stack (issue #82).
+
+- **EFA-DIR-001** (efa-provider, conforms). efa-direct requires FI_MR_LOCAL and FI_CONTEXT2
+- **EFA-MRA-001** (efa-provider, unverified). Closing the memory region under an outstanding operation produces one transmit completion
+- **EFA-MRA-002** (efa-provider, unverified). A receive matched to an aborted send gets an error completion
+- **EFA-MSG-001** (efa-provider, conforms). Sends from one endpoint to another are matched in submission order on the efa fabric
+- **EFA-MSG-003** (efa-provider, conforms). In-order 128-byte send/recv is not offered by the RDM endpoint
+- **EFA-SIZE-001** (efa-provider, conforms). The efa fabric imposes no maximum message size
+- **EFA-THR-001** (efa-provider, conforms). RDM endpoints accept FI_THREAD_SAFE, FI_THREAD_COMPLETION and FI_THREAD_DOMAIN
+- **EFA-THR-002** (libfabric-core, hides-bugs). Under FI_THREAD_COMPLETION, the consumer serialises access to what shares a completion queue or counter
+- **EFA-THR-003** (libfabric-core, hides-bugs). Under FI_THREAD_DOMAIN, the consumer serialises access to the whole domain
+- **EFA-TXC-001** (efa-provider, hides-bugs). A transmit completion need not mean the operation took effect at the peer
+
+## Layers
+
+- `device`: the EFA device and SRD, reached through verbs and efadv
+- `efa-provider`: libfabric's efa provider, in software above the device
+- `libfabric-core`: libfabric's common layer, shared by every provider
+- `nccl`: NCCL's plugin interface
 
 ## Sources
 

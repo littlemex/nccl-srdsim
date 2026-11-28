@@ -16,6 +16,7 @@ What SRD and the libfabric efa provider guarantee, and what NCCL's RMA plugin in
 | `title`, `statement` | The guarantee in one line, then in one sentence precise enough to check |
 | `kind` | `forbids`: the fabric never does this, so this project must not either. A capability the fabric always offers is written as a forbidding ("does not refuse ..."). `permits`: the fabric may do this, so this project should be able to |
 | `scope` | `fabric`, `operations`, and `when` for the options or conditions the guarantee depends on |
+| `layer` | Which part of the real stack keeps the guarantee: `device` (the EFA device and SRD, reached through verbs and efadv), `efa-provider` (libfabric's efa provider, in software), `libfabric-core` (libfabric's common layer) or `nccl`. A fake needs to reproduce only what the layers below it keep; anything above that it reproduces is a place it can drift from the real stack |
 | `basis` | `documented`, `read-from-source`, `observed-on-hardware` or `assumed`. An assumed guarantee says in `basis_note` what it rests on |
 | `sources` | Each `{ source, quote }`: the quote appears in that source at its pinned commit |
 | `checked_by` | `test:<ctest name>`, `model:<property>` or `fact:<hardware fact>`. Empty only with `unchecked` saying why |

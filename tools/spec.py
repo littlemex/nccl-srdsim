@@ -31,7 +31,13 @@ STATUSES = {
     "not-implemented": "the provider does not offer this",
     "unverified": "not yet established",
 }
-REQUIRED = ["id", "title", "kind", "statement", "scope", "basis", "sources", "checked_by", "srdsim"]
+LAYERS = {
+    "device": "the EFA device and SRD, reached through verbs and efadv",
+    "efa-provider": "libfabric's efa provider, in software above the device",
+    "libfabric-core": "libfabric's common layer, shared by every provider",
+    "nccl": "NCCL's plugin interface",
+}
+REQUIRED = ["id", "title", "kind", "statement", "scope", "layer", "basis", "sources", "checked_by", "srdsim"]
 ID_RE = re.compile(r"^[A-Z]+-[A-Z]+-\d{3}$")
 
 
@@ -87,6 +93,8 @@ def check(offline: bool) -> int:
         seen[r.get("id")] = r.get("_file")
         if r.get("kind") not in KINDS:
             errors.append(f"{where}: kind must be one of {sorted(KINDS)}")
+        if r.get("layer") not in LAYERS:
+            errors.append(f"{where}: layer must be one of {sorted(LAYERS)}")
         if r.get("basis") not in BASES:
             errors.append(f"{where}: basis must be one of {sorted(BASES)}")
         if r.get("basis") == "assumed" and not r.get("basis_note"):
@@ -132,6 +140,8 @@ def check(offline: bool) -> int:
     for r in records:
         by_status.setdefault(r.get("srdsim", {}).get("status"), []).append(r.get("id"))
     unchecked = [r["id"] for r in records if not r.get("checked_by")]
+    above = [r["id"] for r in records if r.get("layer") in ("efa-provider", "libfabric-core")
+             and r.get("srdsim", {}).get("status") != "not-implemented"]
     quotes = "quotes not checked (offline)" if offline else \
         ("every quote found in its source" if not any("quote not found" in e for e in errors) else "SOME QUOTES NOT FOUND")
     print(f"{len(records)} guarantees in {len({r['_file'] for r in records})} files, {len(sources)} sources, {quotes}")
@@ -139,6 +149,7 @@ def check(offline: bool) -> int:
         if by_status.get(st):
             print(f"  {st:16} {len(by_status[st]):2}  {' '.join(by_status[st])}")
     print(f"  nothing checks {len(unchecked)}: {' '.join(unchecked)}")
+    print(f"  owned above the device but reproduced here {len(above)}: {' '.join(above)}")
     for n in notes:
         print("note:", n)
     for e in errors:
@@ -157,18 +168,28 @@ def render() -> str:
         "project should be able to). The last column says how this project compares: `hides-bugs` means code that is "
         "wrong on the hardware can pass here, and `invents-bugs` that code that is right on the hardware can fail here.",
         "",
-        "| ID | Guarantee | Kind | Basis | Checked by | This project |",
-        "|---|---|---|---|---|---|",
+        "| ID | Guarantee | Kind | Layer | Basis | Checked by | This project |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in sorted(records, key=lambda r: r["id"]):
         checks = ", ".join(f"`{c.split(':', 1)[1]}`" for c in r["checked_by"]) or "nothing yet"
-        out.append(f"| {r['id']} | {r['statement']} | {r['kind']} | {r['basis']} | {checks} | {r['srdsim']['status']} |")
+        out.append(f"| {r['id']} | {r['statement']} | {r['kind']} | {r['layer']} | {r['basis']} | {checks} | {r['srdsim']['status']} |")
     out += ["", "## Known differences", "",
             "The records where this project does not do what the fabric does, with the reason.", ""]
     for r in sorted(records, key=lambda r: r["id"]):
         st = r["srdsim"]["status"]
         if st != "conforms":
             out.append(f"- **{r['id']}** ({st}: {STATUSES[st]}). {r['srdsim']['note']}")
+    above = [r for r in sorted(records, key=lambda r: r["id"])
+             if r["layer"] in ("efa-provider", "libfabric-core") and r["srdsim"]["status"] != "not-implemented"]
+    out += ["", "## Owned above the device, reproduced here", "",
+            "On the real stack these guarantees are kept by software above the device -- libfabric's efa provider "
+            "or its common layer -- and this project's provider reimplements them. A fake at the device boundary "
+            "would run that software unchanged and get them exactly; until then each is a place this project can "
+            "drift from the real stack (issue #82).", ""]
+    out += [f"- **{r['id']}** ({r['layer']}, {r['srdsim']['status']}). {r['title']}" for r in above] or ["- none"]
+    out += ["", "## Layers", ""]
+    out += [f"- `{k}`: {v}" for k, v in LAYERS.items()]
     out += ["", "## Sources", ""]
     for key, src in sources.items():
         out.append(f"- `{key}`: [{src['title']}]({src['view']}), {src['version']}")

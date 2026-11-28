@@ -10,6 +10,7 @@ title = "Sends from one endpoint to another are matched in submission order on t
 kind = "forbids"
 statement = "On the efa fabric, a send posted after another send from the same endpoint to the same destination endpoint is not matched against receives before it."
 scope = { fabric = ["efa"], operations = ["send", "tagged send"] }
+layer = "efa-provider"
 basis = "documented"
 basis_note = "SAS is defined as transmission order; the efa RDM endpoint provides it with a software reorder buffer at the receiver, which is what makes the observable order the matching order. For tagged sends, an earlier send can still complete later if its tag matches a later receive."
 sources = [
@@ -26,6 +27,7 @@ title = "Sends may be matched out of order on the efa-direct fabric"
 kind = "permits"
 statement = "On the efa-direct fabric, sends from the same endpoint to the same destination may be matched in an order other than the one they were posted in."
 scope = { fabric = ["efa-direct"], operations = ["send"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "As mentioned earlier, it doesn't provide SAS guarantees" },
@@ -41,6 +43,7 @@ title = "In-order 128-byte send/recv is not offered by the RDM endpoint"
 kind = "forbids"
 statement = "Setting FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES on an RDM endpoint does not succeed; it returns -FI_EOPNOTSUPP."
 scope = { fabric = ["efa"], operations = ["send"], when = ["fi_setopt of FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES"] }
+layer = "efa-provider"
 basis = "read-from-source"
 sources = [
   { source = "efa_rdm_ep_fiops", quote = "FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES is currently not supported" },
@@ -57,6 +60,7 @@ title = "RMA writes posted before an earlier write's transmit completion may lan
 kind = "permits"
 statement = "Two RMA writes from one endpoint, the second posted before the first one's transmit completion, may take effect at the target in either order."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "writedata"], when = ["the later write is posted before the earlier write's transmit completion"] }
+layer = "device"
 basis = "documented"
 basis_note = "The man pages speak of transmission order; that the order of taking effect at the target is equally free is the reading here, bounded by EFA-RMA-002, which orders anything posted after a transmit completion."
 sources = [
@@ -73,6 +77,7 @@ title = "With the default memory region ordering, an operation posted after anot
 kind = "forbids"
 statement = "Unless FI_EFA_MR_RELAXED_ORDERING is set, an operation to the same endpoint posted after the transmit completion of an earlier one does not appear at the target before the earlier one."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "read", "send"], when = ["FI_EFA_MR_RELAXED_ORDERING not set"] }
+layer = "device"
 basis = "documented"
 basis_note = "The man page states this of the device. Whether it holds for operations the efa fabric emulates in software, and which of the two memory regions the flag has to be absent from, it does not say."
 sources = [
@@ -88,6 +93,7 @@ title = "Relaxed memory region ordering drops the ordering after a transmit comp
 kind = "permits"
 statement = "With FI_EFA_MR_RELAXED_ORDERING set, an operation posted after an earlier one's transmit completion may appear at the target before the earlier one."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "read", "send"], when = ["FI_EFA_MR_RELAXED_ORDERING set"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "When FI_EFA_MR_RELAXED_ORDERING is specified, that ordering guarantee is lost." },
@@ -102,6 +108,7 @@ title = "With in-order 128-byte writes, each aligned block lands in order"
 kind = "forbids"
 statement = "Once FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES has been set successfully, the data inside each 128-byte block aligned in the target's address space is not written out of order."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "writedata"], when = ["fi_setopt of FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES returned 0"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "Enabling the option will guarantee data inside each 128 bytes aligned block being written in order" },
@@ -115,6 +122,7 @@ title = "With in-order 128-byte writes, data reaches the target buffer once"
 kind = "forbids"
 statement = "Once FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES has been set successfully, the data of an RMA write is not delivered to the target buffer more than once."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "writedata"], when = ["fi_setopt of FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES returned 0"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "it will also guarantee data to be delivered to the target buffer only once." },
@@ -129,6 +137,7 @@ title = "Without in-order 128-byte writes, an aligned block may land out of orde
 kind = "permits"
 statement = "Without FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, the data inside a 128-byte aligned block of an RMA write may be written in any order."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "writedata"], when = ["FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES not set"] }
+layer = "device"
 basis = "assumed"
 basis_note = "Read as the converse of EFA-RMA-004: the man page says what the option guarantees and not what happens without it. A hardware fact would settle it."
 sources = []
@@ -142,6 +151,7 @@ title = "Without in-order 128-byte writes, data may reach the target buffer more
 kind = "permits"
 statement = "Without FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES, the data of an RMA write may be delivered to the target buffer more than once."
 scope = { fabric = ["efa", "efa-direct"], operations = ["write", "writedata"], when = ["FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES not set"] }
+layer = "device"
 basis = "assumed"
 basis_note = "The converse of EFA-RMA-005, as for EFA-RMA-006. If it holds, whether a delivery can repeat after the write's remote completion (EFA-CQD-001) is a further open question."
 sources = []
@@ -157,6 +167,7 @@ title = "A write's remote completion with CQ data comes after all of its data ha
 kind = "forbids"
 statement = "The target's completion for a device RMA write carrying remote CQ data is not raised before every byte of that write is in the target buffer."
 scope = { fabric = ["efa", "efa-direct"], operations = ["writedata"], when = ["the write is carried by the device's RDMA write, not emulated"] }
+layer = "device"
 basis = "assumed"
 basis_note = "Neither fi_efa(7) nor fi_rma(3) states when the target completion is raised. The provider maps it to the device's RDMA write with immediate (IBV_WC_RECV_RDMA_WITH_IMM), whose completion follows the data placement in the verbs semantics; that is the assumption, and a hardware fact (issue #81) would establish it. Writes the efa fabric emulates in software take another path and need their own record."
 sources = []
@@ -169,6 +180,7 @@ title = "A transmit completion need not mean the operation took effect at the pe
 kind = "permits"
 statement = "Unless the consumer asks for FI_DELIVERY_COMPLETE, a transmit completion from an efa RDM endpoint may be reported before the operation has taken effect at the target."
 scope = { fabric = ["efa"], operations = ["send", "write", "writedata"], when = ["FI_DELIVERY_COMPLETE neither in the hints' tx_attr->op_flags nor in the operation's flags"] }
+layer = "efa-provider"
 basis = "read-from-source"
 basis_note = "An operation's completion level is its own flags or'ed with the endpoint's tx op_flags, and those are the hints' tx_attr->op_flags whenever the consumer passes hints: the provider's own default, which includes FI_DELIVERY_COMPLETE, applies only to a consumer that passes none. The meaning of the lower level is fi_cq(3)'s."
 sources = [
@@ -188,6 +200,7 @@ title = "The efa fabric imposes no maximum message size"
 kind = "forbids"
 statement = "On the efa fabric, the provider does not refuse a message or RMA operation for its size."
 scope = { fabric = ["efa"], operations = ["send", "write", "read"] }
+layer = "efa-provider"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "does not have a maximum message size (for all operations)." },
@@ -201,6 +214,7 @@ title = "On efa-direct, a message is at most the device MTU"
 kind = "forbids"
 statement = "On the efa-direct fabric, a MSG operation larger than the device MTU (about 8 KiB) is not supported; the result of posting one is not defined by the man page."
 scope = { fabric = ["efa-direct"], operations = ["send"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "For MSG operations, the maximum message size is the MTU size of the efa device (approximately 8KiB)." },
@@ -215,6 +229,7 @@ title = "The efa-direct fabric progresses on its own"
 kind = "forbids"
 statement = "On the efa-direct fabric, data and control progress do not depend on the consumer calling into the provider: the endpoints use FI_PROGRESS_AUTO."
 scope = { fabric = ["efa-direct"], operations = ["all"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "The *FI_EP_RDM* and *FI_EP_DGRAM* endpoints in the `efa-direct` fabric support *FI_PROGRESS_AUTO*." },
@@ -229,6 +244,7 @@ title = "The target must know the initiator before an RMA operation, on efa-dire
 kind = "forbids"
 statement = "On the efa-direct fabric, and on the efa fabric with FI_OPT_EFA_HOMOGENEOUS_PEERS set to true, the consumer must insert the initiator's address into the target's address vector before an RMA operation is posted; the result otherwise is not defined by the man page."
 scope = { fabric = ["efa-direct", "efa"], operations = ["write", "read"], when = ["efa-direct, or efa with FI_OPT_EFA_HOMOGENEOUS_PEERS true"] }
+layer = "device"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "For the `efa-direct` fabric, the target side of RMA operation must insert the initiator side's address into AV before the RMA operation is kicked off, due to a current device limitation. The same limitation applies to the `efa` fabric when the `FI_OPT_EFA_HOMOGENEOUS_PEERS` option is set as `true`." },
@@ -243,6 +259,7 @@ title = "efa-direct requires FI_MR_LOCAL and FI_CONTEXT2"
 kind = "forbids"
 statement = "On the efa-direct fabric, an RDM endpoint is not offered to a consumer that does not support FI_MR_LOCAL and FI_CONTEXT2."
 scope = { fabric = ["efa-direct"], operations = ["all"] }
+layer = "efa-provider"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "it requires the use of *FI_CONTEXT2* mode for DGRAM endpoint and the `efa-direct` fabric of RDM endpoint." },
@@ -257,6 +274,7 @@ title = "The efa fabric offers atomic operations"
 kind = "forbids"
 statement = "On the efa fabric, the provider does not refuse hints that ask for FI_ATOMIC."
 scope = { fabric = ["efa"], operations = ["atomic"] }
+layer = "efa-provider"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "*FI_ATOMIC*, *FI_DIRECTED_RECV*, *FI_MULTI_RECV*, and *FI_SOURCE*." },
@@ -273,6 +291,7 @@ title = "RDM endpoints accept FI_THREAD_SAFE, FI_THREAD_COMPLETION and FI_THREAD
 kind = "forbids"
 statement = "The provider does not refuse an RDM endpoint for asking for FI_THREAD_SAFE, FI_THREAD_COMPLETION or FI_THREAD_DOMAIN."
 scope = { fabric = ["efa", "efa-direct"], operations = ["all"] }
+layer = "efa-provider"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "Both RDM and DGRAM endpoints supports *FI_THREAD_SAFE*, *FI_THREAD_COMPLETION*, *FI_THREAD_DOMAIN*." },
@@ -286,6 +305,7 @@ title = "Under FI_THREAD_COMPLETION, the consumer serialises access to what shar
 kind = "permits"
 statement = "Under FI_THREAD_COMPLETION, the provider need not serialise concurrent access to objects bound to one completion queue or counter; what happens when the consumer does not serialise it is not defined."
 scope = { fabric = ["efa", "efa-direct"], operations = ["all"], when = ["FI_THREAD_COMPLETION"] }
+layer = "libfabric-core"
 basis = "documented"
 sources = [
   { source = "fi_domain", quote = "Applications must serialize access to all objects that are associated by a common completion mechanism (for example, transmit and receive contexts bound to the same CQ or counter)." },
@@ -299,6 +319,7 @@ title = "Under FI_THREAD_DOMAIN, the consumer serialises access to the whole dom
 kind = "permits"
 statement = "Under FI_THREAD_DOMAIN, the provider need not serialise concurrent access to the objects of one domain; what happens when the consumer does not serialise it is not defined."
 scope = { fabric = ["efa", "efa-direct"], operations = ["all"], when = ["FI_THREAD_DOMAIN"] }
+layer = "libfabric-core"
 basis = "documented"
 sources = [
   { source = "fi_domain", quote = "Applications must serialize access to all objects under the same domain." },
@@ -314,6 +335,7 @@ title = "Closing the memory region under an outstanding operation produces one t
 kind = "forbids"
 statement = "On the efa fabric, if the memory region of an outstanding send, write or device RMA read is closed while the peer connection works, that operation ends with exactly one transmit completion, success or error; never none and never more."
 scope = { fabric = ["efa"], operations = ["send", "write", "read"], when = ["both sides on libfabric 2.7.0 or later", "the memory region is not referenced by a posted receive", "the operation is not emulated RMA or an atomic"] }
+layer = "efa-provider"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "If the user closes an MR on an outstanding TX operation, and its peer connection is functioning normally, the operation is guaranteed to eventually provide a single TX completion." },
@@ -330,6 +352,7 @@ title = "A receive matched to an aborted send gets an error completion"
 kind = "forbids"
 statement = "On the efa fabric, if a receive has been matched to a send whose memory region the sender closed, and the peer connection works, the receiver does not go without an error completion for that receive."
 scope = { fabric = ["efa"], operations = ["receive"], when = ["both sides on libfabric 2.7.0 or later"] }
+layer = "efa-provider"
 basis = "documented"
 sources = [
   { source = "fi_efa", quote = "If a receive operation has been matched to an aborted TX operation, and its peer connection is functioning normally, the receiver side is guaranteed to write a CQ error for the matched receive." },
